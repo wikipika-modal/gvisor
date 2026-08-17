@@ -850,6 +850,7 @@ func isWarning(line string) bool {
 
 	// Caused by properties of the host that runsc doesn't necessarily control.
 	case strings.Contains(line, "Host limit is lower than recommended"):
+	case strings.Contains(line, "host vsyscall page is mapped"):
 
 	// TODO(gvisor.dev/issue/11649): Systrap needs to roll back created
 	// patches for traced procs.

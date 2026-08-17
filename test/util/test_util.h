@@ -230,6 +230,7 @@ constexpr char kSlimVM[] = "slimvm";
 constexpr char kFuchsia[] = "fuchsia";
 constexpr char kStarnix[] = "starnix";
 constexpr char kSystrap[] = "systrap";
+constexpr char kXemu[] = "xemu";
 }  // namespace Platform
 
 bool IsRunningOnGvisor();
