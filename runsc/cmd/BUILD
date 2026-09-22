@@ -20,6 +20,7 @@ go_library(
         "features.go",
         "forward.go",
         "fscheckpoint.go",
+        "fsmutationlog.go",
         "gofer.go",
         "install.go",
         "install_sidecars.go",

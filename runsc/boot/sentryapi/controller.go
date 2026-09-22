@@ -315,6 +315,33 @@ type FSSaveArgs struct {
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
 }
 
+// ContMgrFsMutationLog emits an ordered journal of the mutations to the
+// overlay upper layer's files.
+const ContMgrFsMutationLog = "containerManager.FsMutationLog"
+
+// FsMutationLogArgs holds arguments to FsMutationLog.
+type FsMutationLogArgs struct {
+	// Path is the mount path inside the container to journal. Empty defaults to
+	// "/".
+	Path string `json:"path"`
+
+	// SinceGen requests the segment of changes since this generation (as returned
+	// by a previous call). Zero drains the full history of a mount that has not been
+	// drained yet; a mismatch fails (there is no full baseline).
+	SinceGen uint64 `json:"since_gen"`
+}
+
+// FsMutationLogResult holds results from FsMutationLog.
+type FsMutationLogResult struct {
+	// Generation is the generation the written segment reflects; the caller passes
+	// it as SinceGen next time.
+	Generation uint64 `json:"generation"`
+
+	// Length is the size of the written segment; the caller reflinks the log file and
+	// reads [0, Length).
+	Length uint64 `json:"length"`
+}
+
 // ContMgrGetSavings gets the savings for restored sandboxes.
 const ContMgrGetSavings = "containerManager.GetSavings"
 

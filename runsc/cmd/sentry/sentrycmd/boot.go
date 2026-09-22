@@ -248,6 +248,9 @@ type Boot struct {
 
 	// noRootContainer boots without a root container. See Create.noRootContainer.
 	noRootContainer bool
+	// fsMutationLogFD is the file descriptor to the persistent mutation-log file that the
+	// root overlay upper adopts at mount creation. -1 if not donated.
+	fsMutationLogFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -317,6 +320,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.fsRestoreFDs, "fs-restore-fds", "ordered list of file descriptors for filesystem checkpoint restore")
 	f.BoolVar(&b.fsRestoreCheckpointGofer, "fs-restore-checkpoint-gofer", false, "if true, -fs-restore-fds is a socket connected to checkpoint gofer")
 	f.IntVar(&b.rootfsUpperTarFD, "rootfs-upper-tar-fd", -1, "file descriptor to the tar file containing the rootfs upper layer changes.")
+	f.IntVar(&b.fsMutationLogFD, "fsmutationlog-fd", -1, "file descriptor to the persistent mutation-log file the root overlay upper adopts at mount creation.")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
@@ -749,6 +753,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
 		NoRootContainer:          b.noRootContainer,
 		StartupTimer:             timer,
+		FSMutationLogFD:          b.fsMutationLogFD,
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
