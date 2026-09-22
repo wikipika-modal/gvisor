@@ -1159,6 +1159,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", rootfsTarPath, rootfsUpperTarFlags(rootfsTarPath), lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
+	// Donate the persistent mutation-log file so the root overlay upper adopts it at mount
+	// creation (see tmpfs.FilesystemOpts.MutationLogFD). The caller sets the path only for a
+	// fresh sandbox; leaving it empty on restore keeps the restored mount inert.
+	if conf.FSMutationLog && conf.FSMutationLogPath != "" {
+		mutLogFile, err := os.OpenFile(conf.FSMutationLogPath, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("opening fsmutationlog file %q: %w", conf.FSMutationLogPath, err)
+		}
+		donations.DonateAndClose("fsmutationlog-fd", mutLogFile)
+	}
 
 	// Pass gofer mount configs.
 	if len(args.GoferMountConfs) > 0 {
@@ -3148,6 +3158,39 @@ func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error 
 		return fmt.Errorf("serializing rootfs upper layer to tar: %w", err)
 	}
 	return nil
+}
+
+// FsMutationLog drains a mutation-log segment of the overlay upper layer into the persistent
+// host log file adopted at boot. See Container.FsMutationLog and kernel.FsMutationLog. length
+// is the size of the written segment; the caller reflinks the log file and reads [0, length).
+func (s *Sandbox) FsMutationLog(path string, sinceGen uint64) (generation uint64, length uint64, err error) {
+	log.Debugf("FsMutationLog, sandbox: %q, path: %q", s.ID, path)
+	args := sentryapi.FsMutationLogArgs{
+		Path:     path,
+		SinceGen: sinceGen,
+	}
+	var res sentryapi.FsMutationLogResult
+	if err := s.call(sentryapi.ContMgrFsMutationLog, &args, &res); err != nil {
+		return 0, 0, fmt.Errorf("collecting fs mutation log: %w", err)
+	}
+	return res.Generation, res.Length, nil
+}
+
+// FsMutationLogDump writes a FULL mutation-log segment of the overlay upper layer to out,
+// restarting the journal after it if resync. length is the size of the FULL segment.
+func (s *Sandbox) FsMutationLogDump(path string, out *os.File, resync bool) (generation uint64, length uint64, err error) {
+	log.Debugf("FsMutationLogDump, sandbox: %q, path: %q, resync: %t", s.ID, path, resync)
+	args := sentryapi.FsMutationLogArgs{
+		Path:        path,
+		Dump:        true,
+		Resync:      resync,
+		FilePayload: urpc.FilePayload{Files: []*os.File{out}},
+	}
+	var res sentryapi.FsMutationLogResult
+	if err := s.call(sentryapi.ContMgrFsMutationLog, &args, &res); err != nil {
+		return 0, 0, fmt.Errorf("dumping fs mutation log: %w", err)
+	}
+	return res.Generation, res.Length, nil
 }
 
 // ReadFile reads a file of the sandbox from the given container (or root container if containerID is empty) up to the specified size from the specified offset.

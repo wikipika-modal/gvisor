@@ -940,6 +940,34 @@ func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) erro
 	return cm.l.k.FSSave(cm.l.k.SupervisorContext(), &kopts)
 }
 
+// FsMutationLog writes an ordered journal of the mutations to the overlay upper
+// layer to the provided log file. It does not clone the filestore; the caller
+// reflinks the filestore's physical backing file host-side while the container
+// remains paused.
+func (cm *containerManager) FsMutationLog(args *sentryapi.FsMutationLogArgs, res *sentryapi.FsMutationLogResult) error {
+	log.Debugf("containerManager.FsMutationLog")
+	kopts := kernel.FsMutationLogOpts{
+		Path:     args.Path,
+		SinceGen: args.SinceGen,
+	}
+	if args.Dump {
+		if len(args.Files) != 1 {
+			return fmt.Errorf("fsmutationlog dump needs one output file, got %d", len(args.Files))
+		}
+		defer args.Files[0].Close()
+		kopts.Dump = args.Files[0]
+		kopts.Resync = args.Resync
+	} else if args.Resync {
+		return fmt.Errorf("fsmutationlog resync needs a dump")
+	}
+	if err := cm.l.k.FsMutationLog(cm.l.k.SupervisorContext(), &kopts); err != nil {
+		return err
+	}
+	res.Generation = kopts.Generation
+	res.Length = kopts.Length
+	return nil
+}
+
 // GetSavings returns the savings for restored sandboxes.
 func (cm *containerManager) GetSavings(_ *struct{}, s *sentryapi.Savings) error {
 	log.Debugf("containerManager.GetSavings")
