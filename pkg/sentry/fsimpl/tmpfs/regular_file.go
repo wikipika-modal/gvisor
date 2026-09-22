@@ -298,6 +298,14 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 	return nil
 }
 
+// hasWritableMapping reports whether rf currently has at least one writable
+// shared memory mapping, i.e. one through which the file can be changed in place.
+func (rf *regularFile) hasWritableMapping() bool {
+	rf.mapsMu.Lock()
+	defer rf.mapsMu.Unlock()
+	return rf.writableMappingPages > 0
+}
+
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
 func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
 	rf.mapsMu.Lock()
@@ -451,7 +459,10 @@ type regularFileFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *regularFileFD) Release(context.Context) {
-	// noop
+	if fd.vfsfd.IsWritable() {
+		d := fd.dentry()
+		d.inode.fs.logCloseForWrite(d.inode)
+	}
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -494,6 +505,9 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		curPgStart = curPgEnd
 	}
 	f.inode.touchCMtimeLocked()
+
+	// Content mutations on a writable file description are journaled at close (or at
+	// the drain while it is open); see logOpenForWrite.
 	return nil
 }
 
@@ -685,6 +699,14 @@ func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpt
 	opts.SentryOwnedContent = true
 	if file.initiallyUnlinked {
 		opts.NameMut = memmap.NameMutAnonShmem
+	}
+	// A writable shared mapping can let applications mutate the file without any
+	// syscalls. We record the mmap event so the mutation log re-emits this file as dirty.
+	// Note that writes to a file via a private mapping aren't supposed to get propagated
+	// to the underlying file, so we don't record private mappings.
+	if opts.MaxPerms.Write && !opts.Private {
+		d := fd.dentry()
+		d.inode.fs.logMmapWritable(d.inode)
 	}
 	return vfs.GenericConfigureMMap(&fd.vfsfd, file, opts)
 }

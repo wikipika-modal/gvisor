@@ -62,12 +62,13 @@ func commands() (map[util.SubCommand]string, []subcommands.Command) {
 		new(cmd.Wait):       userGroup,
 
 		// Non-OCI user-facing runsc commands.
-		new(cmd.Do):           userGroup,
-		new(cmd.FSCheckpoint): userGroup,
-		new(cmd.PortForward):  userGroup,
-		new(cmd.Read):         userGroup,
-		new(cmd.SandboxExec):  userGroup,
-		new(cmd.Tar):          userGroup,
+		new(cmd.Do):            userGroup,
+		new(cmd.FSCheckpoint):  userGroup,
+		new(cmd.FsMutationLog): userGroup,
+		new(cmd.PortForward):   userGroup,
+		new(cmd.Read):          userGroup,
+		new(cmd.SandboxExec):   userGroup,
+		new(cmd.Tar):           userGroup,
 
 		// Helpers.
 		new(cmd.Install):     helperGroup,

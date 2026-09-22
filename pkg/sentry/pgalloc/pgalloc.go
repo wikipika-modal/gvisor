@@ -1833,6 +1833,16 @@ func (f *MemoryFile) IsDiskBacked() bool {
 	return f.opts.DiskBackedFile
 }
 
+// SyncBackingFile flushes the backing file's dirty page cache to disk. It is a
+// no-op if f is not disk-backed. It is used so that a host-side reflink of the
+// backing file observes all committed data.
+func (f *MemoryFile) SyncBackingFile() error {
+	if !f.IsDiskBacked() {
+		return nil
+	}
+	return unix.Fsync(f.FD())
+}
+
 // HugepagesEnabled returns true if the MemoryFile expects to back allocations
 // for which AllocOpts.Huge == true with huge pages.
 func (f *MemoryFile) HugepagesEnabled() bool {

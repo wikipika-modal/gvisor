@@ -141,6 +141,10 @@ type Container struct {
 	// following entries are for bind mounts in Spec.Mounts (in the same order).
 	GoferMountConfs specutils.GoferMountConfFlags `json:"goferMountConfs"`
 
+	// FSMutationLogFilestore is the journal-owned root filestore left for the
+	// caller to capture and remove. Other filestores use ordinary cleanup.
+	FSMutationLogFilestore string `json:"fsMutationLogFilestore,omitempty"`
+
 	//
 	// Fields below this line are not saved in the state file and will not
 	// be preserved across commands.
@@ -458,6 +462,9 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			return fmt.Errorf("cannot create sandbox: %w", err)
 		}
 		c.Sandbox = sand
+		if conf.FSMutationLog && conf.FSMutationLogPath != "" && len(args.FSRestoreImagePaths) == 0 && c.GoferMountConfs[0].IsSelfBacked() {
+			c.FSMutationLogFilestore = sentryapi.SelfFilestorePath(c.Spec.Root.Path, c.sandboxID())
+		}
 		return nil
 
 	}); err != nil {
@@ -821,6 +828,18 @@ func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
 	return c.Sandbox.TarRootfsUpperLayer(c.ID, outFD)
 }
 
+// FsMutationLog drains a mutation-log segment of the overlay upper layer into the persistent
+// host log file adopted at boot (see kernel.FsMutationLog). It does not clone the filestore;
+// the caller reflinks the filestore's and the log's physical backing files while the container
+// is paused. length is the size of the written segment; the caller reads [0, length).
+func (c *Container) FsMutationLog(path string, sinceGen uint64) (generation uint64, length uint64, err error) {
+	log.Debugf("FsMutationLog, cid: %s, path: %q", c.ID, path)
+	if err := c.CheckSandboxRunning(); err != nil {
+		return 0, 0, err
+	}
+	return c.Sandbox.FsMutationLog(path, sinceGen)
+}
+
 // SignalContainer sends the signal to the container. If all is true and signal
 // is SIGKILL, then waits for all processes to exit before returning.
 // SignalContainer returns an error if the container is already stopped.
@@ -1061,6 +1080,10 @@ func (c *Container) Destroy() error {
 			}
 		}
 		filestorePath := sentryapi.SelfFilestorePath(mountSrc, c.sandboxID())
+		if filestorePath == c.FSMutationLogFilestore {
+			log.Infof("Skipping deletion of filestore %q because fsmutationlog is enabled", filestorePath)
+			return
+		}
 		if err := os.Remove(filestorePath); err != nil {
 			err = fmt.Errorf("failed to delete filestore file %q: %v", filestorePath, err)
 			log.Warningf("%v", err)
@@ -1077,6 +1100,10 @@ func (c *Container) Destroy() error {
 			// Assume this is a self-backed shared mount and try to delete the
 			// filestore. Subsequently ignore the ENOENT if the assumption is wrong.
 			filestorePath := sentryapi.SelfFilestorePath(hint.Mount.Source, c.sandboxID())
+			if filestorePath == c.FSMutationLogFilestore {
+				log.Infof("Skipping deletion of filestore %q because fsmutationlog is enabled", filestorePath)
+				continue
+			}
 			if err := os.Remove(filestorePath); err != nil && !os.IsNotExist(err) {
 				err = fmt.Errorf("failed to delete shared filestore file %q: %v", filestorePath, err)
 				log.Warningf("%v", err)

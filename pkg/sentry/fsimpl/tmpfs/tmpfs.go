@@ -38,10 +38,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
@@ -129,6 +131,28 @@ type filesystem struct {
 
 	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
 	ovlWhiteout *deviceFile
+
+	// Mutation logging is opt-in and does not survive memory restore. logMu
+	// serializes frames, epoch transitions, and finalization; logEnabled gates
+	// mutation hooks. Open writers and shared mappings are reconciled at capture.
+	logEnabled        atomicbitops.Bool   `state:"nosave"`
+	logGen            atomicbitops.Uint64 `state:"nosave"`
+	logMu             sync.Mutex          `state:"nosave"`
+	logFD             int                 `state:"nosave"`
+	logOff            uint64              `state:"nosave"`
+	logMapping        []byte              `state:"nosave"`
+	logMapSize        uint64              `state:"nosave"`
+	logScratch        []byte              `state:"nosave"`
+	logOpenFiles      map[*inode]uint64   `state:"nosave"`
+	mmapWritable      map[*inode]struct{} `state:"nosave"`
+	lastEmittedLogGen uint64              `state:"nosave"`
+	logFailed         bool                `state:"nosave"`
+	logFailure        uint64              `state:"nosave"`
+	logSeq            uint64              `state:"nosave"`
+	logSealed         bool                `state:"nosave"`
+	logFinalized      bool                `state:"nosave"`
+	logFinalizeErr    error               `state:"nosave"`
+	preserveOnRelease bool                `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -170,6 +194,18 @@ type FilesystemOpts struct {
 	// DisableDefaultSizeLimit disables setting a default size limit. In Linux,
 	// SB_KERNMOUNT has this effect on tmpfs mounts; see mm/shmem.c:shmem_fill_super().
 	DisableDefaultSizeLimit bool
+
+	// EnableMutationLog turns on mutation-log tracking (see fsmutationlog.go) for this
+	// mount from creation. Only the disk-backed overlay upper -- the sole FSMutationLog
+	// target -- sets it, so ordinary tmpfs mounts pay no logging cost. When false, logEnabled
+	// stays false and every append helper is a no-op. When true, MutationLogFD must be set.
+	EnableMutationLog bool
+
+	// MutationLogFD is the host log file the mount journals to, donated at boot. It is
+	// adopted and mmap'd at creation, so structural records are written to it during
+	// execution. Required when EnableMutationLog is set; ownership is transferred to
+	// GetFilesystem.
+	MutationLogFD *fd.FD
 
 	// AllowXattrPrefix is a set of xattr namespace prefixes that this
 	// tmpfs mount will allow.
@@ -400,6 +436,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		maxSizeInPages:   maxSizeInPages,
 		maxInodes:        maxInodes,
 		allowXattrPrefix: allowXattrPrefix,
+		logFD:            -1, // no mutation-log file adopted yet
 	}
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
 	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
@@ -447,12 +484,42 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		ctx.Infof("tmpfs.filesystem: loaded SourceTar in %s", time.Since(timeUntarStart))
 	}
 
+	// Enable mutation-log tracking from creation when requested (only the disk-backed
+	// overlay upper sets EnableMutationLog) by adopting and mapping the donated log file, so
+	// structural records are written to the host file during execution from the first mutation
+	// on -- there is no separate pre-adoption buffering path. This is done after any SourceTar
+	// untar above so an enabled mount does not pay to log its initial population (the overlay
+	// upper has no SourceTar and starts empty, so it is still tracked in full). A mount left
+	// disabled (logEnabled false) pays nothing.
+	if tmpfsOptsOk && tmpfsOpts.EnableMutationLog {
+		if tmpfsOpts.MutationLogFD == nil {
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, fmt.Errorf("tmpfs: EnableMutationLog set without a MutationLogFD")
+		}
+		fs.logFD = tmpfsOpts.MutationLogFD.Release()
+		if err := fs.initMutationLog(); err != nil {
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, fmt.Errorf("tmpfs: map mutation log: %w", err)
+		}
+		fs.preserveOnRelease = true
+		fs.logEnabled.Store(true)
+	}
+
 	return &fs.vfsfs, &root.vfsd, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	if fs.preserveOnRelease {
+		// Zero filesystem references means that no guest operation can mutate
+		// this filesystem. Seal the journal before retaining the filestore ranges
+		// that it references for capture by the host.
+		if err := fs.finalizeMutationLog(); err != nil {
+			ctx.Warningf("finalizing filesystem mutation log: %v", err)
+		}
+		return
+	}
 	fs.mu.Lock()
 	if fs.root.inode.isDir() {
 		fs.root.releaseChildrenLocked(ctx)
@@ -461,6 +528,14 @@ func (fs *filesystem) Release(ctx context.Context) {
 		fs.ovlWhiteout.inode.decLinksLocked(ctx)
 	}
 	fs.mu.Unlock()
+	if fs.logMapping != nil {
+		unix.Munmap(fs.logMapping)
+		fs.logMapping = nil
+	}
+	if fs.logFD >= 0 {
+		unix.Close(fs.logFD)
+		fs.logFD = -1
+	}
 	if fs.mf.ResourceID().Ok() {
 		// If ResourceID is set, then this is a private MemoryFile which needs
 		// to be destroyed since this tmpfs is the only user.
@@ -1254,7 +1329,12 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	return fd.dentry().inode.setStat(ctx, auth.CredentialsFromContext(ctx), &opts)
+	d := fd.dentry()
+	if err := d.inode.setStat(ctx, auth.CredentialsFromContext(ctx), &opts); err != nil {
+		return err
+	}
+	d.inode.fs.logDirty(d.inode)
+	return nil
 }
 
 // StatFS implements vfs.FileDescriptionImpl.StatFS.
@@ -1274,12 +1354,22 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
-	return fd.dentry().inode.setXattr(auth.CredentialsFromContext(ctx), &opts)
+	d := fd.dentry()
+	if err := d.inode.setXattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
+		return err
+	}
+	d.inode.fs.logDirty(d.inode)
+	return nil
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
-	return fd.dentry().inode.removeXattr(auth.CredentialsFromContext(ctx), name)
+	d := fd.dentry()
+	if err := d.inode.removeXattr(auth.CredentialsFromContext(ctx), name); err != nil {
+		return err
+	}
+	d.inode.fs.logDirty(d.inode)
+	return nil
 }
 
 // GetPosixACL implements vfs.FileDescriptionImpl.GetPosixACL.
@@ -1296,7 +1386,12 @@ func (fd *fileDescription) GetPosixACL(ctx context.Context, t vfs.ACLType) (*vfs
 
 // SetPosixACL implements vfs.FileDescriptionImpl.SetPosixACL.
 func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
-	return fd.dentry().inode.setPosixACL(auth.CredentialsFromContext(ctx), t, acl, clearSGID)
+	in := fd.dentry().inode
+	newACL, mode, err := in.setPosixACL(auth.CredentialsFromContext(ctx), t, acl, clearSGID)
+	if err == nil {
+		in.fs.logDirty(in)
+	}
+	return newACL, mode, err
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all

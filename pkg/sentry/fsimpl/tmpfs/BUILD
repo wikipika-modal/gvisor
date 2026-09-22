@@ -86,6 +86,8 @@ go_library(
         "filesystem.go",
         "filesystem_mutex.go",
         "fscheckpoint.go",
+        "fsmutationlog.go",
+        "fsmutationlog_fmlg_unsafe.go",
         "fstree.go",
         "inode_mutex.go",
         "inode_refs.go",
@@ -138,6 +140,7 @@ go_library(
         "//pkg/sync",
         "//pkg/sync/locking",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -160,6 +163,8 @@ go_test(
     name = "tmpfs_test",
     size = "small",
     srcs = [
+        "fsmutationlog_test.go",
+        "fstestharness_test.go",
         "pipe_test.go",
         "regular_file_test.go",
         "stat_test.go",
@@ -172,6 +177,7 @@ go_test(
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/fd",
         "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/sentry/contexttest",
