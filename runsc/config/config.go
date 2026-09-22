@@ -104,6 +104,18 @@ type Config struct {
 	// DO NOT call it directly, use GetOverlay2() instead.
 	Overlay2 Overlay2 `flag:"overlay2"`
 
+	// FSMutationLog enables mutation-log tracking (the fsmutationlog snapshot
+	// mechanism) on the disk-backed overlay upper layer. Off by default so ordinary
+	// sandboxes pay no logging cost; the caller sets it for sandboxes that will be
+	// snapshotted with fsmutationlog.
+	FSMutationLog bool `flag:"fsmutationlog"`
+
+	// FSMutationLogPath is the host path of the persistent mutation-log file for the
+	// root overlay upper. When set (with FSMutationLog), runsc opens it and donates it
+	// to the sandbox at boot, so the sentry adopts it at mount creation and journals to
+	// it during execution. The snapshot caller reflinks this same path.
+	FSMutationLogPath string `flag:"fsmutationlog-path"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 

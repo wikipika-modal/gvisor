@@ -74,6 +74,10 @@ const (
 	// ContMgrFSSave saves a filesystem checkpoint.
 	ContMgrFSSave = "containerManager.FSSave"
 
+	// ContMgrFsMutationLog emits an ordered journal of the mutations to the
+	// overlay upper layer's files.
+	ContMgrFsMutationLog = "containerManager.FsMutationLog"
+
 	// ContMgrGetSavings gets the savings for restored sandboxes.
 	ContMgrGetSavings = "containerManager.GetSavings"
 
@@ -1237,6 +1241,47 @@ func (cm *containerManager) FSSave(args *FSSaveArgs, _ *struct{}) error {
 		return err
 	}
 	return cm.l.k.FSSave(cm.l.k.SupervisorContext(), &kopts)
+}
+
+// FsMutationLogArgs holds arguments to FsMutationLog.
+type FsMutationLogArgs struct {
+	// Path is the mount path inside the container to journal. Empty defaults to
+	// "/".
+	Path string `json:"path"`
+
+	// SinceGen requests the segment of changes since this generation (as returned
+	// by a previous call). Zero drains the full history of a mount that has not been
+	// drained yet; a mismatch fails (there is no full baseline).
+	SinceGen uint64 `json:"since_gen"`
+}
+
+// FsMutationLogResult holds results from FsMutationLog.
+type FsMutationLogResult struct {
+	// Generation is the generation the written segment reflects; the caller passes
+	// it as SinceGen next time.
+	Generation uint64 `json:"generation"`
+
+	// Length is the size of the written segment; the caller reflinks the log file and
+	// reads [0, Length).
+	Length uint64 `json:"length"`
+}
+
+// FsMutationLog writes an ordered journal of the mutations to the overlay upper
+// layer to the provided log file. It does not clone the filestore; the caller
+// reflinks the filestore's physical backing file host-side while the container
+// remains paused.
+func (cm *containerManager) FsMutationLog(args *FsMutationLogArgs, res *FsMutationLogResult) error {
+	log.Debugf("containerManager.FsMutationLog")
+	kopts := kernel.FsMutationLogOpts{
+		Path:     args.Path,
+		SinceGen: args.SinceGen,
+	}
+	if err := cm.l.k.FsMutationLog(cm.l.k.SupervisorContext(), &kopts); err != nil {
+		return err
+	}
+	res.Generation = kopts.Generation
+	res.Length = kopts.Length
+	return nil
 }
 
 // Savings holds the savings with restore.

@@ -2,83 +2,83 @@ load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(default_applicable_licenses = ["//:license"])
+package(default_applicable_licenses=["//:license"])
 
 licenses(["notice"])
 
 go_template_instance(
-    name = "dentry_list",
-    out = "dentry_list.go",
-    package = "tmpfs",
-    prefix = "dentry",
-    template = "//pkg/ilist:generic_list",
-    types = {
+    name="dentry_list",
+    out="dentry_list.go",
+    package="tmpfs",
+    prefix="dentry",
+    template="//pkg/ilist:generic_list",
+    types={
         "Element": "*dentry",
         "Linker": "*dentry",
     },
 )
 
 go_template_instance(
-    name = "fstree",
-    out = "fstree.go",
-    package = "tmpfs",
-    prefix = "generic",
-    template = "//pkg/sentry/vfs/genericfstree:generic_fstree",
-    types = {
+    name="fstree",
+    out="fstree.go",
+    package="tmpfs",
+    prefix="generic",
+    template="//pkg/sentry/vfs/genericfstree:generic_fstree",
+    types={
         "Dentry": "dentry",
         "Filesystem": "filesystem",
     },
 )
 
 go_template_instance(
-    name = "inode_refs",
-    out = "inode_refs.go",
-    package = "tmpfs",
-    prefix = "inode",
-    template = "//pkg/refs:refs_template",
-    types = {
+    name="inode_refs",
+    out="inode_refs.go",
+    package="tmpfs",
+    prefix="inode",
+    template="//pkg/refs:refs_template",
+    types={
         "T": "inode",
     },
 )
 
 declare_rwmutex(
-    name = "ancestry_mutex",
-    out = "ancestry_mutex.go",
-    package = "tmpfs",
-    prefix = "ancestry",
+    name="ancestry_mutex",
+    out="ancestry_mutex.go",
+    package="tmpfs",
+    prefix="ancestry",
 )
 
 declare_rwmutex(
-    name = "filesystem_mutex",
-    out = "filesystem_mutex.go",
-    package = "tmpfs",
-    prefix = "filesystem",
+    name="filesystem_mutex",
+    out="filesystem_mutex.go",
+    package="tmpfs",
+    prefix="filesystem",
 )
 
 declare_mutex(
-    name = "inode_mutex",
-    out = "inode_mutex.go",
-    package = "tmpfs",
-    prefix = "inode",
+    name="inode_mutex",
+    out="inode_mutex.go",
+    package="tmpfs",
+    prefix="inode",
 )
 
 declare_mutex(
-    name = "iter_mutex",
-    out = "iter_mutex.go",
-    package = "tmpfs",
-    prefix = "iter",
+    name="iter_mutex",
+    out="iter_mutex.go",
+    package="tmpfs",
+    prefix="iter",
 )
 
 declare_mutex(
-    name = "pages_used_mutex",
-    out = "pages_used_mutex.go",
-    package = "tmpfs",
-    prefix = "pagesUsed",
+    name="pages_used_mutex",
+    out="pages_used_mutex.go",
+    package="tmpfs",
+    prefix="pagesUsed",
 )
 
 go_library(
-    name = "tmpfs",
-    srcs = [
+    name="tmpfs",
+    srcs=[
         "ancestry_mutex.go",
         "dentry_list.go",
         "device_file.go",
@@ -86,6 +86,8 @@ go_library(
         "filesystem.go",
         "filesystem_mutex.go",
         "fscheckpoint.go",
+        "fsmutationlog.go",
+        "fsmutationlog_fmlg_unsafe.go",
         "fstree.go",
         "inode_mutex.go",
         "inode_refs.go",
@@ -99,13 +101,13 @@ go_library(
         "tar.go",
         "tmpfs.go",
     ],
-    imports = [
+    imports=[
         "gvisor.dev/gvisor/pkg/sentry/checkpoint",
         "gvisor.dev/gvisor/pkg/sentry/vfs",
     ],
-    marshal = True,
-    visibility = ["//pkg/sentry:internal"],
-    deps = [
+    marshal=True,
+    visibility=["//pkg/sentry:internal"],
+    deps=[
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
@@ -138,14 +140,15 @@ go_library(
         "//pkg/sync",
         "//pkg/sync/locking",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
 go_test(
-    name = "benchmark_test",
-    size = "small",
-    srcs = ["benchmark_test.go"],
-    deps = [
+    name="benchmark_test",
+    size="small",
+    srcs=["benchmark_test.go"],
+    deps=[
         ":tmpfs",
         "//pkg/abi/linux",
         "//pkg/fspath",
@@ -157,21 +160,24 @@ go_test(
 )
 
 go_test(
-    name = "tmpfs_test",
-    size = "small",
-    srcs = [
+    name="tmpfs_test",
+    size="small",
+    srcs=[
+        "fsmutationlog_test.go",
+        "fstestharness_test.go",
         "pipe_test.go",
         "regular_file_test.go",
         "stat_test.go",
         "tar_test.go",
         "tmpfs_test.go",
     ],
-    library = ":tmpfs",
-    deps = [
+    library=":tmpfs",
+    deps=[
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/fd",
         "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/sentry/contexttest",

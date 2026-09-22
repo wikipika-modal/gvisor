@@ -19,6 +19,7 @@ go_library(
         "exec.go",
         "features.go",
         "fscheckpoint.go",
+        "fsmutationlog.go",
         "gofer.go",
         "install.go",
         "install_sidecars.go",

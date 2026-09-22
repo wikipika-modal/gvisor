@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net"
@@ -27,9 +28,11 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
@@ -153,6 +156,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		ExecFD:           -1,
 		RootfsUpperTarFD: -1,
 		CPUDMALatencyFD:  -1,
+		FSMutationLogFD:  -1,
 	}
 	l, err := New(args)
 	if err != nil {
@@ -282,13 +286,15 @@ func TestHostnetWithRawSockets(t *testing.T) {
 
 	// Creating loader should fail.
 	l, err := New(Args{
-		ID:              "should-fail",
-		Spec:            testSpec(),
-		Conf:            conf,
-		DevGoferFD:      -1,
-		PodInitConfigFD: -1,
-		ExecFD:          -1,
-		CPUDMALatencyFD: -1,
+		ID:               "should-fail",
+		Spec:             testSpec(),
+		Conf:             conf,
+		DevGoferFD:       -1,
+		PodInitConfigFD:  -1,
+		ExecFD:           -1,
+		RootfsUpperTarFD: -1,
+		CPUDMALatencyFD:  -1,
+		FSMutationLogFD:  -1,
 	})
 	if err == nil {
 		l.Destroy()
@@ -689,6 +695,103 @@ func TestSignalUnkillablePolicyMapping(t *testing.T) {
 	} {
 		if got := signalUnkillablePolicy(tc.confPolicy); got != tc.kernelPolicy {
 			t.Errorf("signalUnkillablePolicy(%v) = %v, want %v", tc.confPolicy, got, tc.kernelPolicy)
+		}
+	}
+}
+
+// TestRunFinalizesMutationLog preserves the real upper after its guest namespace exits.
+func TestRunFinalizesMutationLog(t *testing.T) {
+	journal, err := os.CreateTemp(t.TempDir(), "journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	filestore, err := os.CreateTemp(t.TempDir(), "filestore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer filestore.Close()
+	logFD, err := fd.NewFromFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFD.Close()
+	storeFD, err := fd.NewFromFile(filestore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeFD.Close()
+
+	conf := testConfig()
+	conf.FSMutationLog = true
+	spec := testSpec()
+	spec.Root.Readonly = false
+	// Use a directory owned by the guest user; the host root may be read-only.
+	spec.Process.Cwd = t.TempDir()
+	spec.Process.User = specs.User{UID: uint32(os.Getuid()), GID: uint32(os.Getgid())}
+	const contents = "fmlg-retained-upper-data"
+	spec.Process.Args = []string{"/bin/sh", "-c", "echo " + contents + " > fmlg-retained-file"}
+	l, cleanup, err := createLoader(conf, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	// Configure the journaled upper before Run creates the root filesystem.
+	l.mu.Lock()
+	l.root.goferMountConfs[0].Upper = specutils.SelfOverlay
+	l.root.goferFilestoreFDs = []*fd.FD{fd.New(storeFD.Release())}
+	l.root.fsMutationLogFD = fd.New(logFD.Release())
+	l.mu.Unlock()
+	destroyed := false
+	defer func() {
+		if !destroyed {
+			l.Destroy()
+		}
+	}()
+
+	started := make(chan error, 1)
+	go func() { started <- <-l.ctrl.manager.startResultChan }()
+	if err := l.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	if status := l.WaitExit(); !status.Exited() || status.ExitStatus() != 0 {
+		t.Fatalf("application exited with %s", status)
+	}
+	data, err := os.ReadFile(journal.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 112 || string(data[:4]) != "FMLG" || binary.LittleEndian.Uint16(data[4:]) != 2 {
+		t.Fatalf("exit journal: %d bytes, want a trimmed v2 epoch", len(data))
+	}
+	endFrame := data[len(data)-48:]
+	epoch := binary.LittleEndian.Uint64(endFrame[0:])
+	kind := binary.LittleEndian.Uint32(endFrame[12:])
+	endOffset := binary.LittleEndian.Uint64(endFrame[24:])
+	frameCount := binary.LittleEndian.Uint64(endFrame[32:])
+	reason := binary.LittleEndian.Uint64(endFrame[40:])
+	if epoch != 1 || kind != 6 || endOffset != uint64(len(data)) || frameCount <= 2 || reason != 1 {
+		t.Fatalf("missing graceful END: %x", endFrame)
+	}
+
+	// Loader teardown must leave the backing bytes readable by the host.
+	l.Destroy()
+	destroyed = true
+	buf := make([]byte, 4096)
+	for offset := int64(0); ; offset += int64(len(buf)) {
+		offset, err = unix.Seek(int(filestore.Fd()), offset, unix.SEEK_DATA)
+		if err != nil {
+			t.Fatalf("retained file contents missing from filestore: %v", err)
+		}
+		n, err := filestore.ReadAt(buf, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(buf[:n]), contents) {
+			break
 		}
 	}
 }

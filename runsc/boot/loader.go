@@ -172,6 +172,10 @@ type containerInfo struct {
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
 
+	// fsMutationLogFD is the persistent mutation-log file that the root overlay upper
+	// adopts at mount creation. nil if not donated (e.g. on restore).
+	fsMutationLogFD *fd.FD
+
 	// useCPUNums indicates whether to use platform assigned CPU numbers as CPU numbers in the sentry.
 	useCPUNums bool
 }
@@ -543,6 +547,10 @@ type Args struct {
 	// The `Loader` records midpoints on it as it goes through loader creation
 	// and sandbox startup. The `Loader` does not take ownership of it.
 	StartupTimer *timing.Timer
+
+	// FSMutationLogFD is the file descriptor to the persistent mutation-log file that the
+	// root overlay upper adopts at mount creation. -1 if not donated.
+	FSMutationLogFD int
 }
 
 // HostTHP holds host transparent hugepage settings.
@@ -767,6 +775,9 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("rootfs upper tar file is mutually exclusive with filesystem checkpoint restore")
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
+	}
+	if args.FSMutationLogFD >= 0 {
+		l.root.fsMutationLogFD = fd.New(args.FSMutationLogFD)
 	}
 
 	// Create kernel and platform.
@@ -1996,7 +2007,6 @@ func (l *Loader) WaitForStartSignal() {
 func (l *Loader) WaitExit() linux.WaitStatus {
 	// Wait for container.
 	l.k.WaitExited()
-
 	return l.k.GlobalInit().ExitStatus()
 }
 
