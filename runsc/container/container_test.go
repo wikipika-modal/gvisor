@@ -3235,6 +3235,66 @@ func TestWaitOnExitedSandbox(t *testing.T) {
 	}
 }
 
+// TestDestroyFilestoreCleanup checks cleanup after reloading persisted container state.
+func TestDestroyFilestoreCleanup(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fsmutationlog=%t", enabled), func(t *testing.T) {
+			c := &Container{
+				ID:     "filestore-test",
+				Status: Stopped,
+				Spec: &specs.Spec{
+					Root:   &specs.Root{Path: t.TempDir()},
+					Mounts: []specs.Mount{{Type: "bind", Source: t.TempDir(), Destination: "/data"}},
+				},
+				GoferMountConfs: []specutils.GoferMountConf{
+					{Lower: specutils.Lisafs, Upper: specutils.SelfOverlay},
+					{Lower: specutils.Lisafs, Upper: specutils.SelfOverlay},
+				},
+				Saver: StateFile{RootDir: t.TempDir(), ID: FullID{SandboxID: "filestore-test", ContainerID: "filestore-test"}},
+			}
+			filestore := boot.SelfFilestorePath(c.Spec.Root.Path, c.sandboxID())
+			if enabled {
+				c.FSMutationLogFilestore = filestore
+			}
+			// A self-backed bind mount is unrelated to the root mutation journal.
+			submountFilestore := boot.SelfFilestorePath(c.Spec.Mounts[0].Source, c.sandboxID())
+			if err := os.WriteFile(submountFilestore, []byte("submount data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filestore, []byte("snapshot data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Saver.lock(BlockAcquire); err != nil {
+				t.Fatal(err)
+			}
+			err := c.saveLocked()
+			c.Saver.UnlockOrDie()
+			defer c.Saver.close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var loaded Container
+			if err := c.Saver.load(&loaded, LoadOpts{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := loaded.Destroy(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(submountFilestore); !os.IsNotExist(err) {
+				t.Fatalf("unrelated filestore was not removed: %v", err)
+			}
+			data, err := os.ReadFile(filestore)
+			if enabled {
+				if err != nil || string(data) != "snapshot data" {
+					t.Fatalf("journaled filestore was not preserved: data %q, err %v", data, err)
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("ordinary filestore was not removed: %v", err)
+			}
+		})
+	}
+}
+
 func TestDestroyNotStarted(t *testing.T) {
 	spec, conf := sleepSpecConf(t)
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
