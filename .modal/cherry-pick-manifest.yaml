@@ -1,0 +1,95 @@
+# Commits cherry-picked onto this release branch, in application order, by category.
+# Sources are the original commits (upstream, PR heads or Modal branches), not the resulting picks.
+release_branch: release/20261005
+branch_point_date: "2026-10-05"
+base: 1c9217b74ada6e7cdf35c70560f49c4aec91ab67
+previous_release: e2e1b96327e6eddaa7b6589d6489756b88d88702
+picks:
+  - source: c7f458aa30f9494c42f3ff2e8075263b1ddced04
+    group: non_modal
+    subject: "systrap: shift the spinning queue by the stub gap"
+    pull_request: https://github.com/google/gvisor/pull/15573
+  - source: c5606b4744862ac94306207bdeef3925c2835eed
+    group: non_modal
+    subject: "Drop reassembled IPv4 packets exceeding maximum total length."
+  - source: 38ad1072a85cfc3a1abc2ab0384cc481c71abf27
+    group: non_modal
+    subject: "systrap: retry seccomp notify RECV on ENOENT"
+    pull_request: https://github.com/google/gvisor/pull/15496
+  - source: 636086525b2e6225d32bf3892aac764ba1bcb2c1
+    group: non_modal
+    subject: "Don't cut EROFS reads short at the inline tail"
+    pull_request: https://github.com/google/gvisor/pull/15526
+  - source: 553528ee10349d5235f364c4e2cc500f0d4c488a
+    group: non_modal
+    subject: "Only signal a process group's stopped members when it becomes orphaned."
+  - source: 6915fb6809164ba86a1d4948fa1f97273592b78b
+    group: non_modal
+    subject: "Inherit TCP_NODELAY on accepted TCP sockets"
+    pull_request: https://github.com/google/gvisor/pull/15517
+  - source: 9537768b1221e7810f19ca4b18a72076c6c4d55c
+    group: modal
+    subject: "rdmaproxy: support UCX-based data planes (epoll, comp channels, SRQ)"
+    pull_request: https://github.com/google/gvisor/pull/14950
+  - source: 15d86e6e33490416ecd039976ea21059ff7d81e1
+    group: modal
+    subject: "nvproxy: Reject OS descriptors without a handle"
+    pull_request: https://github.com/google/gvisor/pull/15377
+  - source: da908864052797e17e3e7fc58d1ede7d60e211e6
+    group: modal
+    subject: "nvproxy: Support NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR on fixed drivers"
+    pull_request: https://github.com/google/gvisor/pull/15354
+  - source: 1cfac5e1e10a9e30987e7cbd0845ecec4182dfe4
+    group: modal
+    subject: "nvproxy: NVIDIA RTX PRO 6000 Missing ioctl 0x501 Implementation"
+    pull_request: https://github.com/google/gvisor/pull/15391
+  - source: 99ae9fe90b7756d46892e3cbf41bb857b9544bd5
+    group: prs
+    subject: "Pass --device-map to cuda-checkpoint when GPUs change across restore"
+    pull_request: https://github.com/google/gvisor/pull/14817
+  - source: 11bd95794c64419341ca2022c25cd6772a96bdeb
+    group: prs
+    subject: "systrap: return bare errno from stub syscalls"
+    pull_request: https://github.com/google/gvisor/pull/14940
+  - source: a559b7869b8db54f95d5f73b6c1b645e0ee9279d
+    group: prs
+    subject: "nvproxy: handle Blackwell profiler control commands used by CUPTI"
+    pull_request: https://github.com/google/gvisor/pull/15290
+  - source: 500102117012d89d7a3e9cc194ae1aefd408a458
+    group: prs
+    subject: "Expose virtual NUMA topology for NVProxy workloads"
+    pull_request: https://github.com/google/gvisor/pull/15636
+  - source: 9f745c6f34d35cc053ae1dc917319403d4dc72d5
+    group: prs
+    subject: "nvproxy: support /dev/nvidia-uvm-tools"
+    pull_request: https://github.com/google/gvisor/pull/15547
+  - source: d517f89891151a838e1c4be175fafac20d74eb81
+    group: prs
+    subject: "nvproxy: Add NV_COUNTER_COLLECTION_UNIT control commands"
+    pull_request: https://github.com/google/gvisor/pull/15638
+  - source: 0d478ad5526d64dfa092c8617626ffde479a9216
+    group: prs
+    subject: "tmpfs: stream regular file contents to and from tar archives"
+    pull_request: https://github.com/google/gvisor/pull/15675
+  - source: d87b5a5c3f24543539e7e5ee3fe1df0b9077f3cc
+    group: prs
+    subject: "Adds missing ioctls for Vulkan"
+    pull_request: https://github.com/google/gvisor/pull/15736
+  - source: 914b7c3978b417142fb2960c49b4360356b9a201
+    group: prs
+    subject: "cpuid: Hide AMX from applications"
+    pull_request: https://github.com/google/gvisor/pull/15727
+  - source: c8bf830b32649ba97086a923418ddce2c8ec92a2
+    group: prs
+    subject: "nvproxy: remove unused profiling control"
+    pull_request: https://github.com/google/gvisor/pull/15943
+  - source: 94e0abe7a4efbca07f91eca34a2b8517a6221273
+    group: proprietary
+    subject: "MODAL: Add the XEMU platform"
+  - source: 8ebd5dd1a82de80858dc4a8cde64a5f2e7764a2a
+    group: proprietary
+    subject: "MODAL: Add support for fsmutationlog."
+  - source: 5a81a38fc013466ae8f5e0f59fb8128a99ee691a
+    group: proprietary
+    subject: "MODAL: Do not embed sidecar binaries in runsc"
+    pull_request: https://github.com/modal-labs/gvisor/pull/20
