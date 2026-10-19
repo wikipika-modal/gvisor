@@ -80,6 +80,12 @@ func putDentrySlice(ds *[]*dentry) {
 // +checklocksreleaseread:fs.renameMu
 func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*dentry) {
 	fs.renameMu.RUnlock()
+	fs.checkDropDentries(ctx, dsp)
+}
+
+// checkDropDentries is renameMuRUnlockAndCheckDrop for callers that have
+// already unlocked fs.renameMu.
+func (fs *filesystem) checkDropDentries(ctx context.Context, dsp **[]*dentry) {
 	if *dsp == nil {
 		return
 	}
@@ -557,7 +563,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
-	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, ct == createSyntheticMountpoint, false /* skipData */); err != nil {
+	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, ct == createSyntheticMountpoint, false /* skipData */, nil /* renameMuReleased */); err != nil {
 		return err
 	}
 
@@ -816,7 +822,7 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	unlocked := false
 	unlock := func() {
 		if !unlocked {
-			fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+			fs.renameMuRUnlockAndCheckDrop(ctx, &ds) // +checklocksforce: fs.renameMu is held until unlocked is set.
 			unlocked = true
 		}
 	}
@@ -830,13 +836,8 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		if mustCreate {
 			return nil, linuxerr.EEXIST
 		}
-		if err := start.ensureOpenableLocked(ctx, rp, &opts); err != nil {
-			return nil, err
-		}
-		start.IncRef()
-		defer start.DecRef(ctx)
-		unlock()
-		return start.openCopiedUp(ctx, rp, &opts)
+		unlocked = true // openExistingLocked unlocks fs.renameMu and drops ds.
+		return fs.openExistingLocked(ctx, rp, start, &opts, &ds)
 	}
 
 afterTrailingSymlink:
@@ -884,17 +885,49 @@ afterTrailingSymlink:
 	if rp.MustBeDir() && !child.isDir() {
 		return nil, linuxerr.ENOTDIR
 	}
-	if err := child.ensureOpenableLocked(ctx, rp, &opts); err != nil {
-		return nil, err
-	}
-	child.IncRef()
-	defer child.DecRef(ctx)
-	unlock()
-	return child.openCopiedUp(ctx, rp, &opts)
+	unlocked = true // openExistingLocked unlocks fs.renameMu and drops ds.
+	return fs.openExistingLocked(ctx, rp, child, &opts, &ds)
 }
 
-// Preconditions: filesystem.renameMu must be locked.
-func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) error {
+// openExistingLocked opens d, which a path walk that added zero-reference
+// dentries to *ds has reached.
+//
+// +checklocksreleaseread:fs.renameMu
+// +checklocksignore
+func (fs *filesystem) openExistingLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, error) {
+	// d must stay alive while copy-up runs without fs.renameMu. DecRef may lock
+	// fs.renameMu for writing, so it runs after fs.renameMu is unlocked below.
+	d.IncRef()
+	defer d.DecRef(ctx)
+	for {
+		renameMuReleased := false
+		err := d.ensureOpenableLocked(ctx, rp, opts, &renameMuReleased)
+		if err == errCopyUpInProgress {
+			fs.renameMu.RUnlock()
+			d.waitForCopyUp()
+			fs.renameMu.RLock()
+			continue
+		}
+		// Dropping dentries in ds may lock fs.renameMu for writing, so it
+		// must happen after copy-up has unlocked d.copyMu.
+		if renameMuReleased {
+			fs.checkDropDentries(ctx, ds)
+		} else {
+			fs.renameMuRUnlockAndCheckDrop(ctx, ds)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return d.openCopiedUp(ctx, rp, opts)
+	}
+}
+
+// ensureOpenableLocked checks that d can be opened with opts, and copies d up
+// if opts requires write access. See copyUpForOpenLocked for renameMuReleased
+// and errCopyUpInProgress.
+//
+// Preconditions: filesystem.renameMu must be locked for reading.
+func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, renameMuReleased *bool) error {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return err
@@ -934,10 +967,7 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 		return err
 	}
 	defer rp.Mount().EndWrite()
-	if opts.Flags&linux.O_TRUNC != 0 {
-		return d.copyUpForTruncateLocked(ctx)
-	}
-	return d.copyUpLocked(ctx)
+	return d.copyUpForOpenLocked(ctx, opts.Flags&linux.O_TRUNC != 0, renameMuReleased)
 }
 
 // Preconditions: If vfs.AccessTypesForOpenFlags(opts).MayWrite() and d is not a

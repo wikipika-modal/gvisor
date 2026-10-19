@@ -912,7 +912,7 @@ func (d *dentry) topLayer() vfs.VirtualDentry {
 }
 
 func (d *dentry) topLookupLayer() lookupLayer {
-	if d.upperVD.Ok() {
+	if d.isCopiedUp() {
 		return lookupLayerUpper
 	}
 	return lookupLayerLower

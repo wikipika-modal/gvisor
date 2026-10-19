@@ -15,6 +15,7 @@
 package overlay
 
 import (
+	"errors"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -51,19 +52,46 @@ func (d *dentry) canBeCopiedUp() bool {
 //
 // Preconditions: filesystem.renameMu must be locked.
 func (d *dentry) copyUpLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, false /* forSyntheticMountpoint */, false /* skipData */)
+	return d.copyUpMaybeSyntheticMountpointLocked(ctx, false /* forSyntheticMountpoint */, false /* skipData */, nil /* renameMuReleased */)
 }
 
-// copyUpForTruncateLocked is copyUpLocked for an open with O_TRUNC, which
-// truncates the upper file right after copy-up, so regular file data is not
-// copied. Compare Linux's fs/overlayfs/copy_up.c:ovl_copy_up_flags().
+// errCopyUpInProgress is returned by copyUpForOpenLocked when another copy-up
+// of the same dentry holds dentry.copyMu.
+var errCopyUpInProgress = errors.New("overlay: copy-up in progress")
+
+// waitForCopyUp waits for operations holding d.copyMu, such as a copy-up of
+// d, to finish. It locks d.copyMu for writing, which waits out current readers
+// and holds off new ones, so that retrying doesn't spin while readers hold it.
 //
-// Preconditions: filesystem.renameMu must be locked.
-func (d *dentry) copyUpForTruncateLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, false /* forSyntheticMountpoint */, true /* skipData */)
+// Preconditions: filesystem.renameMu must be unlocked.
+func (d *dentry) waitForCopyUp() {
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
 }
 
-func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSyntheticMountpoint, skipData bool) error {
+// copyUpForOpenLocked is copyUpLocked for an open that requires write access.
+//
+// If trunc is true, the open truncates the upper file right after copy-up, so
+// regular file data is not copied. Compare Linux's
+// fs/overlayfs/copy_up.c:ovl_copy_up_flags().
+//
+// Otherwise, copyUpForOpenLocked unlocks filesystem.renameMu and sets
+// *renameMuReleased before copying regular file data, so that copying a large
+// file does not block path operations elsewhere in the filesystem. d.copyMu
+// stays locked until copy-up is published; operations that could rename or
+// remove d wait for it until then. If another copy-up of d holds d.copyMu,
+// copyUpForOpenLocked returns errCopyUpInProgress with filesystem.renameMu
+// still locked, and the caller should wait for d.copyMu without holding
+// filesystem.renameMu before retrying.
+//
+// Preconditions:
+//   - filesystem.renameMu must be locked for reading.
+//   - The caller must hold a reference on d.
+func (d *dentry) copyUpForOpenLocked(ctx context.Context, trunc bool, renameMuReleased *bool) error {
+	return d.copyUpMaybeSyntheticMountpointLocked(ctx, false /* forSyntheticMountpoint */, trunc, renameMuReleased)
+}
+
+func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSyntheticMountpoint, skipData bool, renameMuReleased *bool) error {
 	// Fast path.
 	if d.isCopiedUp() {
 		return nil
@@ -83,11 +111,15 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		// d is a filesystem root with no upper layer.
 		return linuxerr.EROFS
 	}
-	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, forSyntheticMountpoint, false /* skipData */); err != nil {
+	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, forSyntheticMountpoint, false /* skipData */, nil /* renameMuReleased */); err != nil {
 		return err
 	}
 
-	d.copyMu.Lock()
+	if renameMuReleased == nil {
+		d.copyMu.Lock()
+	} else if !d.copyMu.TryLock() {
+		return errCopyUpInProgress
+	}
 	defer d.copyMu.Unlock()
 	if d.upperVD.Ok() {
 		// Raced with another call to d.copyUpLocked().
@@ -155,6 +187,10 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		}
 		defer newFD.DecRef(ctx)
 		if !skipData {
+			if renameMuReleased != nil {
+				d.fs.renameMu.RUnlock()
+				*renameMuReleased = true
+			}
 			if _, err := vfs.CopyRegularFileData(ctx, newFD, oldFD); err != nil {
 				cleanupUndoCopyUp()
 				return err
