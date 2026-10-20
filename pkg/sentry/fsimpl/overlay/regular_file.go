@@ -187,7 +187,7 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 			return nil
 		}
 		d.fs.renameMu.RLock()
-		err := d.copyUpLocked(ctx)
+		err := d.copyUpForWriteLocked(ctx)
 		d.fs.renameMu.RUnlock()
 		if err != nil {
 			return err
