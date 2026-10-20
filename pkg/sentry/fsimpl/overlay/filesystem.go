@@ -619,7 +619,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 		// Not requesting write permission.  Allow it.
 		return nil
 	}
-	if !d.upperVD.Ok() && !d.canBeCopiedUp() {
+	if !d.isCopiedUp() && !d.canBeCopiedUp() {
 		// A lower layer file that can not be copied up, can not be written to.
 		// Error out here. Don't give the application false hopes.
 		return linuxerr.EACCES
@@ -955,7 +955,7 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	if err := d.writeCount.CheckWrite(); err != nil {
 		return err
 	}
-	if !d.upperVD.Ok() && !d.canBeCopiedUp() {
+	if !d.isCopiedUp() && !d.canBeCopiedUp() {
 		return linuxerr.EPERM
 	}
 	if linux.FileMode(d.mode.Load()).IsSpecialFile() {
@@ -1799,7 +1799,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 
 	// We need a dentry representing the child being removed in order to verify
 	// that it's not a directory.
-	child, childLayer, err := fs.getChildLocked(ctx, parent, name, &ds)
+	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
 	if err != nil {
 		return err
 	}
@@ -1810,9 +1810,11 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	// Hold child.copyMu to prevent it from being copied-up during
-	// deletion.
+	// deletion. Determine its layer only once copyMu is held, since a copy-up
+	// in progress may finish while we wait.
 	child.copyMu.RLock()
 	defer child.copyMu.RUnlock()
+	childLayer := child.topLookupLayer()
 	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 		return err
 	}
