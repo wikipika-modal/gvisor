@@ -1614,6 +1614,8 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 		return err
 	}
+	d.IncRef()
+	defer d.DecRef(ctx)
 	err = d.setStatLocked(ctx, rp, opts)
 	if err == nil {
 		if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
@@ -1624,7 +1626,7 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 	return err
 }
 
-// Precondition: d.fs.renameMu must be held for reading.
+// Preconditions: d.fs.renameMu must be held for reading, and the caller must hold a reference on d.
 func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	mode := linux.FileMode(d.mode.Load())
 	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts, mode, d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
@@ -1643,7 +1645,7 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 		return err
 	}
 	defer mnt.EndWrite()
-	if err := d.copyUpLocked(ctx); err != nil {
+	if err := d.copyUpForWriteLocked(ctx); err != nil {
 		return err
 	}
 	// Changes to d's attributes are serialized by d.copyMu.
