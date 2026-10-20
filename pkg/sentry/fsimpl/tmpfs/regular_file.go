@@ -197,7 +197,8 @@ func NewMemfd(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount, al
 }
 
 // truncate grows or shrinks the file to the given size. It unconditionally
-// updates mtime and ctime.
+// updates mtime and ctime, and clears setuid/setgid bits and file
+// capabilities as Linux's fs/open.c:do_truncate() does.
 func (rf *regularFile) truncate(newSize uint64) error {
 	rf.inode.mu.Lock()
 	defer rf.inode.mu.Unlock()
@@ -205,6 +206,13 @@ func (rf *regularFile) truncate(newSize uint64) error {
 		return err
 	}
 	rf.inode.touchCMtimeLocked()
+	for {
+		old := rf.inode.mode.Load()
+		if rf.inode.mode.CompareAndSwap(old, vfs.ClearSUIDAndSGID(old)) {
+			break
+		}
+	}
+	rf.inode.xattrs.KillPriv()
 	return nil
 }
 

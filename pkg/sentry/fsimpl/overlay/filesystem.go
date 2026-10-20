@@ -967,6 +967,17 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	if ftype != linux.S_IFREG {
 		return layerFD, nil
 	}
+	if isUpper && opts.Flags&linux.O_TRUNC != 0 && d.mode.Load()&(linux.S_ISUID|linux.S_ISGID) != 0 {
+		// Truncation may have cleared setuid and setgid bits in the upper layer.
+		stat, err := layerFD.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_MODE})
+		if err != nil {
+			layerFD.DecRef(ctx)
+			return nil, err
+		}
+		d.copyMu.Lock()
+		d.mode.Store(uint32(stat.Mode))
+		d.copyMu.Unlock()
+	}
 	layerFlags := layerFD.StatusFlags()
 	fd := &regularFileFD{
 		copiedUp:    isUpper,
