@@ -834,8 +834,9 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 }
 
 // evictCachedLocked destroys the oldest cached dentries until at most keep
-// remain, then clears fs.evicting. Unless keep is 0, recently used dentries
-// are spared once and move to the back of fs.cached.
+// remain, repeating while the cache is still over its limit, then clears
+// fs.evicting. Unless keep is 0, recently used dentries are spared once and
+// move to the back of fs.cached.
 //
 // Preconditions: fs.renameMu must be locked for writing.
 func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
@@ -862,6 +863,9 @@ func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 			d.checkDropLocked(ctx)
 		}
 		fs.cacheMu.Lock()
+		if len(fs.cached) <= maxCachedDentries {
+			break
+		}
 	}
 	fs.evicting = false
 	fs.cacheMu.Unlock()
