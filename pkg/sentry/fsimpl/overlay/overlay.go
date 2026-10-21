@@ -153,7 +153,7 @@ type filesystem struct {
 	// cached holds dentries that had no references when they were last
 	// dropped, oldest first, so that path resolution can reuse them and
 	// destroying them can be batched under one renameMu write lock. Entries
-	// may since have gained references or been destroyed; eviction skips them.
+	// may since have gained references; eviction skips them.
 	// cached and dentry.cached are protected by cacheMu.
 	cacheMu sync.Mutex `state:"nosave"`
 	cached  []*dentry
