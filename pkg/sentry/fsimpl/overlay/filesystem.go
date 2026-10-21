@@ -214,7 +214,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Start: childVD,
 		}
 		stat, err := vfsObj.StatAt(ctx, fs.creds, childPop, &vfs.StatOptions{
-			Mask: mask,
+			Mask: mask | linux.STATX_NLINK,
 		})
 		if err != nil {
 			lookupErr = err
@@ -278,6 +278,9 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			child.devMajor = atomicbitops.FromUint32(stat.DevMajor)
 			child.devMinor = atomicbitops.FromUint32(stat.DevMinor)
 			child.ino = atomicbitops.FromUint64(stat.Ino)
+			if isUpper && !isDir && (stat.Mask&linux.STATX_NLINK == 0 || stat.Nlink > 1) {
+				child.hardLinked.Store(true)
+			}
 		}
 
 		// For non-directory files, only the topmost layer that contains a file
@@ -693,6 +696,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			}
 			return err
 		}
+		old.hardLinked.Store(true)
 		old.watches.Notify(withDropList(ctx, ds), "", linux.IN_ATTRIB, 0 /* cookie */, vfs.InodeEvent, false /* unlinked */)
 		return nil
 	})
