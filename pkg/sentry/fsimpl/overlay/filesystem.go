@@ -68,9 +68,8 @@ func putDentrySlice(ds *[]*dentry) {
 	dentrySlicePool.Put(ds)
 }
 
-// renameMuRUnlockAndCheckDrop calls fs.renameMu.RUnlock(), then calls
-// dentry.checkDropLocked on all dentries in *dsp with fs.renameMu locked for
-// writing.
+// renameMuRUnlockAndCheckDrop calls fs.renameMu.RUnlock(), then caches or
+// destroys the dentries in *dsp that have no references.
 //
 // dsp is a pointer-to-pointer since defer evaluates its arguments immediately,
 // but dentry slices are allocated lazily, and it's much easier to say "defer
@@ -83,23 +82,7 @@ func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*
 	if *dsp == nil {
 		return
 	}
-	ds := **dsp
-	// Only go through calling dentry.checkDropLocked() (which requires
-	// re-locking renameMu) if we actually have any dentries with zero refs.
-	checkAny := false
-	for i := range ds {
-		if ds[i].refs.Load() == 0 {
-			checkAny = true
-			break
-		}
-	}
-	if checkAny {
-		fs.renameMu.Lock()
-		for _, d := range ds {
-			d.checkDropLocked(ctx)
-		}
-		fs.renameMu.Unlock()
-	}
+	fs.cacheOrDrop(ctx, **dsp)
 	putDentrySlice(*dsp)
 }
 
