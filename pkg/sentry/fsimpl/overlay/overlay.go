@@ -20,6 +20,7 @@
 //
 //	directoryFD.mu / regularFileFD.mu
 //		filesystem.renameMu
+//			filesystem.cacheMu
 //			dentry.dirMu
 //		    dentry.copyMu
 //		      filesystem.devMu
@@ -147,7 +148,26 @@ type filesystem struct {
 
 	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
 	maxFilenameLen uint64
+
+	// cached holds dentries that had no references when they were last
+	// dropped, oldest first, so that path resolution can reuse them and
+	// destroying them can be batched under one renameMu write lock. Entries
+	// may since have gained references or been destroyed; eviction skips them.
+	// cached and dentry.cached are protected by cacheMu.
+	cacheMu sync.Mutex `state:"nosave"`
+	cached  []*dentry
+
+	// evicting is set while a goroutine evicts cached dentries.
+	evicting atomicbitops.Bool `state:"nosave"`
+
+	// released is set once the filesystem is released; dentries are then
+	// destroyed as soon as they lose their last reference.
+	released atomicbitops.Bool
 }
+
+// maxCachedDentries is the number of unreferenced dentries each overlay
+// filesystem keeps; once exceeded, the oldest half is destroyed.
+const maxCachedDentries = 256
 
 // +stateify savable
 type layerDevNumber struct {
@@ -469,6 +489,10 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.released.Store(true)
+	fs.renameMu.Lock()
+	fs.evictCachedLocked(ctx, 0)
+	fs.renameMu.Unlock()
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
 	for _, lowerDevMinor := range fs.lowerDevMinors {
@@ -619,6 +643,9 @@ type dentry struct {
 	// len(inlineLowerVDs).
 	inlineLowerVDs [1]vfs.VirtualDentry
 
+	// cached is true if d is in fs.cached. cached is protected by fs.cacheMu.
+	cached bool
+
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
 	devMajor atomicbitops.Uint32
@@ -731,9 +758,8 @@ func (d *dentry) DecRef(ctx context.Context) {
 		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
-		d.fs.renameMu.Lock()
-		d.checkDropLocked(ctx)
-		d.fs.renameMu.Unlock()
+		ds := [1]*dentry{d}
+		d.fs.cacheOrDrop(ctx, ds[:])
 	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
 	}
@@ -748,6 +774,74 @@ func (d *dentry) decRefLocked(ctx context.Context) {
 		d.checkDropLocked(ctx)
 	} else if r < 0 {
 		panic("overlay.dentry.decRefLocked() called without holding a reference")
+	}
+}
+
+// cacheOrDrop is called with fs.renameMu unlocked after the dentries in ds
+// may have lost their last reference. Unreferenced dentries that path
+// resolution can still reach are cached; the rest are destroyed. If the cache
+// overflows, its oldest half is destroyed.
+func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
+	mustDrop := func(d *dentry) bool {
+		return d.vfsd.IsDead() || fs.released.Load()
+	}
+	drop := false
+	fs.cacheMu.Lock()
+	for _, d := range ds {
+		if d.refs.Load() != 0 {
+			continue
+		}
+		if mustDrop(d) {
+			drop = true
+			continue
+		}
+		if !d.cached {
+			d.cached = true
+			fs.cached = append(fs.cached, d)
+		}
+	}
+	evict := len(fs.cached) > maxCachedDentries && fs.evicting.CompareAndSwap(false, true)
+	fs.cacheMu.Unlock()
+	if !drop && !evict {
+		return
+	}
+	fs.renameMu.Lock()
+	if drop {
+		for _, d := range ds {
+			if d.refs.Load() == 0 && mustDrop(d) {
+				d.checkDropLocked(ctx)
+			}
+		}
+	}
+	if evict {
+		fs.evictCachedLocked(ctx, maxCachedDentries/2)
+		fs.evicting.Store(false)
+	}
+	fs.renameMu.Unlock()
+}
+
+// evictCachedLocked destroys the oldest cached dentries until at most keep
+// remain.
+//
+// Preconditions: fs.renameMu must be locked for writing.
+func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
+	fs.cacheMu.Lock()
+	n := len(fs.cached) - keep
+	if n <= 0 {
+		fs.cacheMu.Unlock()
+		return
+	}
+	victims := make([]*dentry, n)
+	copy(victims, fs.cached)
+	m := copy(fs.cached, fs.cached[n:])
+	clear(fs.cached[m:])
+	fs.cached = fs.cached[:m]
+	for _, d := range victims {
+		d.cached = false
+	}
+	fs.cacheMu.Unlock()
+	for _, d := range victims {
+		d.checkDropLocked(ctx)
 	}
 }
 
