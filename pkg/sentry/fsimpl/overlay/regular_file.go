@@ -183,7 +183,7 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 	// d.copiedUp is never cleared once set, so this check can be safely
 	// performed without holding locks.
 	if !d.isCopiedUp() {
-		if d.isNoopChown(ctx, &opts) {
+		if d.isNoopSetStat(ctx, &opts) {
 			return nil
 		}
 		d.fs.renameMu.RLock()

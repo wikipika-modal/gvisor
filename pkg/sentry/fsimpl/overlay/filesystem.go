@@ -1607,14 +1607,13 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 	return err
 }
 
-// isNoopChown returns true if opts only sets d's owner to its current value
-// and would not clear any setid bits or file capabilities, so applying it does
-// not require copying d up.
+// isNoopSetStat returns true if applying opts would leave d's metadata
+// unchanged, so it does not require copying d up.
 //
 // Preconditions: d is not copied up.
-func (d *dentry) isNoopChown(ctx context.Context, opts *vfs.SetStatOptions) bool {
+func (d *dentry) isNoopSetStat(ctx context.Context, opts *vfs.SetStatOptions) bool {
 	stat := &opts.Stat
-	if stat.Mask&^(linux.STATX_UID|linux.STATX_GID) != 0 {
+	if stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_ATIME|linux.STATX_MTIME) != 0 {
 		return false
 	}
 	if stat.Mask&linux.STATX_UID != 0 && stat.UID != d.uid.Load() {
@@ -1623,16 +1622,34 @@ func (d *dentry) isNoopChown(ctx context.Context, opts *vfs.SetStatOptions) bool
 	if stat.Mask&linux.STATX_GID != 0 && stat.GID != d.gid.Load() {
 		return false
 	}
+	mode := d.mode.Load()
+	// chmod(2) also recomputes the access ACL, so leave files with one alone.
+	if stat.Mask&linux.STATX_MODE != 0 && (uint32(stat.Mode)&^linux.S_IFMT != mode&^linux.S_IFMT || d.accessACL.Load() != nil) {
+		return false
+	}
+	if stat.Mask&linux.STATX_ATIME != 0 && stat.Atime.Nsec == linux.UTIME_NOW ||
+		stat.Mask&linux.STATX_MTIME != 0 && stat.Mtime.Nsec == linux.UTIME_NOW {
+		return false
+	}
+	if opts.ClearPrivs && vfs.ClearSUIDAndSGID(mode) != mode {
+		return false
+	}
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	lowerPop := &vfs.PathOperation{Root: d.lowerVDs[0], Start: d.lowerVDs[0]}
+	if timeMask := stat.Mask & (linux.STATX_ATIME | linux.STATX_MTIME); timeMask != 0 {
+		lowerStat, err := vfsObj.StatAt(ctx, d.fs.creds, lowerPop, &vfs.StatOptions{Mask: timeMask})
+		if err != nil || lowerStat.Mask&timeMask != timeMask {
+			return false
+		}
+		if stat.Mask&linux.STATX_ATIME != 0 && stat.Atime != lowerStat.Atime ||
+			stat.Mask&linux.STATX_MTIME != 0 && stat.Mtime != lowerStat.Mtime {
+			return false
+		}
+	}
 	if !opts.ClearPrivs {
 		return true
 	}
-	if mode := d.mode.Load(); vfs.ClearSUIDAndSGID(mode) != mode {
-		return false
-	}
-	_, err := d.fs.vfsfs.VirtualFilesystem().GetXattrAt(ctx, d.fs.creds, &vfs.PathOperation{
-		Root:  d.lowerVDs[0],
-		Start: d.lowerVDs[0],
-	}, &vfs.GetXattrOptions{
+	_, err := vfsObj.GetXattrAt(ctx, d.fs.creds, lowerPop, &vfs.GetXattrOptions{
 		Name: linux.XATTR_SECURITY_CAPABILITY,
 		Size: linux.XATTR_CAPS_SZ_3,
 	})
@@ -1658,7 +1675,7 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 		return err
 	}
 	defer mnt.EndWrite()
-	if !d.isCopiedUp() && d.isNoopChown(ctx, &opts) {
+	if !d.isCopiedUp() && d.isNoopSetStat(ctx, &opts) {
 		return nil
 	}
 	if err := d.copyUpLocked(ctx); err != nil {
