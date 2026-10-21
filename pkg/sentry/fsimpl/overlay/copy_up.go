@@ -123,7 +123,20 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	}
 	const timestampsMask = linux.STATX_ATIME | linux.STATX_MTIME
 	oldStat, err := vfsObj.StatAt(ctx, d.fs.creds, &oldpop, &vfs.StatOptions{
-		Mask: timestampsMask,
+		Mask: timestampsMask | linux.STATX_CTIME | linux.STATX_INO | linux.STATX_BTIME,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Creating d in the parent's upper layer must not change the parent's
+	// timestamps, since the parent's contents do not change.
+	parentPop := vfs.PathOperation{
+		Root:  parent.upperVD,
+		Start: parent.upperVD,
+	}
+	parentStat, err := vfsObj.StatAt(ctx, d.fs.creds, &parentPop, &vfs.StatOptions{
+		Mask: linux.STATX_MTIME | linux.STATX_CTIME,
 	})
 	if err != nil {
 		return err
@@ -364,32 +377,69 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		return err
 	}
 
-	// Update the dentry's device and inode numbers (except for directories,
-	// for which these remain overlay-assigned).
+	if err := vfsObj.SetStatAt(ctx, d.fs.creds, &parentPop, &vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask:  parentStat.Mask & (linux.STATX_MTIME | linux.STATX_CTIME),
+			Mtime: parentStat.Mtime,
+			Ctime: parentStat.Ctime,
+		},
+	}); err != nil {
+		cleanupUndoCopyUp()
+		return err
+	}
+
+	upperPop := vfs.PathOperation{
+		Root:  d.upperVD,
+		Start: d.upperVD,
+	}
+	// Non-directories keep the lower layer file's device and inode numbers,
+	// recorded in xattrOrigin so that later lookups find them. Directories'
+	// numbers are always derived from the lowest layer.
 	if ftype != linux.S_IFDIR {
-		upperStat, err := vfsObj.StatAt(ctx, d.fs.creds, &vfs.PathOperation{
-			Root:  d.upperVD,
-			Start: d.upperVD,
-		}, &vfs.StatOptions{
-			Mask: linux.STATX_INO,
-		})
-		if err != nil {
-			cleanupUndoCopyUp()
-			return err
+		if oldStat.Mask&linux.STATX_INO != 0 && vfsObj.SetXattrAt(ctx, d.fs.creds, &upperPop, &vfs.SetXattrOptions{
+			Name:  d.fs.xattrOrigin,
+			Value: originXattr(&oldStat),
+		}) == nil {
+			d.hasOrigin.Store(true)
+			d.originBtime.Store(statBtime(&oldStat))
+		} else {
+			upperStat, err := vfsObj.StatAt(ctx, d.fs.creds, &upperPop, &vfs.StatOptions{
+				Mask: linux.STATX_INO,
+			})
+			if err != nil {
+				cleanupUndoCopyUp()
+				return err
+			}
+			if upperStat.Mask&linux.STATX_INO == 0 {
+				cleanupUndoCopyUp()
+				return linuxerr.EREMOTE
+			}
+			d.devMajor.Store(upperStat.DevMajor)
+			d.devMinor.Store(upperStat.DevMinor)
+			d.ino.Store(upperStat.Ino)
+			d.hasOrigin.Store(false)
 		}
-		if upperStat.Mask&linux.STATX_INO == 0 {
-			cleanupUndoCopyUp()
-			return linuxerr.EREMOTE
-		}
-		d.devMajor.Store(upperStat.DevMajor)
-		d.devMinor.Store(upperStat.DevMinor)
-		d.ino.Store(upperStat.Ino)
 
 		// Lower level dentries for non-directories are no longer accessible from
 		// the overlayfs anymore after copyup. Ask filesystems to release their
 		// resources whenever possible.
 		for _, lowerDentry := range d.lowerVDs {
 			lowerDentry.Dentry().MarkEvictable()
+		}
+	}
+
+	// Copy-up does not change the file's metadata, so it keeps the lower
+	// layer file's ctime. This must follow every other change to the upper
+	// layer file.
+	if oldStat.Mask&linux.STATX_CTIME != 0 {
+		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &upperPop, &vfs.SetStatOptions{
+			Stat: linux.Statx{
+				Mask:  linux.STATX_CTIME,
+				Ctime: oldStat.Ctime,
+			},
+		}); err != nil {
+			cleanupUndoCopyUp()
+			return err
 		}
 	}
 

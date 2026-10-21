@@ -214,7 +214,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Start: childVD,
 		}
 		stat, err := vfsObj.StatAt(ctx, fs.creds, childPop, &vfs.StatOptions{
-			Mask: mask,
+			Mask: mask | linux.STATX_BTIME,
 		})
 		if err != nil {
 			lookupErr = err
@@ -241,6 +241,18 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			// on previous layers, since lower layers aren't searched for
 			// non-directory files.)
 			return false
+		}
+
+		if !isUpper {
+			// For directories, the lowest layer wins, as for inode numbers.
+			child.hasOrigin.Store(true)
+			child.originBtime.Store(statBtime(&stat))
+		} else if !isDir {
+			if devMajor, devMinor, ino, btime, ok := fs.getOrigin(ctx, childPop); ok {
+				stat.DevMajor, stat.DevMinor, stat.Ino = devMajor, devMinor, ino
+				child.hasOrigin.Store(true)
+				child.originBtime.Store(btime)
+			}
 		}
 
 		// Update child to include this layer.
@@ -327,7 +339,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		child.dirInoHash = orig
 		child.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
 		child.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
-	} else if !child.upperVD.Ok() {
+	} else if !child.upperVD.Ok() || child.hasOrigin.Load() {
 		childDevMinor, err := fs.getLowerDevMinor(child.devMajor.RacyLoad(), child.devMinor.RacyLoad())
 		if err != nil {
 			ctx.Infof("overlay.filesystem.lookupLocked: failed to map lower layer device number (%d, %d) to an overlay-specific device number: %v", child.devMajor.RacyLoad(), child.devMinor.RacyLoad(), err)
@@ -1726,6 +1738,7 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		// the overlay mount.
 		stat.Attributes &^= linux.STATX_ATTR_MOUNT_ROOT
 		stat.AttributesMask &^= linux.STATX_ATTR_MOUNT_ROOT
+		d.statOriginTo(&stat)
 	}
 	d.statInternalTo(ctx, &opts, &stat)
 	rp.AddMountRootAttr(&d.vfsd, &stat)
