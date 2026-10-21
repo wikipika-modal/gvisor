@@ -646,6 +646,10 @@ type dentry struct {
 	// cached is true if d is in fs.cached. cached is protected by fs.cacheMu.
 	cached bool
 
+	// cacheUsed is set when path resolution reuses d, and spares d from the
+	// next eviction.
+	cacheUsed atomicbitops.Bool
+
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
 	devMajor atomicbitops.Uint32
@@ -831,14 +835,21 @@ func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 		fs.cacheMu.Unlock()
 		return
 	}
-	victims := make([]*dentry, n)
-	copy(victims, fs.cached)
-	m := copy(fs.cached, fs.cached[n:])
+	var victims, spared []*dentry
+	i := 0
+	for ; i < len(fs.cached) && len(victims) < n; i++ {
+		d := fs.cached[i]
+		if keep != 0 && d.cacheUsed.Swap(false) {
+			spared = append(spared, d)
+			continue
+		}
+		d.cached = false
+		victims = append(victims, d)
+	}
+	rest := append(fs.cached[i:], spared...)
+	m := copy(fs.cached, rest)
 	clear(fs.cached[m:])
 	fs.cached = fs.cached[:m]
-	for _, d := range victims {
-		d.cached = false
-	}
 	fs.cacheMu.Unlock()
 	for _, d := range victims {
 		d.checkDropLocked(ctx)
