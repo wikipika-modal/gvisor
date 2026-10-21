@@ -153,6 +153,7 @@ func (fd *regularFileFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.
 		// the overlay mount; FileDescription.Stat sets it for fd.
 		stat.Attributes &^= linux.STATX_ATTR_MOUNT_ROOT
 		stat.AttributesMask &^= linux.STATX_ATTR_MOUNT_ROOT
+		fd.dentry().statOriginTo(&stat)
 	}
 	fd.dentry().statInternalTo(ctx, &opts, &stat)
 	return stat, nil

@@ -194,6 +194,7 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 		// Reuse slice allocated for maybeWhiteouts from a previous layer to
 		// reduce allocations.
 		maybeWhiteouts = maybeWhiteouts[:0]
+		layerStart := len(dirents)
 		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
 				return nil
@@ -235,6 +236,22 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 			}
 			dirent.NextOff = int64(len(dirents) + 1)
 			dirents = append(dirents, dirent)
+		}
+
+		// Files copied up from a lower layer keep that file's inode number.
+		if isUpper {
+			for i := layerStart; i < len(dirents); i++ {
+				if dirents[i].Type == linux.DT_DIR {
+					continue
+				}
+				if _, _, ino, _, ok := d.fs.getOrigin(ctx, &vfs.PathOperation{
+					Root:  layerVD,
+					Start: layerVD,
+					Path:  fspath.Parse(dirents[i].Name),
+				}); ok {
+					dirents[i].Ino = ino
+				}
+			}
 		}
 		return true
 	})

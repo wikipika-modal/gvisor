@@ -108,6 +108,11 @@ type filesystem struct {
 	// xattrOpaque is xattrPrefix + "opaque". xattrOpaque is immutable.
 	xattrOpaque string
 
+	// xattrOrigin is xattrPrefix + "origin". It is set on files copied up to
+	// the upper layer and identifies the lower layer file they were copied
+	// from; see originXattr. xattrOrigin is immutable.
+	xattrOrigin string
+
 	// createCreds is a cache of credentials that is used for create operations.
 	createCredsMu createCredsMutex `state:"nosave"`
 	createCreds   map[createCredsKey]*auth.Credentials
@@ -347,6 +352,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		creds:          creds.Fork(),
 		xattrPrefix:    xattrPrefix,
 		xattrOpaque:    xattrPrefix + "opaque",
+		xattrOrigin:    xattrPrefix + "origin",
 		dirDevMinor:    dirDevMinor,
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
@@ -620,6 +626,13 @@ type dentry struct {
 	devMajor atomicbitops.Uint32
 	devMinor atomicbitops.Uint32
 	ino      atomicbitops.Uint64
+
+	// If hasOrigin is set, d is, or was copied up from, a file on a lower
+	// layer, and originBtime is that file's birth time in nanoseconds, or 0
+	// if it reported none. Stat reports originBtime so that copy-up does not
+	// change it.
+	hasOrigin   atomicbitops.Bool
+	originBtime atomicbitops.Int64
 
 	// If this dentry represents a regular file, then:
 	//
@@ -956,6 +969,49 @@ func (d *dentry) statInternalTo(ctx context.Context, opts *vfs.StatOptions, stat
 	stat.Ino = d.ino.Load()
 	stat.DevMajor = d.devMajor.Load()
 	stat.DevMinor = d.devMinor.Load()
+}
+
+// statOriginTo overwrites the fields of stat, as returned by d's top layer,
+// that copy-up would otherwise change.
+func (d *dentry) statOriginTo(stat *linux.Statx) {
+	if !d.hasOrigin.Load() {
+		return
+	}
+	if btime := d.originBtime.Load(); btime != 0 {
+		stat.Mask |= linux.STATX_BTIME
+		stat.Btime = linux.NsecToStatxTimestamp(btime)
+	} else {
+		stat.Mask &^= linux.STATX_BTIME
+		stat.Btime = linux.StatxTimestamp{}
+	}
+}
+
+// statBtime returns stat's birth time in nanoseconds, or 0 if it has none.
+func statBtime(stat *linux.Statx) int64 {
+	if stat.Mask&linux.STATX_BTIME == 0 {
+		return 0
+	}
+	return stat.Btime.ToNsec()
+}
+
+// originXattr returns the value of xattrOrigin for a file copied up from the
+// lower layer file described by stat.
+func originXattr(stat *linux.Statx) string {
+	return fmt.Sprintf("%d:%d:%d:%d", stat.DevMajor, stat.DevMinor, stat.Ino, statBtime(stat))
+}
+
+// getOrigin returns the lower layer device and inode numbers and birth time
+// recorded in the xattrOrigin of the file at pop, if it has one.
+func (fs *filesystem) getOrigin(ctx context.Context, pop *vfs.PathOperation) (devMajor, devMinor uint32, ino uint64, btime int64, ok bool) {
+	val, err := fs.vfsfs.VirtualFilesystem().GetXattrAt(ctx, fs.creds, pop, &vfs.GetXattrOptions{
+		Name: fs.xattrOrigin,
+		Size: 64,
+	})
+	if err != nil {
+		return 0, 0, 0, 0, false
+	}
+	_, err = fmt.Sscanf(val, "%d:%d:%d:%d", &devMajor, &devMinor, &ino, &btime)
+	return devMajor, devMinor, ino, btime, err == nil
 }
 
 // Preconditions: d.copyMu must be locked for writing.
