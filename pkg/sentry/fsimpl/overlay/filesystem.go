@@ -167,6 +167,9 @@ func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *
 //   - d.dirMu must be locked.
 func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name string, ds **[]*dentry) (*dentry, lookupLayer, error) {
 	if child, ok := parent.children[name]; ok {
+		if !child.recentlyUsed.Load() {
+			child.recentlyUsed.Store(true)
+		}
 		return child, child.topLookupLayer(), nil
 	}
 	child, topLookupLayer, err := fs.lookupLocked(ctx, parent, name)
