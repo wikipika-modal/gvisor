@@ -38,6 +38,7 @@ package overlay
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -157,8 +158,9 @@ type filesystem struct {
 	cacheMu sync.Mutex `state:"nosave"`
 	cached  []*dentry
 
-	// evicting is set while a goroutine evicts cached dentries.
-	evicting atomicbitops.Bool `state:"nosave"`
+	// evicting is set while a goroutine evicts cached dentries. evicting is
+	// protected by cacheMu.
+	evicting bool `state:"nosave"`
 
 	// released is set once the filesystem is released; dentries are then
 	// destroyed as soon as they lose their last reference.
@@ -646,6 +648,11 @@ type dentry struct {
 	// cached is true if d is in fs.cached. cached is protected by fs.cacheMu.
 	cached bool
 
+	// hardLinked is set if d's upper file may have other hard links. d is then
+	// never cached, since metadata changes made through another link do not
+	// update d.
+	hardLinked atomicbitops.Bool
+
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
 	devMajor atomicbitops.Uint32
@@ -783,7 +790,7 @@ func (d *dentry) decRefLocked(ctx context.Context) {
 // overflows, its oldest half is destroyed.
 func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	mustDrop := func(d *dentry) bool {
-		return d.vfsd.IsDead() || fs.released.Load()
+		return d.vfsd.IsDead() || d.hardLinked.Load() || fs.released.Load()
 	}
 	drop := false
 	fs.cacheMu.Lock()
@@ -800,7 +807,10 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 			fs.cached = append(fs.cached, d)
 		}
 	}
-	evict := len(fs.cached) > maxCachedDentries && fs.evicting.CompareAndSwap(false, true)
+	evict := len(fs.cached) > maxCachedDentries && !fs.evicting
+	if evict {
+		fs.evicting = true
+	}
 	fs.cacheMu.Unlock()
 	if !drop && !evict {
 		return
@@ -815,34 +825,34 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	}
 	if evict {
 		fs.evictCachedLocked(ctx, maxCachedDentries/2)
-		fs.evicting.Store(false)
 	}
 	fs.renameMu.Unlock()
 }
 
 // evictCachedLocked destroys the oldest cached dentries until at most keep
-// remain.
+// remain, then clears fs.evicting.
 //
 // Preconditions: fs.renameMu must be locked for writing.
 func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 	fs.cacheMu.Lock()
-	n := len(fs.cached) - keep
-	if n <= 0 {
+	for len(fs.cached) > keep {
+		n := len(fs.cached) - keep
+		victims := make([]*dentry, n)
+		copy(victims, fs.cached)
+		m := copy(fs.cached, fs.cached[n:])
+		clear(fs.cached[m:])
+		fs.cached = fs.cached[:m]
+		for _, d := range victims {
+			d.cached = false
+		}
 		fs.cacheMu.Unlock()
-		return
+		for _, d := range victims {
+			d.checkDropLocked(ctx)
+		}
+		fs.cacheMu.Lock()
 	}
-	victims := make([]*dentry, n)
-	copy(victims, fs.cached)
-	m := copy(fs.cached, fs.cached[n:])
-	clear(fs.cached[m:])
-	fs.cached = fs.cached[:m]
-	for _, d := range victims {
-		d.cached = false
-	}
+	fs.evicting = false
 	fs.cacheMu.Unlock()
-	for _, d := range victims {
-		d.checkDropLocked(ctx)
-	}
 }
 
 // checkDropLocked should be called after d's reference count becomes 0 or it
@@ -885,6 +895,14 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	default:
 		panic("overlay.dentry.destroyLocked() called with references on the dentry")
 	}
+
+	d.fs.cacheMu.Lock()
+	if d.cached {
+		i := slices.Index(d.fs.cached, d)
+		d.fs.cached = slices.Delete(d.fs.cached, i, i+1)
+		d.cached = false
+	}
+	d.fs.cacheMu.Unlock()
 
 	if d.upperVD.Ok() {
 		d.upperVD.DecRef(ctx)
