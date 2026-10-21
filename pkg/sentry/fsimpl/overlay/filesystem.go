@@ -1607,6 +1607,38 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 	return err
 }
 
+// isNoopChown returns true if opts only sets d's owner to its current value
+// and would not clear any setid bits or file capabilities, so applying it does
+// not require copying d up.
+//
+// Preconditions: d is not copied up.
+func (d *dentry) isNoopChown(ctx context.Context, opts *vfs.SetStatOptions) bool {
+	stat := &opts.Stat
+	if stat.Mask&^(linux.STATX_UID|linux.STATX_GID) != 0 {
+		return false
+	}
+	if stat.Mask&linux.STATX_UID != 0 && stat.UID != d.uid.Load() {
+		return false
+	}
+	if stat.Mask&linux.STATX_GID != 0 && stat.GID != d.gid.Load() {
+		return false
+	}
+	if !opts.ClearPrivs {
+		return true
+	}
+	if mode := d.mode.Load(); vfs.ClearSUIDAndSGID(mode) != mode {
+		return false
+	}
+	_, err := d.fs.vfsfs.VirtualFilesystem().GetXattrAt(ctx, d.fs.creds, &vfs.PathOperation{
+		Root:  d.lowerVDs[0],
+		Start: d.lowerVDs[0],
+	}, &vfs.GetXattrOptions{
+		Name: linux.XATTR_SECURITY_CAPABILITY,
+		Size: linux.XATTR_CAPS_SZ_3,
+	})
+	return linuxerr.Equals(linuxerr.ENODATA, err) || linuxerr.Equals(linuxerr.EOPNOTSUPP, err)
+}
+
 // Precondition: d.fs.renameMu must be held for reading.
 func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	mode := linux.FileMode(d.mode.Load())
@@ -1626,6 +1658,9 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 		return err
 	}
 	defer mnt.EndWrite()
+	if !d.isCopiedUp() && d.isNoopChown(ctx, &opts) {
+		return nil
+	}
 	if err := d.copyUpLocked(ctx); err != nil {
 		return err
 	}
