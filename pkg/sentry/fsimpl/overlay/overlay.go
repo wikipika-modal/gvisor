@@ -151,7 +151,7 @@ type filesystem struct {
 	maxFilenameLen uint64
 
 	// cached holds dentries that had no references when they were last
-	// dropped, oldest first, so that path resolution can reuse them and
+	// dropped, in eviction order, so that path resolution can reuse them and
 	// destroying them can be batched under one renameMu write lock. Entries
 	// may since have gained references; eviction skips them.
 	// cached and dentry.cached are protected by cacheMu.
@@ -168,7 +168,7 @@ type filesystem struct {
 }
 
 // maxCachedDentries is the number of unreferenced dentries each overlay
-// filesystem keeps; once exceeded, the oldest half is destroyed.
+// filesystem keeps; once exceeded, half of them are destroyed.
 const maxCachedDentries = 256
 
 // +stateify savable
@@ -653,6 +653,10 @@ type dentry struct {
 	// update d.
 	hardLinked atomicbitops.Bool
 
+	// recentlyUsed is set when path resolution reuses d, and spares d once
+	// from eviction.
+	recentlyUsed atomicbitops.Bool
+
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
 	devMajor atomicbitops.Uint32
@@ -787,7 +791,7 @@ func (d *dentry) decRefLocked(ctx context.Context) {
 // cacheOrDrop is called with fs.renameMu unlocked after the dentries in ds
 // may have lost their last reference. Unreferenced dentries that path
 // resolution can still reach are cached; the rest are destroyed. If the cache
-// overflows, its oldest half is destroyed.
+// overflows, half of it is destroyed.
 func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	mustDrop := func(d *dentry) bool {
 		return d.vfsd.IsDead() || d.hardLinked.Load() || fs.released.Load()
@@ -830,21 +834,29 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 }
 
 // evictCachedLocked destroys the oldest cached dentries until at most keep
-// remain, then clears fs.evicting.
+// remain, then clears fs.evicting. Unless keep is 0, recently used dentries
+// are spared once and move to the back of fs.cached.
 //
 // Preconditions: fs.renameMu must be locked for writing.
 func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 	fs.cacheMu.Lock()
 	for len(fs.cached) > keep {
 		n := len(fs.cached) - keep
-		victims := make([]*dentry, n)
-		copy(victims, fs.cached)
-		m := copy(fs.cached, fs.cached[n:])
+		var victims, spared []*dentry
+		i := 0
+		for ; i < len(fs.cached) && len(victims) < n; i++ {
+			d := fs.cached[i]
+			if keep != 0 && d.recentlyUsed.Swap(false) {
+				spared = append(spared, d)
+				continue
+			}
+			d.cached = false
+			victims = append(victims, d)
+		}
+		m := copy(fs.cached, fs.cached[i:])
+		m += copy(fs.cached[m:], spared)
 		clear(fs.cached[m:])
 		fs.cached = fs.cached[:m]
-		for _, d := range victims {
-			d.cached = false
-		}
 		fs.cacheMu.Unlock()
 		for _, d := range victims {
 			d.checkDropLocked(ctx)
