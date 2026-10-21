@@ -156,7 +156,7 @@ type filesystem struct {
 	// cached and dentry.cached are protected by cacheMu. Lock order: renameMu,
 	// then cacheMu.
 	cacheMu sync.Mutex `state:"nosave"`
-	cached  []*dentry  `state:"nosave"`
+	cached  []*dentry
 
 	// evicting is set while a goroutine evicts cached dentries.
 	evicting atomicbitops.Bool `state:"nosave"`
@@ -642,7 +642,7 @@ type dentry struct {
 	inlineLowerVDs [1]vfs.VirtualDentry
 
 	// cached is true if d is in fs.cached. cached is protected by fs.cacheMu.
-	cached bool `state:"nosave"`
+	cached bool
 
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
@@ -841,23 +841,6 @@ func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 	for _, d := range victims {
 		d.checkDropLocked(ctx)
 	}
-}
-
-// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
-func (fs *filesystem) PrepareSave(ctx context.Context) error {
-	fs.renameMu.Lock()
-	fs.evictCachedLocked(ctx, 0)
-	fs.renameMu.Unlock()
-	return nil
-}
-
-// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
-func (fs *filesystem) BeforeResume(ctx context.Context) {}
-
-// CompleteRestore implements
-// vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
-func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
-	return nil
 }
 
 // checkDropLocked should be called after d's reference count becomes 0 or it
