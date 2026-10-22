@@ -151,10 +151,10 @@ type filesystem struct {
 	maxFilenameLen uint64
 
 	// cached holds dentries that had no references when they were last
-	// dropped, oldest first, so that path resolution can reuse them and
-	// destroying them can be batched under one renameMu write lock. Entries
-	// may since have gained references; eviction skips them.
-	// cached and dentry.cached are protected by cacheMu.
+	// dropped, so that path resolution can reuse them and destroying them can
+	// be batched under one renameMu write lock. Entries may since have gained
+	// references; eviction skips them. cached and dentry.cached are protected
+	// by cacheMu.
 	cacheMu sync.Mutex `state:"nosave"`
 	cached  []*dentry
 
@@ -168,7 +168,7 @@ type filesystem struct {
 }
 
 // maxCachedDentries is the number of unreferenced dentries each overlay
-// filesystem keeps; once exceeded, the oldest half is destroyed.
+// filesystem keeps; once exceeded, all of them are destroyed.
 const maxCachedDentries = 256
 
 // +stateify savable
@@ -493,7 +493,7 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.released.Store(true)
 	fs.renameMu.Lock()
-	fs.evictCachedLocked(ctx, 0)
+	fs.evictCachedLocked(ctx)
 	fs.renameMu.Unlock()
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
@@ -789,7 +789,7 @@ func (d *dentry) decRefLocked(ctx context.Context) {
 // cacheOrDrop is called with fs.renameMu unlocked after the dentries in ds
 // may have lost their last reference. Unreferenced dentries that path
 // resolution can still reach are cached; the rest are destroyed. If the cache
-// overflows, its oldest half is destroyed.
+// overflows, it is emptied.
 func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	mustDrop := func(d *dentry) bool {
 		return d.vfsd.IsDead() || d.hardLinked.Load() || fs.released.Load()
@@ -826,25 +826,20 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 		}
 	}
 	if evict {
-		fs.evictCachedLocked(ctx, maxCachedDentries/2)
+		fs.evictCachedLocked(ctx)
 	}
 	fs.renameMu.Unlock()
 }
 
-// evictCachedLocked destroys the oldest cached dentries until at most keep
-// remain, repeating while the cache is still over its limit, then clears
-// fs.evicting.
+// evictCachedLocked destroys all cached dentries, repeating while the cache
+// refilled past its limit meanwhile, then clears fs.evicting.
 //
 // Preconditions: fs.renameMu must be locked for writing.
-func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
+func (fs *filesystem) evictCachedLocked(ctx context.Context) {
 	fs.cacheMu.Lock()
-	for len(fs.cached) > keep {
-		n := len(fs.cached) - keep
-		victims := make([]*dentry, n)
-		copy(victims, fs.cached)
-		m := copy(fs.cached, fs.cached[n:])
-		clear(fs.cached[m:])
-		fs.cached = fs.cached[:m]
+	for {
+		victims := fs.cached
+		fs.cached = nil
 		for _, d := range victims {
 			d.cached = false
 		}
