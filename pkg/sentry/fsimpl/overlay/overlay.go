@@ -38,6 +38,7 @@ package overlay
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -169,7 +170,19 @@ type filesystem struct {
 
 // maxCachedDentries is the number of unreferenced dentries each overlay
 // filesystem keeps; once exceeded, the oldest half is destroyed.
-const maxCachedDentries = 256
+var maxCachedDentries = func() int {
+	if n, err := strconv.Atoi(os.Getenv("GVISOR_OVERLAY_DCACHE")); err == nil {
+		return n
+	}
+	return 256
+}()
+
+var evictKeep = func() int {
+	if os.Getenv("GVISOR_OVERLAY_DCACHE_EVICTALL") == "1" {
+		return 0
+	}
+	return maxCachedDentries / 2
+}()
 
 // +stateify savable
 type layerDevNumber struct {
@@ -824,7 +837,7 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 		}
 	}
 	if evict {
-		fs.evictCachedLocked(ctx, maxCachedDentries/2)
+		fs.evictCachedLocked(ctx, evictKeep)
 	}
 	fs.renameMu.Unlock()
 }
