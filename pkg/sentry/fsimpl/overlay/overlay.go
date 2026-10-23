@@ -169,7 +169,7 @@ type filesystem struct {
 
 // maxCachedDentries is the number of unreferenced dentries each overlay
 // filesystem keeps; once exceeded, all of them are destroyed.
-const maxCachedDentries = 256
+const maxCachedDentries = 1000
 
 // +stateify savable
 type layerDevNumber struct {
