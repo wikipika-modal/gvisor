@@ -375,6 +375,9 @@ type Cgroup interface {
 	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
+	// SetDevices allows processes in the cgroup to access only the devices
+	// matched by rules.
+	SetDevices(rules []DeviceRule) error
 	CloneIntoCgroup() (*os.File, error)
 	CPUQuota() (int64, error)
 	CPUPeriod() (int64, error)

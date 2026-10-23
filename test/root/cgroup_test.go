@@ -20,11 +20,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/docker/docker/api/types/container"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -572,6 +575,73 @@ func TestCgroupV2(t *testing.T) {
 	if err := verifyPid(pid, path); err != nil {
 		t.Errorf("cgroup control processes (%s): %v", path, err)
 	}
+}
+
+// TestCgroupDevices checks that the sandbox's cgroup restricts device access.
+func TestCgroupDevices(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+	if err := d.Spawn(ctx, dockerutil.RunOpts{Image: "basic/alpine"}, "sleep", "10000"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	pid, err := d.SandboxPid(ctx)
+	if err != nil {
+		t.Fatalf("SandboxPid: %v", err)
+	}
+
+	if cgroup.IsOnlyV2() {
+		path, err := pidCgroupPath(pid, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dir.Close()
+		res, err := link.QueryPrograms(link.QueryOptions{Target: int(dir.Fd()), Attach: ebpf.AttachCGroupDevice})
+		if err != nil {
+			t.Fatalf("querying device filters of %s: %v", path, err)
+		}
+		if len(res.Programs) == 0 {
+			t.Errorf("no device filter attached to %s", path)
+		}
+		return
+	}
+
+	path, err := pidCgroupPath(pid, "devices")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := os.ReadFile(filepath.Join(path, "devices.list"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := strings.Split(strings.TrimSpace(string(list)), "\n")
+	if slices.Contains(rules, "a *:* rwm") {
+		t.Errorf("%s allows all devices", path)
+	}
+	if !slices.Contains(rules, "c 1:3 rw") {
+		t.Errorf("%s does not allow /dev/null, rules: %q", path, rules)
+	}
+}
+
+// pidCgroupPath returns the path of pid's cgroup in the given controller's
+// hierarchy, or in the unified hierarchy if controller is empty.
+func pidCgroupPath(pid int, controller string) (string, error) {
+	data, err := os.ReadFile(procPath(strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		// Format: hierarchy-ID:controller-list:cgroup-path
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) == 3 && slices.Contains(strings.Split(fields[1], ","), controller) {
+			return cgroupPath(controller, fields[2]), nil
+		}
+	}
+	return "", fmt.Errorf("no %q cgroup for pid %d", controller, pid)
 }
 
 // TestCgroupParent sets the "CgroupParent" option and checks that the child and

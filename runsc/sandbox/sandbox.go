@@ -180,6 +180,11 @@ type Sandbox struct {
 	// and allow serialization of the configuration into json
 	CgroupJSON cgroup.CgroupJSON `json:"cgroup"`
 
+	// DeviceRules is the set of devices that the sandbox's cgroup allows access
+	// to. It grows as containers that expose devices start in the sandbox. Nil
+	// if the sandbox has no cgroup.
+	DeviceRules []cgroup.DeviceRule `json:"deviceRules"`
+
 	// OriginalOOMScoreAdj stores the value of oom_score_adj when the sandbox
 	// started, before it may be modified.
 	OriginalOOMScoreAdj int `json:"originalOomScoreAdj"`
@@ -315,6 +320,9 @@ type Args struct {
 	// Gcgroup is the cgroup that the sandbox is part of.
 	Cgroup cgroup.Cgroup
 
+	// DeviceRules is the set of devices that Cgroup allows access to.
+	DeviceRules []cgroup.DeviceRule
+
 	// CloneIntoCgroupFD, when non-nil, is an FD to `Cgroup`'s directory. The
 	// sandbox process is created inside the cgroup via `CLONE_INTO_CGROUP`.
 	CloneIntoCgroupFD *os.File
@@ -356,6 +364,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		CgroupJSON: cgroup.CgroupJSON{
 			Cgroup: args.Cgroup,
 		},
+		DeviceRules:         args.DeviceRules,
 		UID:                 -1, // prevent usage before it's set.
 		GID:                 -1, // prevent usage before it's set.
 		MetricMetadata:      conf.MetricMetadata(),
