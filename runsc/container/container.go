@@ -414,6 +414,24 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return parentCgroup, err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
+		// The device filter is attached while the sandbox processes start.
+		// They only open whitelisted devices, and the container does not run
+		// before it is started.
+		devicesDone := make(chan error, 1)
+		go func() {
+			if containerCgroup == nil {
+				devicesDone <- nil
+				return
+			}
+			rules, err := sandboxDeviceRules(conf, args.Spec)
+			if err == nil {
+				if err = containerCgroup.AllowDevices(rules); err != nil {
+					err = handleCgroupInstallErr(conf, "device cgroup", err)
+				}
+			}
+			devicesDone <- err
+		}()
+
 		// No rootfs and no mounts, so nothing for a gofer to serve.
 		// Subcontainers get their own.
 		var (
@@ -454,8 +472,12 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			NoRootContainer:     args.NoRootContainer,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
+		devicesErr := <-devicesDone
 		if err != nil {
 			return fmt.Errorf("cannot create sandbox: %w", err)
+		}
+		if devicesErr != nil {
+			return devicesErr
 		}
 		c.Sandbox = sand
 		return nil
@@ -535,6 +557,10 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		if err := cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
+			if err := c.allowSandboxDevices(conf); err != nil {
+				return err
+			}
+
 			// Create the gofer process.
 			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD)
 			if err != nil {
@@ -2233,11 +2259,11 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 }
 
 // handleCgroupInstallErr maps an error from a cgroup install operation. In
-// rootless mode, EACCES/EROFS mean we lack permission to configure cgroups,
-// which is non-fatal: it logs and returns nil so the caller proceeds without a
-// cgroup. All other errors are wrapped with what.
+// rootless mode, permission errors and EROFS mean we lack permission to
+// configure cgroups, which is non-fatal: it logs and returns nil so the caller
+// proceeds without a cgroup. All other errors are wrapped with what.
 func handleCgroupInstallErr(conf *config.Config, what string, err error) error {
-	if (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless {
+	if (errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS)) && conf.Rootless {
 		log.Warningf("Skipping %s configuration in rootless mode: %v", what, err)
 		return nil
 	}
@@ -2471,7 +2497,7 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		"--load-kmods",
 		"configure",
 		fmt.Sprintf("--ldconfig=@%s", ldconfigPath),
-		"--no-cgroups", // runsc doesn't configure device cgroups yet
+		"--no-cgroups", // runsc configures the sandbox's device cgroup itself.
 		fmt.Sprintf("--pid=%d", goferPid),
 		fmt.Sprintf("--device=%s", devices),
 	}
