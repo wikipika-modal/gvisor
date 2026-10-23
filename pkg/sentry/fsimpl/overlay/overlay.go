@@ -767,8 +767,7 @@ func (d *dentry) DecRef(ctx context.Context) {
 		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
-		ds := [1]*dentry{d}
-		d.fs.cacheOrDrop(ctx, ds[:])
+		d.fs.cacheOrDrop(ctx, []*dentry{d})
 	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
 	}
