@@ -1021,13 +1021,19 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	}
 
 	layerVD, isUpper := d.topLayerInfo()
+	layerOpts := opts
 	if d.isMetacopy() {
+		// The lower file has the data but not d's mode, against which execute
+		// permission was already checked.
 		layerVD, isUpper = d.lowerVDs[0], false
+		lowerOpts := *opts
+		lowerOpts.FileExec = false
+		layerOpts = &lowerOpts
 	}
 	layerFD, err := rp.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 		Root:  layerVD,
 		Start: layerVD,
-	}, opts)
+	}, layerOpts)
 	if err != nil {
 		return nil, err
 	}
