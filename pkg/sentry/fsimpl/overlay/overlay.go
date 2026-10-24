@@ -36,6 +36,7 @@ package overlay
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -51,6 +52,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Name is the default filesystem name.
@@ -567,14 +569,58 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 	return minor, nil
 }
 
-// TarUpperLayer implements vfs.TarSerializer.TarUpperLayer.
+// tarDataSerializer is implemented by upper layers that can write regular file
+// data from elsewhere to a tar archive.
+type tarDataSerializer interface {
+	TarUpperLayerWithData(ctx context.Context, outFD *os.File, writeData func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error)) error
+}
+
+// TarUpperLayer implements vfs.TarSerializer.TarUpperLayer. Metacopy files are
+// written with their data from the lower layer.
 func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	upperFS := fs.opts.UpperRoot.Mount().Filesystem()
+	if ts, ok := upperFS.Impl().(tarDataSerializer); ok && fs.opts.Metacopy {
+		return ts.TarUpperLayerWithData(ctx, outFD, fs.writeMetacopyData)
+	}
 	ts, ok := upperFS.Impl().(vfs.TarSerializer)
 	if !ok {
 		return fmt.Errorf("upper layer is of type %q, which does not implement vfs.TarSerializer", upperFS.FilesystemType().Name())
 	}
 	return ts.TarUpperLayer(ctx, outFD)
+}
+
+// writeMetacopyData writes the data of a metacopy file with the given upper
+// layer xattrs to w, and returns false for other files.
+func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error) {
+	redirect, ok := xattrs[fs.xattrRedirect]
+	if _, metacopy := xattrs[fs.xattrMetacopy]; !metacopy || !ok {
+		return false, nil
+	}
+	lowerRoot := fs.opts.LowerRoots[0]
+	fd, err := fs.vfsfs.VirtualFilesystem().OpenAt(ctx, fs.creds, &vfs.PathOperation{
+		Root:  lowerRoot,
+		Start: lowerRoot,
+		Path:  fspath.Parse(redirect),
+	}, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY,
+	})
+	if err != nil {
+		return true, err
+	}
+	defer fd.DecRef(ctx)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+		if _, werr := w.Write(buf[:n]); werr != nil {
+			return true, werr
+		}
+		if err == io.EOF {
+			return true, nil
+		}
+		if err != nil {
+			return true, err
+		}
+	}
 }
 
 // dentry implements vfs.DentryImpl.
