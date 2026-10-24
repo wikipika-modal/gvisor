@@ -144,6 +144,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 		"    'medium' can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created\n"+
 		"    'size' optional parameter overrides default overlay upper layer size\n")
 	flagSet.Bool("fsmutationlog", false, "enable mutation-log tracking on the disk-backed overlay upper layer (the fsmutationlog snapshot mechanism). Off by default so ordinary sandboxes pay no logging cost.")
+	flagSet.Bool("overlay2-metacopy", false, "in the root overlay, copy up only metadata for chown/chmod/utimes/xattr changes, leaving file data on the lower layer until the file is opened for writing (like Linux overlayfs metacopy=on).")
 	flagSet.String("fsmutationlog-path", "", "host path of the persistent mutation-log file for the root overlay upper. When set with --fsmutationlog, runsc opens and donates it to the sandbox at boot.")
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")

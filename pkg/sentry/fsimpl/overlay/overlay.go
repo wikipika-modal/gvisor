@@ -86,6 +86,12 @@ type FilesystemOptions struct {
 	// LowerRoots contains the roots of the immutable lower layers of the
 	// overlay. LowerRoots is immutable.
 	LowerRoots []vfs.VirtualDentry
+
+	// If Metacopy is true, copy-up for a metadata change leaves a regular
+	// file's data on the lower layer until the file is opened for writing,
+	// truncated, or hard linked, as with Linux overlayfs' metacopy=on.
+	// Metacopy requires exactly one lower layer.
+	Metacopy bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -107,6 +113,11 @@ type filesystem struct {
 
 	// xattrOpaque is xattrPrefix + "opaque". xattrOpaque is immutable.
 	xattrOpaque string
+
+	// xattrMetacopy and xattrRedirect are xattrPrefix + "metacopy" and
+	// xattrPrefix + "redirect". They are immutable.
+	xattrMetacopy string
+	xattrRedirect string
 
 	// createCreds is a cache of credentials that is used for create operations.
 	createCredsMu createCredsMutex `state:"nosave"`
@@ -314,6 +325,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two lower layers are required when no upper layer is present")
 		return nil, nil, linuxerr.EINVAL
 	}
+	if fsopts.Metacopy && len(fsopts.LowerRoots) != 1 {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: metacopy requires exactly one lower layer")
+		return nil, nil, linuxerr.EINVAL
+	}
 	const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
 	if len(fsopts.LowerRoots) > maxLowerLayers {
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: %d lower layers specified, maximum %d", len(fsopts.LowerRoots), maxLowerLayers)
@@ -347,6 +362,8 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		creds:          creds.Fork(),
 		xattrPrefix:    xattrPrefix,
 		xattrOpaque:    xattrPrefix + "opaque",
+		xattrMetacopy:  xattrPrefix + "metacopy",
+		xattrRedirect:  xattrPrefix + "redirect",
 		dirDevMinor:    dirDevMinor,
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
@@ -586,6 +603,11 @@ type dentry struct {
 	// copiedUp is 1 if this dentry has been copied-up (i.e. upperVD.Ok()) and
 	// 0 otherwise.
 	copiedUp atomicbitops.Uint32
+
+	// metacopy is true if this dentry is a copied-up regular file whose data
+	// is still on lowerVDs[0]. metacopy is set before copiedUp, and is cleared
+	// with copyMu and mapsMu locked once the data is on the upper layer.
+	metacopy atomicbitops.Bool
 
 	// parent is the dentry corresponding to this dentry's parent directory.
 	// name is this dentry's name in parent. If this dentry is a filesystem

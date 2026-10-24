@@ -116,6 +116,11 @@ type Config struct {
 	// it during execution. The snapshot caller reflinks this same path.
 	FSMutationLogPath string `flag:"fsmutationlog-path"`
 
+	// Overlay2Metacopy makes the root overlay copy up only metadata when a
+	// regular file's metadata changes, leaving its data on the lower layer
+	// until it is opened for writing. See overlay.FilesystemOptions.Metacopy.
+	Overlay2Metacopy bool `flag:"overlay2-metacopy"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
