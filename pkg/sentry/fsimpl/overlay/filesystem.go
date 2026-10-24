@@ -2066,6 +2066,9 @@ func (fs *filesystem) setXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mo
 		return err
 	}
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	// Metacopy data copy-up restores security.capability after writing data.
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
 	// Notably, we use the caller's creds here rather than the filesystem's creds,
 	// since setting some xattrs includes additional UID/GID and userns-related checks
 	// and translations.
@@ -2122,6 +2125,8 @@ func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs
 		return err
 	}
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
 	return vfsObj.RemoveXattrAt(ctx, creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, name)
 }
 

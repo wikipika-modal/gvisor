@@ -550,14 +550,13 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, skipData, mayUnlo
 			return err
 		}
 		// The upper file's data reads as d's data only once the metacopy xattr
-		// is removed, so a failed copy leaves d intact.
+		// is removed, so a failed copy leaves d intact once its metadata is
+		// restored.
 		if mayUnlockRenameMu {
 			d.fs.renameMu.RUnlock()
 			renameMuUnlocked = true
 		}
-		if _, err := vfs.CopyRegularFileData(ctx, upperFD, lowerFD); err != nil {
-			return err
-		}
+		_, copyErr := vfs.CopyRegularFileData(ctx, upperFD, lowerFD)
 		if err := upperFD.SetStat(ctx, vfs.SetStatOptions{
 			Stat: linux.Statx{
 				Mask:  stat.Mask&timestampsMask | linux.STATX_MODE,
@@ -573,6 +572,9 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, skipData, mayUnlo
 			if err := vfsObj.SetXattrAt(ctx, d.fs.creds, &upperPop, &vfs.SetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Value: caps}); err != nil {
 				return err
 			}
+		}
+		if copyErr != nil {
+			return copyErr
 		}
 	}
 	for _, name := range []string{d.fs.xattrMetacopy, d.fs.xattrRedirect} {
