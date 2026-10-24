@@ -101,15 +101,16 @@ func (d *dentry) copyUpForWriteLocked(ctx context.Context) error {
 	return d.copyUpMetacopyDataLocked(ctx, false /* skipData */, true /* mayUnlockRenameMu */)
 }
 
-// copyUpForSetStatLocked is copyUpLocked for a setattr with opts. Truncation
-// needs the regular file data on the upper layer.
+// copyUpForSetStatLocked is copyUpForWriteLocked for a setattr with opts,
+// which needs regular file data on the upper layer only to truncate.
 //
 // Preconditions: As for copyUpForWriteLocked.
 func (d *dentry) copyUpForSetStatLocked(ctx context.Context, opts *vfs.SetStatOptions) error {
-	if opts.Stat.Mask&linux.STATX_SIZE != 0 {
-		return d.copyUpForWriteLocked(ctx)
+	metacopy := opts.Stat.Mask&linux.STATX_SIZE == 0
+	if err := d.copyUpMaybeSyntheticMountpointLocked(ctx, false /* forSyntheticMountpoint */, metacopy, false /* skipData */, true /* mayUnlockRenameMu */); err != nil || metacopy {
+		return err
 	}
-	return d.copyUpLocked(ctx)
+	return d.copyUpMetacopyDataLocked(ctx, false /* skipData */, true /* mayUnlockRenameMu */)
 }
 
 // copyUpMaybeSyntheticMountpointLocked leaves a regular file's data on the
