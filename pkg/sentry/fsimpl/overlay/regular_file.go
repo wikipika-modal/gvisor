@@ -207,27 +207,15 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 			return err
 		}
 	}
-	wrappedFD, err := fd.getCurrentFD(ctx)
-	if err != nil {
-		return err
-	}
-	defer wrappedFD.DecRef(ctx)
 	// Changes to d's attributes are serialized by d.copyMu.
 	d.copyMu.Lock()
 	defer d.copyMu.Unlock()
-	// A metacopy file's metadata is on the upper layer, but wrappedFD is on
-	// the lower layer.
 	upperPop := &vfs.PathOperation{
 		Root:  d.upperVD,
 		Start: d.upperVD,
 	}
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
-	if d.isMetacopy() {
-		err = vfsObj.SetStatAt(ctx, d.fs.creds, upperPop, &opts)
-	} else {
-		err = wrappedFD.SetStat(ctx, opts)
-	}
-	if err != nil {
+	if err := vfsObj.SetStatAt(ctx, d.fs.creds, upperPop, &opts); err != nil {
 		return err
 	}
 
