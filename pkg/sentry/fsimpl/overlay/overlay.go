@@ -38,7 +38,7 @@ package overlay
 import (
 	"fmt"
 	"os"
-	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -155,8 +155,10 @@ type filesystem struct {
 	// be batched under one renameMu write lock. Entries may since have gained
 	// references; eviction skips them. cached and dentry.cached are protected
 	// by cacheMu.
-	cacheMu sync.Mutex `state:"nosave"`
-	cached  []*dentry
+	cacheMu   sync.Mutex `state:"nosave"`
+	cacheHead *dentry    `state:"nosave"`
+	cacheTail *dentry    `state:"nosave"`
+	cacheLen  int        `state:"nosave"`
 
 	// evicting is set while a goroutine evicts cached dentries. evicting is
 	// protected by cacheMu.
@@ -168,8 +170,22 @@ type filesystem struct {
 }
 
 // maxCachedDentries is the number of unreferenced dentries each overlay
-// filesystem keeps; once exceeded, all of them are destroyed.
+// filesystem keeps.
 const maxCachedDentries = 1000
+
+// Bench-only knobs: GVISOR_OVERLAY_DCACHE_POLICY is fifo (default), clock
+// (second chance on lookup hit), lru (refresh on lookup hit and on last ref
+// drop) or lrudrop (refresh on last ref drop only, like fsimpl/gofer).
+// GVISOR_OVERLAY_DCACHE_BATCH is how many dentries one overflow evicts.
+var (
+	dcachePolicy = os.Getenv("GVISOR_OVERLAY_DCACHE_POLICY")
+	dcacheBatch  = func() int {
+		if n, err := strconv.Atoi(os.Getenv("GVISOR_OVERLAY_DCACHE_BATCH")); err == nil && n > 0 {
+			return min(n, maxCachedDentries)
+		}
+		return maxCachedDentries
+	}()
+)
 
 // +stateify savable
 type layerDevNumber struct {
@@ -493,7 +509,7 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.released.Store(true)
 	fs.renameMu.Lock()
-	fs.evictCachedLocked(ctx)
+	fs.evictCachedLocked(ctx, 0)
 	fs.renameMu.Unlock()
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
@@ -647,8 +663,12 @@ type dentry struct {
 	// len(inlineLowerVDs).
 	inlineLowerVDs [1]vfs.VirtualDentry
 
-	// cached is true if d is in fs.cached. cached is protected by fs.cacheMu.
-	cached bool
+	// cached is true if d is in the cache list. cached is written with
+	// fs.cacheMu locked.
+	cached     atomicbitops.Bool
+	cachePrev  *dentry `state:"nosave"`
+	cacheNext  *dentry `state:"nosave"`
+	referenced atomicbitops.Bool
 
 	// hardLinked is set if d's upper file may have other hard links. d is then
 	// never cached, since metadata changes made through another link do not
@@ -797,18 +817,23 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	fs.cacheMu.Lock()
 	for _, d := range ds {
 		if d.refs.Load() != 0 {
+			if d.cached.Load() {
+				fs.cacheRemoveLocked(d)
+			}
 			continue
 		}
 		if mustDrop(d) {
 			drop = true
 			continue
 		}
-		if !d.cached {
-			d.cached = true
-			fs.cached = append(fs.cached, d)
+		if !d.cached.Load() {
+			fs.cachePushFrontLocked(d)
+		} else if dcachePolicy == "lru" || dcachePolicy == "lrudrop" {
+			fs.cacheRemoveLocked(d)
+			fs.cachePushFrontLocked(d)
 		}
 	}
-	evict := len(fs.cached) > maxCachedDentries && !fs.evicting
+	evict := fs.cacheLen > maxCachedDentries && !fs.evicting
 	if evict {
 		fs.evicting = true
 	}
@@ -825,34 +850,91 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 		}
 	}
 	if evict {
-		fs.evictCachedLocked(ctx)
+		fs.evictCachedLocked(ctx, maxCachedDentries-dcacheBatch)
 	}
 	fs.renameMu.Unlock()
 }
 
-// evictCachedLocked destroys all cached dentries, repeating while the cache
-// refilled past its limit meanwhile, then clears fs.evicting.
+// evictCachedLocked destroys cached dentries oldest first until keep remain,
+// repeating while the cache refilled past its limit meanwhile, then clears
+// fs.evicting.
 //
 // Preconditions: fs.renameMu must be locked for writing.
-func (fs *filesystem) evictCachedLocked(ctx context.Context) {
+func (fs *filesystem) evictCachedLocked(ctx context.Context, keep int) {
 	fs.cacheMu.Lock()
 	for {
-		victims := fs.cached
-		fs.cached = nil
-		for _, d := range victims {
-			d.cached = false
+		var victims []*dentry
+		for fs.cacheLen > keep {
+			d := fs.cacheTail
+			fs.cacheRemoveLocked(d)
+			if dcachePolicy == "clock" && d.referenced.Load() {
+				d.referenced.Store(false)
+				fs.cachePushFrontLocked(d)
+				continue
+			}
+			victims = append(victims, d)
 		}
 		fs.cacheMu.Unlock()
 		for _, d := range victims {
 			d.checkDropLocked(ctx)
 		}
 		fs.cacheMu.Lock()
-		if len(fs.cached) <= maxCachedDentries {
+		if fs.cacheLen <= maxCachedDentries {
 			break
 		}
 	}
 	fs.evicting = false
 	fs.cacheMu.Unlock()
+}
+
+// Preconditions: fs.cacheMu must be locked; !d.cached.
+func (fs *filesystem) cachePushFrontLocked(d *dentry) {
+	d.cachePrev = nil
+	d.cacheNext = fs.cacheHead
+	if fs.cacheHead != nil {
+		fs.cacheHead.cachePrev = d
+	} else {
+		fs.cacheTail = d
+	}
+	fs.cacheHead = d
+	fs.cacheLen++
+	d.cached.Store(true)
+}
+
+// Preconditions: fs.cacheMu must be locked; d.cached.
+func (fs *filesystem) cacheRemoveLocked(d *dentry) {
+	if d.cachePrev != nil {
+		d.cachePrev.cacheNext = d.cacheNext
+	} else {
+		fs.cacheHead = d.cacheNext
+	}
+	if d.cacheNext != nil {
+		d.cacheNext.cachePrev = d.cachePrev
+	} else {
+		fs.cacheTail = d.cachePrev
+	}
+	d.cachePrev, d.cacheNext = nil, nil
+	fs.cacheLen--
+	d.cached.Store(false)
+}
+
+// touchCached records a lookup hit on d for the clock and lru policies.
+func (fs *filesystem) touchCached(d *dentry) {
+	switch dcachePolicy {
+	case "clock":
+		if !d.referenced.Load() {
+			d.referenced.Store(true)
+		}
+	case "lru":
+		if d.cached.Load() {
+			fs.cacheMu.Lock()
+			if d.cached.Load() && fs.cacheHead != d {
+				fs.cacheRemoveLocked(d)
+				fs.cachePushFrontLocked(d)
+			}
+			fs.cacheMu.Unlock()
+		}
+	}
 }
 
 // checkDropLocked should be called after d's reference count becomes 0 or it
@@ -897,10 +979,8 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	}
 
 	d.fs.cacheMu.Lock()
-	if d.cached {
-		i := slices.Index(d.fs.cached, d)
-		d.fs.cached = slices.Delete(d.fs.cached, i, i+1)
-		d.cached = false
+	if d.cached.Load() {
+		d.fs.cacheRemoveLocked(d)
 	}
 	d.fs.cacheMu.Unlock()
 

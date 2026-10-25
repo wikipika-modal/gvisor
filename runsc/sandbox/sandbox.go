@@ -983,6 +983,11 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 		if tmpDir := os.Getenv("TMPDIR"); tmpDir != "" {
 			env = append(env, "TMPDIR="+tmpDir)
 		}
+		for _, k := range []string{"GVISOR_OVERLAY_DCACHE_POLICY", "GVISOR_OVERLAY_DCACHE_BATCH"} {
+			if v := os.Getenv(k); v != "" {
+				env = append(env, k+"="+v)
+			}
+		}
 	}
 	env = gvisorbinaries.WithEnforceRelease(env)
 	if opts.sentryUsesCgo {
