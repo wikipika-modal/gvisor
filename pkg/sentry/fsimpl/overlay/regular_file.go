@@ -215,7 +215,9 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 		Start: d.upperVD,
 	}
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
-	if err := vfsObj.SetStatAt(ctx, d.fs.creds, upperPop, &opts); err != nil {
+	// The caller's credentials recheck permission against the upper file's
+	// current owner and mode.
+	if err := vfsObj.SetStatAt(ctx, auth.CredentialsFromContext(ctx), upperPop, &opts); err != nil {
 		return err
 	}
 

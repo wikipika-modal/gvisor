@@ -538,8 +538,8 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, skipData, mayUnlo
 			return err
 		}
 		defer lowerFD.DecRef(ctx)
-		const timestampsMask = linux.STATX_ATIME | linux.STATX_MTIME
-		stat, err := upperFD.Stat(ctx, vfs.StatOptions{Mask: timestampsMask})
+		const restoredMask = linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_MODE
+		stat, err := upperFD.Stat(ctx, vfs.StatOptions{Mask: restoredMask})
 		if err != nil {
 			return err
 		}
@@ -559,11 +559,11 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, skipData, mayUnlo
 		_, copyErr := vfs.CopyRegularFileData(ctx, upperFD, lowerFD)
 		if err := upperFD.SetStat(ctx, vfs.SetStatOptions{
 			Stat: linux.Statx{
-				Mask:  stat.Mask&timestampsMask | linux.STATX_MODE,
+				Mask:  stat.Mask & restoredMask,
 				Atime: stat.Atime,
 				Mtime: stat.Mtime,
 				// Mode is specified again because the vfs.CopyRegularFileData() clears the setid bits.
-				Mode: uint16(d.mode.RacyLoad() &^ linux.S_IFMT),
+				Mode: stat.Mode &^ linux.S_IFMT,
 			},
 		}); err != nil {
 			return err
