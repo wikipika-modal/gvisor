@@ -1,0 +1,92 @@
+# Commits cherry-picked onto this release branch, in application order, by category.
+# Sources are the original commits (upstream, PR heads or Modal branches), not the resulting picks.
+release_branch: release/20261019
+branch_point_date: "2026-10-19"
+base: 760b80785dc53311d4c87bd2de167525a99709c1
+previous_release: 30f3f26b8c1495a3618983651e92e723bf331140
+picks:
+  - source: 49e8aba56da70c97822fb15cdc771904d0b4cfac
+    group: non_modal
+    subject: "Spawn with explicit GOMAXPROCS to avoid 5ebae40be9 regression."
+    pull_request: https://github.com/google/gvisor/pull/15813
+  - source: 6d278f8fc31c97dd9cd112dd60693a1a128d7603
+    group: non_modal
+    subject: "overlay: avoid ENOENT whiteout panic when renaming from a dead dir"
+  - source: 8a05f48c4c1b1da0bbb360abf8df41ca9302cfbb
+    group: non_modal
+    subject: "Stop panicking in initSyscallThread"
+  - source: 814de4372b0b24f0031d089e57e689b9b93e4e3f
+    group: non_modal
+    subject: "tmpfs: return ENOENT when creating a file in a deleted directory"
+  - source: ecef89159aa14d8f51d5b85d73ee7fdc1449be6c
+    group: modal
+    subject: "Avoid growing FD tables when clearing absent descriptors"
+    pull_request: https://github.com/google/gvisor/pull/15999
+  - source: 3722199038ba3ad9460840d49814b5052a309113
+    group: modal
+    subject: "fsutil: use huge pages for the aligned middle of unaligned fills"
+    pull_request: https://github.com/google/gvisor/pull/16008
+  - source: 9f745c6f34d35cc053ae1dc917319403d4dc72d5
+    group: modal
+    subject: "nvproxy: support /dev/nvidia-uvm-tools"
+    pull_request: https://github.com/google/gvisor/pull/15547
+  - source: a39822d696e6a9da8dbe66533e44b1b1504b7e4d
+    group: prs
+    subject: "Pass --device-map to cuda-checkpoint when GPUs change across restore"
+    pull_request: https://github.com/google/gvisor/pull/14817
+  - source: b581c8459ad4016572ba2c0e441e87df8a413a99
+    group: prs
+    subject: "Expose virtual NUMA topology for NVProxy workloads"
+    pull_request: https://github.com/google/gvisor/pull/15636
+  - source: d87b5a5c3f24543539e7e5ee3fe1df0b9077f3cc
+    group: prs
+    subject: "Adds missing ioctls for Vulkan"
+    pull_request: https://github.com/google/gvisor/pull/15736
+  - source: 495fbd903055e5bc5c5b4fbcddee6d6a1ba59480
+    group: prs
+    subject: "Add CUDA-GDB support to nvproxy"
+    pull_request: https://github.com/google/gvisor/pull/15741
+  - source: 6cb32c64981d6f7d927ca9f12c85eec5111746ec
+    group: prs
+    subject: "nvproxy: support GPU queries and FIFO events"
+    pull_request: https://github.com/google/gvisor/pull/15946
+  - source: 653d273c978dab0fb916b99f983aefbe10df429c
+    group: prs
+    subject: "nvproxy: hugepage-align application memory mirrors"
+    pull_request: https://github.com/google/gvisor/pull/16009
+  - source: aab0cb261e3081d7a1316f891677dc4532353cbc
+    group: prs
+    subject: "mm: hugepage-align hugepage-capable tmpfs mappings"
+    pull_request: https://github.com/google/gvisor/pull/16277
+  - source: aeca713eea39f09dd055fa2f16cace0c08228c29
+    group: prs
+    subject: "overlay: Skip copying file data on copy-up for O_TRUNC opens"
+    pull_request: https://github.com/google/gvisor/pull/16117
+  - source: 267690ee31d55b0b63471fcfce3302f75b28fa00
+    group: prs
+    subject: "overlay: Copy file data for open-time copy-up without holding renameMu"
+    pull_request: https://github.com/google/gvisor/pull/16117
+  - source: ad2361b804b3a04e80666c2cb64b167caf4b3ae8
+    group: prs
+    subject: "overlay: Copy file data for setattr copy-up without holding renameMu"
+    pull_request: https://github.com/google/gvisor/pull/16117
+  - source: b01a5165137502bf604297c9abd7138b32eda360
+    group: prs
+    subject: "Restrict /proc/gvisor/spec_environ to the container's user"
+    pull_request: https://github.com/google/gvisor/pull/16130
+  - source: b6dff9b7e8dc74d992998e4975e981a9ad8734f1
+    group: prs
+    subject: "pgalloc: don't merge memAcct from UpdateUsage() during MemoryFile.SaveTo()"
+    pull_request: https://github.com/google/gvisor/pull/16187
+  - source: 88715ed9adbe3d72ce945d745f3a1f514ddc4b47
+    group: prs
+    subject: "Resolve symlinks in device paths before mounting them in the gofer"
+    pull_request: https://github.com/google/gvisor/pull/16360
+  - source: b4358bc4206fc347b464a60b61c655047e87589e
+    group: proprietary
+    subject: "MODAL: Add the XEMU platform"
+    branch: modal-labs/gvisor xemu
+  - source: 8ebd5dd1a82de80858dc4a8cde64a5f2e7764a2a
+    group: proprietary
+    subject: "MODAL: Add support for fsmutationlog."
+    branch: modal-labs/gvisor apoorva/fss/squashed-fsmutationlog
