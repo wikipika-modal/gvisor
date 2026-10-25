@@ -181,8 +181,9 @@ const (
 	// filesystem keeps.
 	maxCachedDentries = 1000
 
-	// dentryCacheEvictBatch is the number of least recently used dentries
-	// destroyed under one renameMu write lock when the cache overflows.
+	// dentryCacheEvictBatch is how far below maxCachedDentries an overflow
+	// shrinks the cache, destroying least recently used dentries under one
+	// renameMu write lock.
 	dentryCacheEvictBatch = 250
 )
 
