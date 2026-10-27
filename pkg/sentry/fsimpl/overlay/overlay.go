@@ -673,7 +673,8 @@ type dentry struct {
 
 	// hardLinked is set if d's upper file may have other hard links. d is then
 	// never cached, since metadata changes made through another link do not
-	// update d.
+	// update d. It is set by lookup and LinkAt, since checking the link count
+	// when d loses its last reference would cost a stat.
 	hardLinked atomicbitops.Bool
 
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
@@ -827,7 +828,7 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 			continue
 		}
 		if d.cached {
-			fs.dentryCache.dentries.Remove(d)
+			fs.dentryCache.dentries.Remove(d) // immediate move to front below
 		} else {
 			d.cached = true
 			fs.dentryCache.dentriesLen++

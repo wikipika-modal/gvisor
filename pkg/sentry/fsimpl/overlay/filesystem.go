@@ -218,6 +218,8 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Root:  childVD,
 			Start: childVD,
 		}
+		// STATX_NLINK is not required, but tells whether an upper file has other
+		// hard links; see dentry.hardLinked.
 		stat, err := vfsObj.StatAt(ctx, fs.creds, childPop, &vfs.StatOptions{
 			Mask: mask | linux.STATX_NLINK,
 		})
