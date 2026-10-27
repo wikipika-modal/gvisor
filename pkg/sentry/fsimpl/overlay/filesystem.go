@@ -37,7 +37,10 @@ func isWhiteout(stat *linux.Statx) bool {
 
 // DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
 func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
-	return linuxerr.EOPNOTSUPP
+	fs.renameMu.Lock()
+	fs.evictCachedLocked(ctx, 0)
+	fs.renameMu.Unlock()
+	return nil
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.
