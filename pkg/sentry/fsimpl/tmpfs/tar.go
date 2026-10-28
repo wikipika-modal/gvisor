@@ -527,10 +527,14 @@ type tarDataWriterCallbacks struct {
 }
 
 func (cb tarDataWriterCallbacks) regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error {
-	if handled, err := cb.writeData(ctx, rf.inode.xattrs.RawXattrs(), tw); handled || err != nil {
+	handled, err := cb.writeData(ctx, rf.inode.xattrs.RawXattrs(), tw)
+	if err != nil {
 		return err
 	}
-	return cb.tarDefaultWriterCallbacks.regularFileWrite(ctx, rf, tw)
+	if !handled {
+		return cb.tarDefaultWriterCallbacks.regularFileWrite(ctx, rf, tw)
+	}
+	return nil
 }
 
 func aclToPAXRecord(acl *vfs.PosixACL) string {

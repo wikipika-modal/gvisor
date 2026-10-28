@@ -305,7 +305,8 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		// For non-directory files, only the topmost layer that contains a file
 		// matters, except that a metacopy file's data is on a lower layer.
 		if !isDir {
-			if isUpper && fs.opts.Metacopy && stat.Mode&linux.S_IFMT == linux.S_IFREG {
+			isRegularFile := stat.Mode&linux.S_IFMT == linux.S_IFREG
+			if isUpper && isRegularFile && fs.opts.Metacopy {
 				lookupErr = fs.lookupMetacopyDataLocked(ctx, child, childVD)
 			}
 			return false
@@ -397,8 +398,12 @@ func (fs *filesystem) lookupMetacopyDataLocked(ctx context.Context, child *dentr
 		Path:  fspath.Parse(redirect),
 	}
 	lowerStat, err := vfsObj.StatAt(ctx, fs.creds, lowerPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
-	if err != nil || lowerStat.Mode&linux.S_IFMT != linux.S_IFREG {
-		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: no regular file at %q: %v", redirect, err)
+	if err != nil {
+		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: no file at %q: %v", redirect, err)
+		return linuxerr.EIO
+	}
+	if lowerStat.Mode&linux.S_IFMT != linux.S_IFREG {
+		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: %q is not a regular file", redirect)
 		return linuxerr.EIO
 	}
 	lowerVD, err := vfsObj.GetDentryAt(ctx, fs.creds, lowerPop, &vfs.GetDentryOptions{})

@@ -195,7 +195,9 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 
 	// Perform copy-up.
 	ftype := d.mode.Load() & linux.S_IFMT
-	metacopy := opts.metacopy && ftype == linux.S_IFREG && d.fs.opts.Metacopy && oldStat.Mask&linux.STATX_SIZE != 0
+	isRegularFile := ftype == linux.S_IFREG
+	lowerSizeKnown := oldStat.Mask&linux.STATX_SIZE != 0
+	metacopy := opts.metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown
 	newpop := vfs.PathOperation{
 		Root:  parent.upperVD,
 		Start: parent.upperVD,
@@ -566,7 +568,8 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOption
 		// Writing the data also removes file capabilities.
 		caps, err := vfsObj.GetXattrAt(ctx, d.fs.creds, &upperPop, &vfs.GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY})
 		hasCaps := err == nil
-		if err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) && !linuxerr.Equals(linuxerr.EOPNOTSUPP, err) {
+		noCaps := linuxerr.Equals(linuxerr.ENODATA, err) || linuxerr.Equals(linuxerr.EOPNOTSUPP, err)
+		if !hasCaps && !noCaps {
 			return err
 		}
 		// The upper file's data reads as d's data only once the metacopy xattr

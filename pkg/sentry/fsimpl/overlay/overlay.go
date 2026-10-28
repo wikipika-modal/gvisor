@@ -592,8 +592,9 @@ func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 // writeMetacopyData writes the data of a metacopy file with the given upper
 // layer xattrs to w, and returns false for other files.
 func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error) {
-	redirect, ok := xattrs[fs.xattrRedirect]
-	if _, metacopy := xattrs[fs.xattrMetacopy]; !metacopy || !ok {
+	_, isMetacopy := xattrs[fs.xattrMetacopy]
+	redirect, hasRedirect := xattrs[fs.xattrRedirect]
+	if !isMetacopy || !hasRedirect {
 		return false, nil
 	}
 	lowerRoot := fs.opts.LowerRoots[0]
