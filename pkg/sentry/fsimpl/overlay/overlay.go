@@ -587,7 +587,10 @@ type tarDataSerializer interface {
 func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	upperFS := fs.opts.UpperRoot.Mount().Filesystem()
 	if ts, ok := upperFS.Impl().(tarDataSerializer); ok && fs.opts.Metacopy {
-		return ts.TarUpperLayerWithData(ctx, outFD, fs.writeMetacopyData)
+		buf := make([]byte, 1<<20)
+		return ts.TarUpperLayerWithData(ctx, outFD, func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error) {
+			return fs.writeMetacopyData(ctx, xattrs, w, buf)
+		})
 	}
 	ts, ok := upperFS.Impl().(vfs.TarSerializer)
 	if !ok {
@@ -598,7 +601,7 @@ func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 
 // writeMetacopyData writes the data of a metacopy file with the given upper
 // layer xattrs to w, and returns false for other files.
-func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error) {
+func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]string, w io.Writer, buf []byte) (bool, error) {
 	_, isMetacopy := xattrs[fs.xattrMetacopy]
 	redirect, hasRedirect := xattrs[fs.xattrRedirect]
 	if !isMetacopy || !hasRedirect {
@@ -616,7 +619,6 @@ func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]s
 		return true, err
 	}
 	defer fd.DecRef(ctx)
-	buf := make([]byte, 1<<20)
 	for {
 		n, err := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 		if _, werr := w.Write(buf[:n]); werr != nil {
