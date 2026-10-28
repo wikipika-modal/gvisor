@@ -469,9 +469,8 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, forSyntheticMountpoint, met
 	return nil
 }
 
-// markLowerEvictable tells the lower layers that their dentries for d, a
-// non-directory whose data is on the upper layer, are no longer accessed
-// through the overlay, so that they may release their resources.
+// markLowerEvictable frees lower dentry cache when a lower file's data is
+// copied up. Does not apply to metacopy!
 func (d *dentry) markLowerEvictable() {
 	for _, lowerDentry := range d.lowerVDs {
 		lowerDentry.Dentry().MarkEvictable()
