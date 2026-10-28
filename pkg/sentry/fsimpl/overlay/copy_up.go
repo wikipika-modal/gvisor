@@ -58,38 +58,23 @@ func (d *dentry) canBeCopiedUp() bool {
 	}
 }
 
-// copyUpOptions controls copy-up.
-type copyUpOptions struct {
-	// forSyntheticMountpoint is passed to the upper layer when creating
-	// directories.
-	forSyntheticMountpoint bool
-
-	// If metacopy and fs.opts.Metacopy are true, a regular file's data stays
-	// on the lower layer.
-	metacopy bool
-
-	// If skipData is true, the caller truncates the upper file right after
-	// copy-up, so regular file data is not copied.
-	skipData bool
-
-	// If mayUnlockRenameMu is true, filesystem.renameMu may be temporarily
-	// unlocked while copying regular file data.
-	mayUnlockRenameMu bool
-}
-
 // copyUpLocked ensures that d exists on the upper layer, i.e. d.upperVD.Ok().
 // If fs.opts.Metacopy is true, a regular file's data stays on the lower layer.
 //
 // Preconditions: filesystem.renameMu must be locked.
 func (d *dentry) copyUpLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{metacopy: true})
+	return d.doCopyUpLocked(ctx, false /* forSyntheticMountpoint */, true /* metacopy */, false /* skipData */, false /* mayUnlockRenameMu */)
 }
 
-// copyUpWithDataLocked is copyUpLocked that also copies regular file data.
+// copyUpForHardlinkLocked is copyUpLocked for a hard link. Links share the
+// upper file, so regular file data is copied.
 //
 // Preconditions: filesystem.renameMu must be locked.
-func (d *dentry) copyUpWithDataLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{})
+func (d *dentry) copyUpForHardlinkLocked(ctx context.Context) error {
+	if err := d.doCopyUpLocked(ctx, false /* forSyntheticMountpoint */, false /* metacopy */, false /* skipData */, false /* mayUnlockRenameMu */); err != nil {
+		return err
+	}
+	return d.doCopyUpDataLocked(ctx, false /* skipData */, false /* mayUnlockRenameMu */)
 }
 
 // copyUpForTruncateLocked is copyUpLocked for an open with O_TRUNC, which
@@ -98,7 +83,10 @@ func (d *dentry) copyUpWithDataLocked(ctx context.Context) error {
 //
 // Preconditions: filesystem.renameMu must be locked.
 func (d *dentry) copyUpForTruncateLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{skipData: true})
+	if err := d.doCopyUpLocked(ctx, false /* forSyntheticMountpoint */, false /* metacopy */, true /* skipData */, false /* mayUnlockRenameMu */); err != nil {
+		return err
+	}
+	return d.doCopyUpDataLocked(ctx, true /* skipData */, false /* mayUnlockRenameMu */)
 }
 
 // copyUpForWriteLocked is copyUpLocked for a write operation. It may
@@ -108,36 +96,35 @@ func (d *dentry) copyUpForTruncateLocked(ctx context.Context) error {
 // Preconditions: filesystem.renameMu must be locked for reading, and the
 // caller must hold a reference on d.
 func (d *dentry) copyUpForWriteLocked(ctx context.Context) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{mayUnlockRenameMu: true})
+	if err := d.doCopyUpLocked(ctx, false /* forSyntheticMountpoint */, false /* metacopy */, false /* skipData */, true /* mayUnlockRenameMu */); err != nil {
+		return err
+	}
+	return d.doCopyUpDataLocked(ctx, false /* skipData */, true /* mayUnlockRenameMu */)
 }
 
 // copyUpForSetStatLocked is copyUpForWriteLocked for a setattr with opts,
 // which needs regular file data on the upper layer only to truncate.
 //
-// Preconditions: As for copyUpForWriteLocked.
+// Preconditions: filesystem.renameMu must be locked for reading, and the
+// caller must hold a reference on d.
 func (d *dentry) copyUpForSetStatLocked(ctx context.Context, opts *vfs.SetStatOptions) error {
-	return d.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{
-		metacopy:          opts.Stat.Mask&linux.STATX_SIZE == 0,
-		mayUnlockRenameMu: true,
-	})
+	if opts.Stat.Mask&linux.STATX_SIZE != 0 {
+		return d.copyUpForWriteLocked(ctx)
+	}
+	return d.doCopyUpLocked(ctx, false /* forSyntheticMountpoint */, true /* metacopy */, false /* skipData */, true /* mayUnlockRenameMu */)
 }
 
-// copyUpMaybeSyntheticMountpointLocked copies d up as specified by opts.
-// Compare Linux's fs/overlayfs/copy_up.c:ovl_copy_up_one().
-func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, opts copyUpOptions) error {
-	if err := d.doCopyUpLocked(ctx, opts); err != nil {
-		return err
-	}
-	if opts.metacopy {
-		return nil
-	}
-	return d.copyUpMetacopyDataLocked(ctx, opts)
-}
-
-// doCopyUpLocked creates d on the upper layer, leaving a regular file's data on
-// the lower layer if opts.metacopy and fs.opts.Metacopy are true. If d is
-// already copied up, doCopyUpLocked does nothing.
-func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
+// doCopyUpLocked creates d on the upper layer if it is not there already. A
+// regular file's data is copied with it unless skipData is true, or metacopy
+// and fs.opts.Metacopy are true, in which case the data stays on the lower
+// layer. forSyntheticMountpoint is passed to the upper layer when creating
+// directories. If mayUnlockRenameMu is true, filesystem.renameMu may be
+// temporarily unlocked while copying data.
+//
+// Preconditions: filesystem.renameMu must be locked. If mayUnlockRenameMu is
+// true, filesystem.renameMu must be locked for reading, and the caller must
+// hold a reference on d.
+func (d *dentry) doCopyUpLocked(ctx context.Context, forSyntheticMountpoint, metacopy, skipData, mayUnlockRenameMu bool) error {
 	// Fast path.
 	if d.isCopiedUp() {
 		return nil
@@ -157,7 +144,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 		// d is a filesystem root with no upper layer.
 		return linuxerr.EROFS
 	}
-	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{forSyntheticMountpoint: opts.forSyntheticMountpoint}); err != nil {
+	if err := parent.doCopyUpLocked(ctx, forSyntheticMountpoint, false /* metacopy */, false /* skipData */, false /* mayUnlockRenameMu */); err != nil {
 		return err
 	}
 
@@ -197,7 +184,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 	ftype := d.mode.Load() & linux.S_IFMT
 	isRegularFile := ftype == linux.S_IFREG
 	lowerSizeKnown := oldStat.Mask&linux.STATX_SIZE != 0
-	metacopy := opts.metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown
+	metacopy = metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown
 	newpop := vfs.PathOperation{
 		Root:  parent.upperVD,
 		Start: parent.upperVD,
@@ -247,9 +234,9 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 				return err
 			}
 			sizeMask = linux.STATX_SIZE
-		} else if !opts.skipData {
+		} else if !skipData {
 			// While copying data, free renameMu.
-			if opts.mayUnlockRenameMu {
+			if mayUnlockRenameMu {
 				d.fs.renameMu.RUnlock()
 				renameMuUnlocked = true
 			}
@@ -310,7 +297,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 		if err := vfsObj.MkdirAt(ctx, d.fs.creds, &newpop, &vfs.MkdirOptions{
 			// d.mode can be read because d.copyMu is locked.
 			Mode:                   linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
-			ForSyntheticMountpoint: opts.forSyntheticMountpoint,
+			ForSyntheticMountpoint: forSyntheticMountpoint,
 		}); err != nil {
 			return err
 		}
@@ -472,7 +459,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, opts copyUpOptions) error {
 		defer d.mapsMu.Unlock()
 		// Without data, the upper file is already empty, so the open's
 		// truncation won't invalidate private copies of lower pages.
-		if err := d.switchToUpperMappableLocked(ctx, mmapOpts.Mappable, opts.skipData); err != nil {
+		if err := d.switchToUpperMappableLocked(ctx, mmapOpts.Mappable, skipData); err != nil {
 			return err
 		}
 	}
@@ -508,12 +495,15 @@ func (d *dentry) setMetacopyXattrsLocked(ctx context.Context, fd *vfs.FileDescri
 	return fd.SetXattr(ctx, &vfs.SetXattrOptions{Name: d.fs.xattrRedirect, Value: redirect})
 }
 
-// copyUpMetacopyDataLocked copies the data of d, if it is a metacopy file, to
-// the upper layer, or drops it if opts.skipData is true. Compare Linux's
-// fs/overlayfs/copy_up.c:ovl_copy_up_meta_inode_data().
+// doCopyUpDataLocked copies the data of d, if it is a metacopy file, to the
+// upper layer, or drops it if skipData is true. If mayUnlockRenameMu is true,
+// filesystem.renameMu may be temporarily unlocked while copying data. Compare
+// Linux's fs/overlayfs/copy_up.c:ovl_copy_up_meta_inode_data().
 //
-// Preconditions: As for copyUpMaybeSyntheticMountpointLocked.
-func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOptions) error {
+// Preconditions: filesystem.renameMu must be locked. If mayUnlockRenameMu is
+// true, filesystem.renameMu must be locked for reading, and the caller must
+// hold a reference on d.
+func (d *dentry) doCopyUpDataLocked(ctx context.Context, skipData, mayUnlockRenameMu bool) error {
 	if !d.isMetacopy() {
 		return nil
 	}
@@ -527,7 +517,7 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOption
 		}
 	}()
 	if !d.isMetacopy() {
-		// Raced with another call to d.copyUpMetacopyDataLocked().
+		// Raced with another call to d.doCopyUpDataLocked().
 		return nil
 	}
 
@@ -543,7 +533,7 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOption
 		return err
 	}
 	defer upperFD.DecRef(ctx)
-	if opts.skipData {
+	if skipData {
 		if err := upperFD.SetStat(ctx, vfs.SetStatOptions{
 			Stat: linux.Statx{Mask: linux.STATX_SIZE},
 		}); err != nil {
@@ -575,7 +565,7 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOption
 		// The upper file's data reads as d's data only once the metacopy xattr
 		// is removed, so a failed copy leaves d intact once its metadata is
 		// restored.
-		if opts.mayUnlockRenameMu {
+		if mayUnlockRenameMu {
 			d.fs.renameMu.RUnlock()
 			renameMuUnlocked = true
 		}
@@ -619,7 +609,7 @@ func (d *dentry) copyUpMetacopyDataLocked(ctx context.Context, opts copyUpOption
 		}
 		d.mapsMu.Lock()
 		defer d.mapsMu.Unlock()
-		if err := d.switchToUpperMappableLocked(ctx, mmapOpts.Mappable, opts.skipData); err != nil {
+		if err := d.switchToUpperMappableLocked(ctx, mmapOpts.Mappable, skipData); err != nil {
 			return err
 		}
 	}

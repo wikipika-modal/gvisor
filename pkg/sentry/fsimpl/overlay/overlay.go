@@ -718,7 +718,7 @@ type dentry struct {
 	//
 	//	- wrappedMappable is protected by mapsMu and dataMu. In addition,
 	//	  it has to be immutable if copyMu is taken for write.
-	//        copyUpMaybeSyntheticMountpointLocked relies on this behavior.
+	//        doCopyUpLocked relies on this behavior.
 	mapsMu          mapsMutex `state:"nosave"`
 	lowerMappings   memmap.MappingSet
 	dataMu          dataRWMutex `state:"nosave"`

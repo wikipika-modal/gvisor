@@ -611,7 +611,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
-	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{forSyntheticMountpoint: ct == createSyntheticMountpoint}); err != nil {
+	if err := parent.doCopyUpLocked(ctx, ct == createSyntheticMountpoint, false /* metacopy */, false /* skipData */, false /* mayUnlockRenameMu */); err != nil {
 		return err
 	}
 
@@ -740,9 +740,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if old.isDir() {
 			return linuxerr.EPERM
 		}
-		// Hard links share the upper file, so its data can't stay on the lower
-		// layer for one link's dentry but not the other's.
-		if err := old.copyUpWithDataLocked(ctx); err != nil {
+		if err := old.copyUpForHardlinkLocked(ctx); err != nil {
 			return err
 		}
 		vfsObj := fs.vfsfs.VirtualFilesystem()
