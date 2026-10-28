@@ -94,6 +94,13 @@ type FilesystemOptions struct {
 	// truncated, or hard linked, as with Linux overlayfs' metacopy=on.
 	// Metacopy requires exactly one lower layer.
 	Metacopy bool
+
+	// MetacopyMinSize is the smallest regular file that metacopy applies to.
+	MetacopyMinSize uint64
+
+	// If MetacopyLazyLower is true, a metacopy file found by lookup resolves
+	// its lower file on first data access.
+	MetacopyLazyLower bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -681,6 +688,10 @@ type dentry struct {
 	copyMu   sync.RWMutex `state:"nosave"`
 	upperVD  vfs.VirtualDentry
 	lowerVDs []vfs.VirtualDentry
+
+	// metacopyLowerMu serializes lazy resolution of a metacopy file's lower
+	// file into lowerVDs.
+	metacopyLowerMu sync.Mutex `state:"nosave"`
 
 	// inlineLowerVDs backs lowerVDs in the common case where len(lowerVDs) <=
 	// len(inlineLowerVDs).

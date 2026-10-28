@@ -1289,6 +1289,10 @@ type Overlay2 struct {
 	// file's metadata changes, like Linux overlayfs' metacopy=on. See
 	// overlay.FilesystemOptions.Metacopy.
 	metacopy bool
+	// metacopyMin and metacopyLazy set overlay.FilesystemOptions.MetacopyMinSize
+	// and MetacopyLazyLower.
+	metacopyMin  uint64
+	metacopyLazy bool
 }
 
 func defaultOverlay2() *Overlay2 {
@@ -1344,6 +1348,18 @@ func (o *Overlay2) Set(v string) error {
 			next.size = size
 			continue
 		}
+		if min, ok := strings.CutPrefix(opt, "metacopymin="); ok {
+			n, err := strconv.ParseUint(min, 10, 64)
+			if err != nil {
+				return setOverlay2Err(v)
+			}
+			next.metacopyMin = n
+			continue
+		}
+		if opt == "metacopylazy=on" {
+			next.metacopyLazy = true
+			continue
+		}
 		switch opt {
 		case overlay2MetacopyEq + "on":
 			next.metacopy = true
@@ -1388,6 +1404,12 @@ func (o Overlay2) String() string {
 	if o.metacopy {
 		res += "," + overlay2MetacopyEq + "on"
 	}
+	if o.metacopyMin != 0 {
+		res += fmt.Sprintf(",metacopymin=%d", o.metacopyMin)
+	}
+	if o.metacopyLazy {
+		res += ",metacopylazy=on"
+	}
 	return res
 }
 
@@ -1416,6 +1438,18 @@ func (o *Overlay2) RootOverlaySize() string {
 // metadata on metadata changes.
 func (o *Overlay2) RootOverlayMetacopy() bool {
 	return o.rootMount && o.metacopy
+}
+
+// RootOverlayMetacopyMinSize returns the smallest file size that metacopy
+// applies to.
+func (o *Overlay2) RootOverlayMetacopyMinSize() uint64 {
+	return o.metacopyMin
+}
+
+// RootOverlayMetacopyLazy returns whether metacopy files resolve their lower
+// file on first data access.
+func (o *Overlay2) RootOverlayMetacopyLazy() bool {
+	return o.metacopyLazy
 }
 
 // SubMountOverlayMedium returns the overlay medium config of submounts.

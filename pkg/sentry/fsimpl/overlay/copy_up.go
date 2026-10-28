@@ -43,7 +43,7 @@ func (d *dentry) isDataCopiedUp() bool {
 }
 
 func (d *dentry) isOnLower() bool {
-	return len(d.lowerVDs) > 0
+	return len(d.lowerVDs) > 0 || d.isMetacopy()
 }
 
 func (d *dentry) canBeCopiedUp() bool {
@@ -184,7 +184,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, forSyntheticMountpoint, met
 	ftype := d.mode.Load() & linux.S_IFMT
 	isRegularFile := ftype == linux.S_IFREG
 	lowerSizeKnown := oldStat.Mask&linux.STATX_SIZE != 0
-	metacopy = metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown
+	metacopy = metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown && oldStat.Size >= d.fs.opts.MetacopyMinSize
 	newpop := vfs.PathOperation{
 		Root:  parent.upperVD,
 		Start: parent.upperVD,
@@ -539,9 +539,13 @@ func (d *dentry) doCopyUpDataLocked(ctx context.Context, skipData, mayUnlockRena
 			return err
 		}
 	} else {
+		lowerVD, err := d.metacopyLowerVD(ctx)
+		if err != nil {
+			return err
+		}
 		lowerFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
-			Root:  d.lowerVDs[0],
-			Start: d.lowerVDs[0],
+			Root:  lowerVD,
+			Start: lowerVD,
 		}, &vfs.OpenOptions{
 			Flags: linux.O_RDONLY,
 		})

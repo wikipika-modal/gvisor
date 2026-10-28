@@ -847,6 +847,9 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		UpperRoot:  upperRootVD,
 		LowerRoots: []vfs.VirtualDentry{lowerRootVD},
 		Metacopy:   conf.Overlay2.RootOverlayMetacopy() && dst == "/",
+
+		MetacopyMinSize:   conf.Overlay2.RootOverlayMetacopyMinSize(),
+		MetacopyLazyLower: conf.Overlay2.RootOverlayMetacopyLazy(),
 	}
 	return &overlayOpts, cu.Release(), nil
 }

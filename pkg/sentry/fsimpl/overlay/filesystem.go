@@ -386,10 +386,49 @@ func (fs *filesystem) lookupMetacopyDataLocked(ctx context.Context, child *dentr
 		}
 		return err
 	}
+	if fs.opts.MetacopyLazyLower {
+		child.metacopy = atomicbitops.FromBool(true)
+		return nil
+	}
+	lowerVD, err := fs.lookupMetacopyLower(ctx, upperVD)
+	if err != nil {
+		return err
+	}
+	child.lowerVDs = append(child.lowerVDs, lowerVD)
+	child.metacopy = atomicbitops.FromBool(true)
+	return nil
+}
+
+// metacopyLowerVD returns the lower file holding metacopy file d's data,
+// looking it up if lookup deferred it.
+//
+// Preconditions: d.isMetacopy().
+func (d *dentry) metacopyLowerVD(ctx context.Context) (vfs.VirtualDentry, error) {
+	d.metacopyLowerMu.Lock()
+	defer d.metacopyLowerMu.Unlock()
+	if len(d.lowerVDs) > 0 {
+		return d.lowerVDs[0], nil
+	}
+	lowerVD, err := d.fs.lookupMetacopyLower(ctx, d.upperVD)
+	if err != nil {
+		return vfs.VirtualDentry{}, err
+	}
+	d.lowerVDs = append(d.lowerVDs, lowerVD)
+	return lowerVD, nil
+}
+
+// lookupMetacopyLower returns the lower file named by metacopy file upperVD's
+// redirect xattr.
+func (fs *filesystem) lookupMetacopyLower(ctx context.Context, upperVD vfs.VirtualDentry) (vfs.VirtualDentry, error) {
+	vfsObj := fs.vfsfs.VirtualFilesystem()
+	upperPop := &vfs.PathOperation{
+		Root:  upperVD,
+		Start: upperVD,
+	}
 	redirect, err := vfsObj.GetXattrAt(ctx, fs.creds, upperPop, &vfs.GetXattrOptions{Name: fs.xattrRedirect, Size: linux.XATTR_SIZE_MAX})
 	if err != nil {
-		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: metacopy file has no redirect: %v", err)
-		return linuxerr.EIO
+		ctx.Warningf("overlay.filesystem.lookupMetacopyLower: metacopy file has no redirect: %v", err)
+		return vfs.VirtualDentry{}, linuxerr.EIO
 	}
 	lowerRoot := fs.opts.LowerRoots[0]
 	lowerPop := &vfs.PathOperation{
@@ -399,20 +438,14 @@ func (fs *filesystem) lookupMetacopyDataLocked(ctx context.Context, child *dentr
 	}
 	lowerStat, err := vfsObj.StatAt(ctx, fs.creds, lowerPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
 	if err != nil {
-		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: no file at %q: %v", redirect, err)
-		return linuxerr.EIO
+		ctx.Warningf("overlay.filesystem.lookupMetacopyLower: no file at %q: %v", redirect, err)
+		return vfs.VirtualDentry{}, linuxerr.EIO
 	}
 	if lowerStat.Mode&linux.S_IFMT != linux.S_IFREG {
-		ctx.Warningf("overlay.filesystem.lookupMetacopyDataLocked: %q is not a regular file", redirect)
-		return linuxerr.EIO
+		ctx.Warningf("overlay.filesystem.lookupMetacopyLower: %q is not a regular file", redirect)
+		return vfs.VirtualDentry{}, linuxerr.EIO
 	}
-	lowerVD, err := vfsObj.GetDentryAt(ctx, fs.creds, lowerPop, &vfs.GetDentryOptions{})
-	if err != nil {
-		return err
-	}
-	child.lowerVDs = append(child.lowerVDs, lowerVD)
-	child.metacopy = atomicbitops.FromBool(true)
-	return nil
+	return vfsObj.GetDentryAt(ctx, fs.creds, lowerPop, &vfs.GetDentryOptions{})
 }
 
 // lookupLayerLocked is similar to lookupLocked, but only returns information
@@ -1028,7 +1061,11 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	if d.isMetacopy() {
 		// The lower file has the data but not d's mode, against which execute
 		// permission was already checked.
-		layerVD, isUpper = d.lowerVDs[0], false
+		lowerVD, err := d.metacopyLowerVD(ctx)
+		if err != nil {
+			return nil, err
+		}
+		layerVD, isUpper = lowerVD, false
 		lowerOpts := *opts
 		lowerOpts.FileExec = false
 		layerOpts = &lowerOpts
