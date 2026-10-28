@@ -94,6 +94,7 @@ go_library(
         "//pkg/sentry/fsimpl/proc",
         "//pkg/sentry/fsimpl/sys",
         "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/fsimpl/user",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",

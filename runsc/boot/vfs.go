@@ -59,6 +59,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -602,6 +603,10 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		// can only send mount options for specs.Mounts (specs.Root is missing
 		// Options field). So assume root is always on top of overlayfs.
 		data = append(data, "overlayfs_stale_read")
+		if conf.Overlay2.RootPageCache() {
+			data = append(data, "force_page_cache")
+		}
+		fsutil.RetainHostMappings = conf.Overlay2.RetainMmap()
 
 		// Configure the gofer dentry cache size.
 		gofer.SetDentryCacheSize(conf.DCache)

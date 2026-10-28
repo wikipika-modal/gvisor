@@ -210,6 +210,9 @@ func (f *MmapCachedFile) decRefUnaccounted(fr memmap.FileRange) {
 			f.refs[chunkStart] = refs - pgs
 		case refs == pgs:
 			delete(f.refs, chunkStart)
+			if RetainHostMappings && !f.mappableReleased {
+				break
+			}
 			// TODO: Unmapping here generally means that mappings of host FDs
 			// will be unmapped when there are no application VMAs mapping f,
 			// e.g. between process executions, which may be expensive for some
@@ -229,9 +232,19 @@ func (f *MmapCachedFile) decRefUnaccounted(fr memmap.FileRange) {
 		}
 	}
 	if f.mappableReleased && len(f.refs) == 0 {
+		if RetainHostMappings {
+			f.mapsMu.Lock()
+			for chunkStart, m := range f.mappings {
+				f.unmapAndRemove(chunkStart, m)
+			}
+			f.mapsMu.Unlock()
+		}
 		f.close()
 	}
 }
+
+// RetainHostMappings keeps host mappings of a file until it is released.
+var RetainHostMappings bool
 
 // Preconditions:
 //   - f.mappings[chunkStart] == m.

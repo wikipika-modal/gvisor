@@ -1293,6 +1293,9 @@ type Overlay2 struct {
 	// and MetacopyLazyLower.
 	metacopyMin  uint64
 	metacopyLazy bool
+	// retainMmap and rootPageCache are experiment knobs for image mmap.
+	retainMmap    bool
+	rootPageCache bool
 }
 
 func defaultOverlay2() *Overlay2 {
@@ -1360,6 +1363,14 @@ func (o *Overlay2) Set(v string) error {
 			next.metacopyLazy = true
 			continue
 		}
+		if opt == "retainmmap=on" {
+			next.retainMmap = true
+			continue
+		}
+		if opt == "rootpagecache=on" {
+			next.rootPageCache = true
+			continue
+		}
 		switch opt {
 		case overlay2MetacopyEq + "on":
 			next.metacopy = true
@@ -1410,6 +1421,12 @@ func (o Overlay2) String() string {
 	if o.metacopyLazy {
 		res += ",metacopylazy=on"
 	}
+	if o.retainMmap {
+		res += ",retainmmap=on"
+	}
+	if o.rootPageCache {
+		res += ",rootpagecache=on"
+	}
 	return res
 }
 
@@ -1444,6 +1461,16 @@ func (o *Overlay2) RootOverlayMetacopy() bool {
 // applies to.
 func (o *Overlay2) RootOverlayMetacopyMinSize() uint64 {
 	return o.metacopyMin
+}
+
+// RetainMmap returns whether host file mappings outlive application mappings.
+func (o *Overlay2) RetainMmap() bool {
+	return o.retainMmap
+}
+
+// RootPageCache returns whether the rootfs gofer caches pages in sentry memory.
+func (o *Overlay2) RootPageCache() bool {
+	return o.rootPageCache
 }
 
 // RootOverlayMetacopyLazy returns whether metacopy files resolve their lower
