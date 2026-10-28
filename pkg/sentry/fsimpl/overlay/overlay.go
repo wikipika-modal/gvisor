@@ -587,6 +587,8 @@ type dentry struct {
 	// 0 otherwise.
 	copiedUp atomicbitops.Uint32
 
+	metacopy atomicbitops.Bool
+
 	// parent is the dentry corresponding to this dentry's parent directory.
 	// name is this dentry's name in parent. If this dentry is a filesystem
 	// root, parent is nil and name is the empty string. parent and name are
@@ -616,8 +618,6 @@ type dentry struct {
 	// inlineLowerVDs backs lowerVDs in the common case where len(lowerVDs) <=
 	// len(inlineLowerVDs).
 	inlineLowerVDs [1]vfs.VirtualDentry
-
-	metacopy atomicbitops.Bool
 
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
