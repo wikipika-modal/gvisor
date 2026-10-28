@@ -606,7 +606,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
-	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, ct == createSyntheticMountpoint, false /* metacopy */, false /* skipData */, false /* mayUnlockRenameMu */); err != nil {
+	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, copyUpOptions{forSyntheticMountpoint: ct == createSyntheticMountpoint}); err != nil {
 		return err
 	}
 
