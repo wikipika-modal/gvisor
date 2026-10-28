@@ -617,6 +617,8 @@ type dentry struct {
 	// len(inlineLowerVDs).
 	inlineLowerVDs [1]vfs.VirtualDentry
 
+	metacopy atomicbitops.Bool
+
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
 	// used by this dentry. These fields are protected by copyMu.
 	devMajor atomicbitops.Uint32
