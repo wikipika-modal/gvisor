@@ -231,6 +231,9 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			// the topmost layer on which the file exists.
 			mask |= linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO
 		}
+		if isUpper && fs.opts.MetacopyMinSize != 0 {
+			mask |= linux.STATX_SIZE
+		}
 		childPop := &vfs.PathOperation{
 			Root:  childVD,
 			Start: childVD,
@@ -306,7 +309,8 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		// matters, except that a metacopy file's data is on a lower layer.
 		if !isDir {
 			isRegularFile := stat.Mode&linux.S_IFMT == linux.S_IFREG
-			if isUpper && isRegularFile && fs.opts.Metacopy {
+			mayBeMetacopy := fs.opts.MetacopyMinSize == 0 || stat.Size >= fs.opts.MetacopyMinSize
+			if isUpper && isRegularFile && fs.opts.Metacopy && mayBeMetacopy {
 				lookupErr = fs.lookupMetacopyDataLocked(ctx, child, childVD)
 			}
 			return false

@@ -616,7 +616,7 @@ func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]s
 		return true, err
 	}
 	defer fd.DecRef(ctx)
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 1<<20)
 	for {
 		n, err := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 		if _, werr := w.Write(buf[:n]); werr != nil {
