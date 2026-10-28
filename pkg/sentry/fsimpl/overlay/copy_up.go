@@ -448,6 +448,7 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, forSyntheticMountpoint, met
 		d.devMajor.Store(upperStat.DevMajor)
 		d.devMinor.Store(upperStat.DevMinor)
 		d.ino.Store(upperStat.Ino)
+		parent.direntsStale.Store(true)
 
 		if !metacopy {
 			d.markLowerEvictable()
