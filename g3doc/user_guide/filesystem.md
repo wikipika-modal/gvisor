@@ -34,7 +34,8 @@ The overlay can be backed by different mediums to manage memory and disk usage:
 ### Global Configuration
 
 To configure the overlay globally for all containers, use the `--overlay2` flag
-with the format `--overlay2={mount}:{medium}[,size={size}][,metacopy=on|off]`.
+with the format
+`--overlay2={mount}:{medium}[,size={size}][,metacopy=on|off][,metacopy_min_size={bytes}]`.
 
 *   `mount`: Can be `root` (root filesystem only) or `all` (all mounts).
 *   `medium`: One of the [backing mediums](#backing-mediums) (`memory`, `self`,
@@ -43,6 +44,9 @@ with the format `--overlay2={mount}:{medium}[,size={size}][,metacopy=on|off]`.
 *   `metacopy`: (Optional, default `off`) When `on`, enables Linux-style
     metacopy. Nondestructive metadata changes (chown, chmod, utime, xattr)
     cause a metadata-only copy-up. Only valid with `root`.
+*   `metacopy_min_size`: (Optional, default `0`) Regular files smaller than
+    this many bytes are copied up with their data. Only valid with
+    `metacopy=on`.
 
 Examples:
 

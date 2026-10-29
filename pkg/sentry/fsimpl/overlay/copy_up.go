@@ -184,7 +184,8 @@ func (d *dentry) doCopyUpLocked(ctx context.Context, forSyntheticMountpoint, met
 	ftype := d.mode.Load() & linux.S_IFMT
 	isRegularFile := ftype == linux.S_IFREG
 	lowerSizeKnown := oldStat.Mask&linux.STATX_SIZE != 0
-	metacopy = metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown
+	bigEnough := oldStat.Size >= d.fs.opts.MetacopyMinSize
+	metacopy = metacopy && d.fs.opts.Metacopy && isRegularFile && lowerSizeKnown && bigEnough
 	newpop := vfs.PathOperation{
 		Root:  parent.upperVD,
 		Start: parent.upperVD,

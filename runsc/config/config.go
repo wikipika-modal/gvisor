@@ -1289,6 +1289,8 @@ type Overlay2 struct {
 	// file's metadata changes, like Linux overlayfs' metacopy=on. See
 	// overlay.FilesystemOptions.Metacopy.
 	metacopy bool
+	// metacopyMinSize is overlay.FilesystemOptions.MetacopyMinSize.
+	metacopyMinSize uint64
 }
 
 func defaultOverlay2() *Overlay2 {
@@ -1297,13 +1299,14 @@ func defaultOverlay2() *Overlay2 {
 }
 
 func setOverlay2Err(v string) error {
-	return fmt.Errorf("expected format is --overlay2={mount}:{medium}[,size={size}][,metacopy=on|off], got %q", v)
+	return fmt.Errorf("expected format is --overlay2={mount}:{medium}[,size={size}][,metacopy=on|off][,metacopy_min_size={bytes}], got %q", v)
 }
 
-// `--overlay2=...` params `size=` and `metacopy=`.
+// `--overlay2=...` params `size=`, `metacopy=` and `metacopy_min_size=`.
 const (
-	overlay2SizeEq     = "size="
-	overlay2MetacopyEq = "metacopy="
+	overlay2SizeEq            = "size="
+	overlay2MetacopyEq        = "metacopy="
+	overlay2MetacopyMinSizeEq = "metacopy_min_size="
 )
 
 // Set implements flag.Value. Set(String()) should be idempotent.
@@ -1344,6 +1347,14 @@ func (o *Overlay2) Set(v string) error {
 			next.size = size
 			continue
 		}
+		if minSize, ok := strings.CutPrefix(opt, overlay2MetacopyMinSizeEq); ok {
+			n, err := strconv.ParseUint(minSize, 10, 64)
+			if err != nil {
+				return setOverlay2Err(v)
+			}
+			next.metacopyMinSize = n
+			continue
+		}
 		switch opt {
 		case overlay2MetacopyEq + "on":
 			next.metacopy = true
@@ -1355,6 +1366,9 @@ func (o *Overlay2) Set(v string) error {
 	}
 	if next.metacopy && next.subMounts {
 		return fmt.Errorf("--overlay2 metacopy=on applies only to the root mount, got %q", v)
+	}
+	if next.metacopyMinSize != 0 && !next.metacopy {
+		return fmt.Errorf("--overlay2 metacopy_min_size requires metacopy=on, got %q", v)
 	}
 
 	*o = next
@@ -1388,6 +1402,9 @@ func (o Overlay2) String() string {
 	if o.metacopy {
 		res += "," + overlay2MetacopyEq + "on"
 	}
+	if o.metacopyMinSize != 0 {
+		res += "," + overlay2MetacopyMinSizeEq + strconv.FormatUint(o.metacopyMinSize, 10)
+	}
 	return res
 }
 
@@ -1416,6 +1433,15 @@ func (o *Overlay2) RootOverlaySize() string {
 // metadata on metadata changes.
 func (o *Overlay2) RootOverlayMetacopy() bool {
 	return o.rootMount && o.metacopy
+}
+
+// RootOverlayMetacopyMinSize returns the smallest regular file that the root
+// overlay copies up without its data.
+func (o *Overlay2) RootOverlayMetacopyMinSize() uint64 {
+	if !o.rootMount {
+		return 0
+	}
+	return o.metacopyMinSize
 }
 
 // SubMountOverlayMedium returns the overlay medium config of submounts.

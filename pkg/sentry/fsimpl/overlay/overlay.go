@@ -94,6 +94,10 @@ type FilesystemOptions struct {
 	// truncated, or hard linked, as with Linux overlayfs' metacopy=on.
 	// Metacopy requires exactly one lower layer.
 	Metacopy bool
+
+	// MetacopyMinSize is the smallest regular file that Metacopy applies to.
+	// Smaller files are copied up with their data.
+	MetacopyMinSize uint64
 }
 
 // filesystem implements vfs.FilesystemImpl.
