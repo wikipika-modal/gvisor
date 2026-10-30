@@ -945,6 +945,7 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		d.upperVD.DecRef(ctx)
 	}
 	for _, lowerVD := range d.lowerVDs {
+		lowerVD.Dentry().MarkEvictable()
 		lowerVD.DecRef(ctx)
 	}
 
