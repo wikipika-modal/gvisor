@@ -1680,7 +1680,10 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 
 	// Changing owners or truncating may clear one or both of the setuid and
 	// setgid bits, so we may have to update opts before setting d.mode.
-	if opts.Stat.Mask&(linux.STATX_UID|linux.STATX_GID|linux.STATX_SIZE) != 0 {
+	hadSetid := d.mode.Load()&(linux.S_ISUID|linux.S_ISGID) != 0
+	setsMode := opts.Stat.Mask&linux.STATX_MODE != 0
+	mayClearSetid := opts.Stat.Mask&(linux.STATX_UID|linux.STATX_GID|linux.STATX_SIZE) != 0
+	if (hadSetid || setsMode) && mayClearSetid {
 		stat, err := vfsObj.StatAt(ctx, d.fs.creds, &upperPop, &vfs.StatOptions{
 			Mask: linux.STATX_MODE,
 		})
