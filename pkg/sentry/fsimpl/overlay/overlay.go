@@ -157,6 +157,11 @@ type filesystem struct {
 	// released is set once the filesystem is released; dentries are then
 	// destroyed as soon as they lose their last reference.
 	released atomicbitops.Bool
+
+	// lowerDecRefs, if not nil, collects the lower layer references of
+	// destroyed dentries so that they are dropped together once renameMu is
+	// unlocked. lowerDecRefs is protected by renameMu.
+	lowerDecRefs *[]vfs.VirtualDentry `state:"nosave"`
 }
 
 // dentryCache is an LRU cache of unreferenced dentries, like fsimpl/gofer's,
@@ -846,7 +851,9 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	if !drop && !evict {
 		return
 	}
+	var lowers []vfs.VirtualDentry
 	fs.renameMu.Lock()
+	fs.lowerDecRefs = &lowers
 	if drop {
 		for _, d := range ds {
 			if d.refs.Load() == 0 && mustDrop(d) {
@@ -857,7 +864,37 @@ func (fs *filesystem) cacheOrDrop(ctx context.Context, ds []*dentry) {
 	if evict {
 		fs.evictCachedLocked(ctx, maxCachedDentries-dentryCacheEvictBatch)
 	}
+	fs.lowerDecRefs = nil
 	fs.renameMu.Unlock()
+	decRefLowers(ctx, lowers)
+}
+
+// lowerBatchDecRefer is implemented by lower filesystems, like fsimpl/gofer,
+// that can drop references on many of their dentries under one lock.
+type lowerBatchDecRefer interface {
+	DecRefDentries(ctx context.Context, ds []*vfs.Dentry)
+}
+
+// decRefLowers drops the references in vds, in one batch per lower filesystem
+// that supports it.
+func decRefLowers(ctx context.Context, vds []vfs.VirtualDentry) {
+	if len(vds) == 0 {
+		return
+	}
+	batches := make(map[lowerBatchDecRefer][]*vfs.Dentry)
+	for _, vd := range vds {
+		if lowerFS, ok := vd.Mount().Filesystem().Impl().(lowerBatchDecRefer); ok {
+			batches[lowerFS] = append(batches[lowerFS], vd.Dentry())
+		} else {
+			vd.Dentry().DecRef(ctx)
+		}
+	}
+	for lowerFS, ds := range batches {
+		lowerFS.DecRefDentries(ctx, ds)
+	}
+	for _, vd := range vds {
+		vd.Mount().DecRef(ctx)
+	}
 }
 
 // Preconditions: fs.dentryCache.mu must be locked.
@@ -945,7 +982,14 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		d.upperVD.DecRef(ctx)
 	}
 	for _, lowerVD := range d.lowerVDs {
-		lowerVD.DecRef(ctx)
+		// The lower dentry is reachable again only through a new overlay
+		// dentry, so the lower filesystem need not cache it.
+		lowerVD.Dentry().MarkEvictable()
+		if d.fs.lowerDecRefs != nil {
+			*d.fs.lowerDecRefs = append(*d.fs.lowerDecRefs, lowerVD)
+		} else {
+			lowerVD.DecRef(ctx)
+		}
 	}
 
 	d.watches.HandleDeletion(ctx)
