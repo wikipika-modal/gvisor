@@ -83,6 +83,12 @@ const (
 	// checkpointGCSOptsFileName is a file that may exist in an image-path
 	// directory that specifies options for storing checkpoint files in GCS.
 	checkpointGCSOptsFileName = "gcs_opts.json"
+
+	// checkpointGoferEndpointFileName is a file that may exist in an
+	// image-path directory that specifies the endpoint of an externally
+	// managed checkpoint gofer. It is mutually exclusive with
+	// checkpointGCSOptsFileName.
+	checkpointGoferEndpointFileName = "checkpoint_gofer.json"
 )
 
 func controlSocketName(id string) string {
@@ -636,7 +642,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	var reply sentryapi.RestoreReply
 	if err := conn.Call(sentryapi.ContMgrRestore, &opt, &reply); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := getCheckpointGoferTarget(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
 			}
 		}
@@ -1933,8 +1939,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 	if len(bundles) > 0 {
 		// Verify we are not using GCS/gofer.
-		gcsOptsPath := filepath.Join(imagePath, checkpointGCSOptsFileName)
-		if _, err := os.Stat(gcsOptsPath); err == nil {
+		if hasCheckpointGoferOpts(imagePath) {
 			return fmt.Errorf("split filesystem checkpoint is not supported with GCS/gofer")
 		}
 	}
@@ -1966,7 +1971,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			log.Warningf("[Lifecycle CPU] Cannot restore the application CPU limit after failed checkpoint: %v", err)
 		}
 		if opt.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := getCheckpointGoferTarget(imagePath); target != "" {
 				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2109,9 +2114,15 @@ func discoverFSCheckpointPrefixes(dir string) ([]string, error) {
 	return prefixes, nil
 }
 
-func hasGCSOpts(imagePath string) bool {
-	_, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName))
-	return err == nil
+// hasCheckpointGoferOpts returns true if imagePath contains a file that
+// configures a checkpoint gofer.
+func hasCheckpointGoferOpts(imagePath string) bool {
+	for _, name := range []string{checkpointGCSOptsFileName, checkpointGoferEndpointFileName} {
+		if _, err := os.Stat(filepath.Join(imagePath, name)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // isGCSRestorePath checks whether p refers to a GCS checkpoint directory
@@ -2121,7 +2132,7 @@ func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
 	p = filepath.Clean(p)
 	fi, err := os.Stat(p)
 	if err == nil && fi.IsDir() {
-		return hasGCSOpts(p), false
+		return hasCheckpointGoferOpts(p), false
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return false, false
@@ -2133,7 +2144,7 @@ func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
 	for {
 		fi, err := os.Stat(dir)
 		if err == nil {
-			return fi.IsDir() && hasGCSOpts(dir), true
+			return fi.IsDir() && hasCheckpointGoferOpts(dir), true
 		}
 		parent := filepath.Dir(dir)
 		if !errors.Is(err, fs.ErrNotExist) || parent == dir {
@@ -2280,7 +2291,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	if err := s.call(sentryapi.ContMgrFSSave, &args, nil); err != nil {
 		if args.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := getCheckpointGoferTarget(imagePath); target != "" {
 				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2291,7 +2302,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, bundles []fscheckpoint.Bundle, args *sentryapi.FSSaveArgs) error {
 	// TODO(b/541219576): Support multi-bundle or prefixed filesystem checkpoint with GCS/gofer.
-	if fscheckpoint.HasPrefixes(bundles) && hasGCSOpts(imagePath) {
+	if fscheckpoint.HasPrefixes(bundles) && hasCheckpointGoferOpts(imagePath) {
 		return fmt.Errorf("multi-bundle or prefixed filesystem checkpoint is not supported with GCS/gofer")
 	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-writes")
@@ -2430,6 +2441,16 @@ func openFSCheckpointLocalFiles(dirFD int, imagePath, prefix string, openFlags i
 	return files[:], nil
 }
 
+// getCheckpointGoferTarget returns a human-readable name for the checkpoint
+// gofer target configured under imagePath, for use in error messages, or
+// empty string if not applicable.
+func getCheckpointGoferTarget(imagePath string) string {
+	if opts, err := readCheckpointGoferEndpointOpts(imagePath); err == nil && opts != nil {
+		return opts.target()
+	}
+	return getGCSURIFromImagePath(imagePath)
+}
+
 // getGCSURIFromImagePath returns the GCS URI (e.g. "gs://bucket" or "gs://bucket/prefix")
 // specified in gcs_opts.json under imagePath, or empty string if not applicable.
 func getGCSURIFromImagePath(imagePath string) string {
@@ -2451,11 +2472,76 @@ func getGCSURIFromImagePath(imagePath string) string {
 	return fmt.Sprintf("gs://%s", opts.Bucket)
 }
 
+// checkpointGoferEndpointOpts is the contents of checkpoint_gofer.json.
+type checkpointGoferEndpointOpts struct {
+	// Endpoint is the path of a Unix domain stream socket on which an
+	// externally managed checkpoint gofer accepts connections.
+	Endpoint string `json:"endpoint"`
+
+	// Target is an optional human-readable name for the checkpoint, used
+	// only in error messages.
+	Target string `json:"target"`
+}
+
+func (o *checkpointGoferEndpointOpts) target() string {
+	if o.Target != "" {
+		return o.Target
+	}
+	return o.Endpoint
+}
+
+// readCheckpointGoferEndpointOpts returns the options in checkpoint_gofer.json
+// under imagePath, or nil if the file does not exist.
+func readCheckpointGoferEndpointOpts(imagePath string) (*checkpointGoferEndpointOpts, error) {
+	optsPath := filepath.Join(imagePath, checkpointGoferEndpointFileName)
+	data, err := os.ReadFile(optsPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %q: %w", optsPath, err)
+	}
+	var opts checkpointGoferEndpointOpts
+	if err := json.Unmarshal(data, &opts); err != nil {
+		return nil, fmt.Errorf("parsing %q: %w", optsPath, err)
+	}
+	if opts.Endpoint == "" {
+		return nil, fmt.Errorf("%q: endpoint must be set", optsPath)
+	}
+	if _, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName)); err == nil {
+		return nil, fmt.Errorf("%q and %q are mutually exclusive", optsPath, checkpointGCSOptsFileName)
+	}
+	return &opts, nil
+}
+
+// dialCheckpointGofer returns a socket connected to the externally managed
+// checkpoint gofer described by opts.
+func dialCheckpointGofer(opts *checkpointGoferEndpointOpts) (*os.File, error) {
+	sockFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("creating checkpoint gofer socket for %s: %w", opts.target(), err)
+	}
+	if err := unix.Connect(sockFD, &unix.SockaddrUnix{Name: opts.Endpoint}); err != nil {
+		unix.Close(sockFD)
+		return nil, fmt.Errorf("connecting to checkpoint gofer at %q for %s: %w", opts.Endpoint, opts.target(), err)
+	}
+	return os.NewFile(uintptr(sockFD), "checkpointgofer-socket"), nil
+}
+
 // maybeStartCheckpointGoferAndGetSocket checks if use of a checkpoint gofer is
-// specified by configuration files in imagePath. If so, it starts the
-// checkpoint gofer and returns an os.File representing a socket connected to
-// it. Otherwise, it returns nil.
+// specified by configuration files in imagePath. If checkpoint_gofer.json
+// exists, it connects to the externally managed checkpoint gofer at the
+// specified endpoint. If gcs_opts.json exists, it starts the checkpoint gofer.
+// In either case, it returns an os.File representing a socket connected to the
+// checkpoint gofer. Otherwise, it returns nil.
 func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg cgroup.Cgroup, imagePath string, extraFlags ...string) (*os.File, error) {
+	endpointOpts, err := readCheckpointGoferEndpointOpts(imagePath)
+	if err != nil {
+		return nil, err
+	}
+	if endpointOpts != nil {
+		return dialCheckpointGofer(endpointOpts)
+	}
 	gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
 	gcsOptsFile, err := os.Open(gcsOptsPath)
 	if err != nil {
@@ -2588,7 +2674,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 		bundles = []fscheckpoint.Bundle{{}}
 	}
 	// TODO(b/541219576): Support multi-bundle or prefixed filesystem checkpoint with GCS/gofer.
-	if fscheckpoint.HasPrefixes(bundles) && hasGCSOpts(path) {
+	if fscheckpoint.HasPrefixes(bundles) && hasCheckpointGoferOpts(path) {
 		return fmt.Errorf("multi-bundle or prefixed filesystem checkpoint is not supported with GCS/gofer")
 	}
 
