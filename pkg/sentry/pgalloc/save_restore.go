@@ -1656,6 +1656,12 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
 	}
+	if !op.tempRef {
+		// Awaited reads (tempRef == false) have waiters blocked on them.
+		if p, ok := apfl.ar.(stateio.ReadPrioritizer); ok {
+			p.PrioritizeLastRead()
+		}
+	}
 	if logAwaitedLoads && !op.tempRef {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}

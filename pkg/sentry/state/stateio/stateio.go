@@ -123,6 +123,14 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// ReadPrioritizer is implemented by AsyncReaders that can serve some reads
+// ahead of others.
+type ReadPrioritizer interface {
+	// PrioritizeLastRead marks the read most recently enqueued by AddRead or
+	// AddReadv as one that a caller is blocked on.
+	PrioritizeLastRead()
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be
