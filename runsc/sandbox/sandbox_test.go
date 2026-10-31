@@ -17,6 +17,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -397,6 +398,85 @@ func TestDiscoverFSCheckpointPrefixesFollowsSymlink(t *testing.T) {
 	if want := []string{"fs"}; !slices.Equal(got, want) {
 		t.Errorf("discoverFSCheckpointPrefixes(%q) = %q, want %q", link, got, want)
 	}
+}
+
+func TestReadCheckpointGoferEndpointOpts(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		endpoint   string
+		gcsOpts    bool
+		want       *checkpointGoferEndpointOpts
+		wantErr    bool
+		wantTarget string
+	}{
+		{name: "missing file"},
+		{name: "missing file with gcs opts", gcsOpts: true},
+		{
+			name:       "endpoint and target",
+			endpoint:   `{"endpoint": "/run/gofer.sock", "target": "snapshot-1"}`,
+			want:       &checkpointGoferEndpointOpts{Endpoint: "/run/gofer.sock", Target: "snapshot-1"},
+			wantTarget: "snapshot-1",
+		},
+		{
+			name:       "endpoint only",
+			endpoint:   `{"endpoint": "/run/gofer.sock"}`,
+			want:       &checkpointGoferEndpointOpts{Endpoint: "/run/gofer.sock"},
+			wantTarget: "/run/gofer.sock",
+		},
+		{name: "invalid json", endpoint: "not valid json", wantErr: true},
+		{name: "empty endpoint", endpoint: `{"target": "snapshot-1"}`, wantErr: true},
+		{name: "both files", endpoint: `{"endpoint": "/run/gofer.sock"}`, gcsOpts: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.endpoint != "" {
+				if err := os.WriteFile(filepath.Join(dir, checkpointGoferEndpointFileName), []byte(tc.endpoint), 0644); err != nil {
+					t.Fatalf("os.WriteFile failed: %v", err)
+				}
+			}
+			if tc.gcsOpts {
+				if err := os.WriteFile(filepath.Join(dir, checkpointGCSOptsFileName), []byte(`{"bucket": "b"}`), 0644); err != nil {
+					t.Fatalf("os.WriteFile failed: %v", err)
+				}
+			}
+			got, err := readCheckpointGoferEndpointOpts(dir)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("readCheckpointGoferEndpointOpts() error = %v, wantErr %t", err, tc.wantErr)
+			}
+			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("readCheckpointGoferEndpointOpts() = %+v, want %+v", got, tc.want)
+			}
+			if tc.want != nil {
+				if target := getCheckpointGoferTarget(dir); target != tc.wantTarget {
+					t.Errorf("getCheckpointGoferTarget() = %q, want %q", target, tc.wantTarget)
+				}
+			}
+		})
+	}
+}
+
+func TestDialCheckpointGofer(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "gofer.sock")
+	opts := &checkpointGoferEndpointOpts{Endpoint: sockPath, Target: "snapshot-1"}
+	if _, err := dialCheckpointGofer(opts); err == nil || !strings.Contains(err.Error(), "snapshot-1") {
+		t.Errorf("dialCheckpointGofer() with no listener: error = %v, want error naming the target", err)
+	}
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+	f, err := dialCheckpointGofer(opts)
+	if err != nil {
+		t.Fatalf("dialCheckpointGofer() failed: %v", err)
+	}
+	defer f.Close()
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("Accept failed: %v", err)
+	}
+	conn.Close()
 }
 
 func TestIsGCSRestorePath(t *testing.T) {
