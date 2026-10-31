@@ -199,6 +199,10 @@ type asyncReadWriter struct {
 	// the next call to Wait().
 	numSubmissions uint32
 
+	// lastReadSub is the read submission most recently added since the last
+	// call to Wait, or nil.
+	lastReadSub *readSubmissionHeader
+
 	ioep ioEndpoint
 
 	connectOnce sync.Once
@@ -318,6 +322,7 @@ func (rw *asyncReadWriter) AddRead(id int, off int64, dstFile stateio.Destinatio
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: 1,
 	}
+	rw.lastReadSub = subHdr
 	rw.ioep.scanFileRanges(1)[0] = dstFR
 	rw.numSubmissions++
 }
@@ -335,8 +340,16 @@ func (rw *asyncReadWriter) AddReadv(id int, off int64, total uint64, dstFile sta
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: numRanges,
 	}
+	rw.lastReadSub = subHdr
 	copy(rw.ioep.scanFileRanges(numRanges), dstFRs)
 	rw.numSubmissions++
+}
+
+// PrioritizeLastRead implements stateio.ReadPrioritizer.PrioritizeLastRead.
+func (rw *asyncReadWriter) PrioritizeLastRead() {
+	if rw.lastReadSub != nil {
+		rw.lastReadSub.Flags |= readSubmissionFlagPriority
+	}
 }
 
 // AddWrite implements stateio.AsyncWriter.AddWrite.
@@ -400,6 +413,7 @@ func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]
 		})
 	}
 	rw.numSubmissions = 0
+	rw.lastReadSub = nil
 	if rw.isReader {
 		rw.ioep.resetForReadSubmissions()
 	} else {

@@ -146,8 +146,9 @@ type readSubmissionHeader struct {
 	// ID is the id passed to AsyncReader.StartRead/Readv.
 	ID uint32
 
-	// Padding is unused, but aligns the following field to 8 bytes.
-	Padding uint32
+	// Flags is a bitmask of readSubmissionFlag*. Servers ignore unknown
+	// flags; older clients always send 0.
+	Flags uint32
 
 	// Offset is the offset into the file being read at which the read begins.
 	Offset int64
@@ -160,6 +161,10 @@ type readSubmissionHeader struct {
 	// destination.
 	NumRanges uint32
 }
+
+// readSubmissionFlagPriority marks a read that the client is blocked on, which
+// the server may serve ahead of other reads.
+const readSubmissionFlagPriority = 1 << 0
 
 type writeRequestHeader struct {
 	// MinCompletions is the minimum number of completions that the server
