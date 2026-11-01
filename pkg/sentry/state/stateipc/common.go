@@ -71,6 +71,11 @@ type OpenResponse struct {
 	// source after completing it.
 	RetainsSources bool `json:"retains_sources"`
 
+	// HoldsWrites tells the client that the server may read a positioned
+	// write's source long after receiving it, and accepts
+	// writeSubmissionFlagRepeat.
+	HoldsWrites bool `json:"holds_writes"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload
@@ -210,6 +215,10 @@ const writeSubmissionFlagPriority = 1 << 0
 // followed by a uint64 file offset at which the write begins, rather than
 // appending, and then by at most MaxRanges-1 FileRanges.
 const writeSubmissionFlagOffset = 1 << 1
+
+// writeSubmissionFlagRepeat marks a priority write that repeats part of an
+// incomplete earlier write; see stateio.WriteRepeat.
+const writeSubmissionFlagRepeat = 1 << 2
 
 type ioResponseHeader struct {
 	// If Errno is non-zero, it is a fatal unix.Errno.

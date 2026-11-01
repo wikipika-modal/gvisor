@@ -46,12 +46,15 @@ type apsUnsavedInfo struct {
 	// byte is saved.
 	off uint64
 
-	// priority is true if the segment has been moved to the front of the
-	// write queue.
+	// priority is true if a writer is blocked on the segment.
 	priority bool
 
 	// inflight is true if a write of the segment has been enqueued.
 	inflight bool
+
+	// prioritySent is true if a priority write of the segment has been
+	// enqueued.
+	prioritySent bool
 }
 
 type apsUnsavedSetFunctions struct{}
@@ -68,7 +71,7 @@ func (apsUnsavedSetFunctions) ClearValue(*apsUnsavedInfo) {
 }
 
 func (apsUnsavedSetFunctions) Merge(fr1 memmap.FileRange, us1 apsUnsavedInfo, fr2 memmap.FileRange, us2 apsUnsavedInfo) (apsUnsavedInfo, bool) {
-	if us1.off+fr1.Length() != us2.off || us1.priority != us2.priority || us1.inflight != us2.inflight {
+	if us1.off+fr1.Length() != us2.off || us1.priority != us2.priority || us1.inflight != us2.inflight || us1.prioritySent != us2.prioritySent {
 		return apsUnsavedInfo{}, false
 	}
 	return us1, true
@@ -100,6 +103,7 @@ func (apfs *AsyncPagesFileSave) EnableEarlyResume() error {
 	}
 	apfs.pw = pw
 	apfs.earlyResume = true
+	apfs.repeats = pw.HoldsWrites()
 	apfs.prioReserve = min(4, apfs.qavail/4)
 	apfs.savedCh = make(chan struct{})
 	for i := range apfs.ops {
@@ -127,15 +131,15 @@ func (amfs *asyncMemoryFileSave) addUnsavedLocked(fr memmap.FileRange, off uint6
 	amfs.unsaved.InsertRange(fr, apsUnsavedInfo{off: off})
 }
 
-// enqueueEarlyResumeLocked enqueues priority writes, then writes in pages file
-// order.
+// enqueueEarlyResumeLocked enqueues priority writes, repeating writes that the
+// pages file may hold, then writes in pages file order.
 //
 // Preconditions: apfs.mu must be locked.
 func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
 	for apfs.canEnqueue() && !apfs.priority.Empty() {
 		pr := apfs.priority.PeekFrontPtr()
 		useg := pr.amfs.unsaved.LowerBoundSegment(pr.Start)
-		for useg.Ok() && useg.Start() < pr.End && (!useg.ValuePtr().priority || useg.ValuePtr().inflight) {
+		for useg.Ok() && useg.Start() < pr.End && (!useg.ValuePtr().priority || useg.ValuePtr().prioritySent) {
 			useg = useg.NextSegment()
 		}
 		if !useg.Ok() || useg.Start() >= pr.End {
@@ -148,7 +152,11 @@ func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
 				return
 			}
 		}
-		n := apfs.enqueueUnsaved(pr.amfs, useg, useg.Range().Intersect(pr.FileRange), true)
+		flags := stateio.WritePriority
+		if useg.ValuePtr().inflight {
+			flags |= stateio.WriteRepeat
+		}
+		n := apfs.enqueueUnsaved(pr.amfs, useg, useg.Range().Intersect(pr.FileRange), flags)
 		apfs.enqueueCurOp()
 		pr.Start = max(pr.Start, useg.Start()) + n
 	}
@@ -169,7 +177,7 @@ func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
 			continue
 		}
 		fr := useg.Range()
-		n := apfs.enqueueUnsaved(amfs, useg, fr, false)
+		n := apfs.enqueueUnsaved(amfs, useg, fr, 0)
 		if n == 0 {
 			apfs.enqueueCurOp()
 			continue
@@ -178,18 +186,18 @@ func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
 	}
 }
 
-// enqueueUnsaved adds as much of fr as possible to apfs.curOp, marks it
-// inflight, and returns the number of bytes added. If apfs.curOp can't be
-// extended, enqueueUnsaved returns 0 without changing it.
+// enqueueUnsaved adds as much of fr as possible to apfs.curOp, a write with the
+// given flags, marks it inflight, and returns the number of bytes added. If
+// apfs.curOp can't be extended, enqueueUnsaved returns 0 without changing it.
 //
 // Preconditions:
 // - apfs.mu must be locked.
 // - apfs.canEnqueue() == true.
 // - useg.Range().IsSupersetOf(fr).
 // - fr.Length() > 0.
-func (apfs *AsyncPagesFileSave) enqueueUnsaved(amfs *asyncMemoryFileSave, useg apsUnsavedIterator, fr memmap.FileRange, priority bool) uint64 {
+func (apfs *AsyncPagesFileSave) enqueueUnsaved(amfs *asyncMemoryFileSave, useg apsUnsavedIterator, fr memmap.FileRange, flags stateio.WriteFlags) uint64 {
 	off := useg.ValuePtr().off + (fr.Start - useg.Start())
-	if op := apfs.curOp; op != nil && op.total != 0 && (op.amfs != amfs || op.priority != priority || op.off+op.total != off) {
+	if op := apfs.curOp; op != nil && op.total != 0 && (op.amfs != amfs || op.flags != flags || op.off+op.total != off) {
 		return 0
 	}
 	if apfs.curOp == nil {
@@ -208,7 +216,7 @@ func (apfs *AsyncPagesFileSave) enqueueUnsaved(amfs *asyncMemoryFileSave, useg a
 	op := apfs.curOp
 	if op.total == 0 {
 		op.off = off
-		op.priority = priority
+		op.flags = flags
 	}
 	n := apfs.combine(apsRange{amfs: amfs, FileRange: fr})
 	if n == 0 {
@@ -216,16 +224,20 @@ func (apfs *AsyncPagesFileSave) enqueueUnsaved(amfs *asyncMemoryFileSave, useg a
 	}
 	useg = amfs.unsaved.Isolate(useg, memmap.FileRange{fr.Start, fr.Start + n})
 	useg.ValuePtr().inflight = true
+	useg.ValuePtr().prioritySent = flags&stateio.WritePriority != 0
 	return n
 }
 
 // enqueueEarlyResumeOp enqueues apfs.curOp.
 func (apfs *AsyncPagesFileSave) enqueueEarlyResumeOp(op *apsOp) {
-	if op.priority {
+	if op.flags&stateio.WritePriority != 0 {
 		apfs.prioOps++
 		apfs.prioBytes += op.total
 	}
-	apfs.pw.AddWritevAt(int(apfs.curOpID), op.off, op.priority, op.total, op.amfs.sf, op.frs, op.iovecs)
+	if op.flags&stateio.WriteRepeat != 0 {
+		apfs.repeatOps++
+	}
+	apfs.pw.AddWritevAt(int(apfs.curOpID), op.off, op.flags, op.total, op.amfs.sf, op.frs, op.iovecs)
 }
 
 // savedLocked records that op has been written.
@@ -255,8 +267,8 @@ func (apfs *AsyncPagesFileSave) endEarlyResume() {
 		amfs.f.earlyResumeSave.CompareAndSwap(amfs, nil)
 	}
 	apfs.wakeSaveWaitersLocked()
-	log.Infof("Early-resume page saving: %d priority writes (%d bytes); %d waits for %s",
-		apfs.prioOps, apfs.prioBytes, apfs.erWaits, apfs.erWaitDur)
+	log.Infof("Early-resume page saving: %d priority writes (%d bytes, %d repeats); %d waits for %s",
+		apfs.prioOps, apfs.prioBytes, apfs.repeatOps, apfs.erWaits, apfs.erWaitDur)
 }
 
 // IsEarlyResumeSaving returns true if pages of f may still be unsaved after an
@@ -330,7 +342,7 @@ func (amfs *asyncMemoryFileSave) awaitSaved(fr memmap.FileRange) {
 		requested := false
 		amfs.unsaved.MutateRange(pfr, func(useg apsUnsavedIterator) bool {
 			us := useg.ValuePtr()
-			if !us.priority && !us.inflight {
+			if !us.priority && (!us.inflight || apfs.repeats) {
 				us.priority = true
 				requested = true
 			}

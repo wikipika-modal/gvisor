@@ -158,6 +158,7 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		maxParallel: resp.MaxParallel,
 		lazy:        resp.Lazy,
 		retains:     resp.RetainsSources,
+		holds:       resp.HoldsWrites,
 		handle:      resp.Handle,
 		isReader:    mode == OpenModeRead,
 	}
@@ -192,6 +193,7 @@ type asyncReadWriter struct {
 	maxParallel uint32
 	lazy        bool
 	retains     bool
+	holds       bool
 	handle      uint32
 	isReader    bool
 
@@ -358,6 +360,11 @@ func (rw *asyncReadWriter) Lazy() bool {
 	return rw.lazy
 }
 
+// HoldsWrites implements stateio.PositionedWriter.HoldsWrites.
+func (rw *asyncReadWriter) HoldsWrites() bool {
+	return rw.holds
+}
+
 // RetainsSources implements stateio.SourceRetainer.RetainsSources.
 func (rw *asyncReadWriter) RetainsSources() bool {
 	return rw.retains
@@ -402,13 +409,16 @@ func (rw *asyncReadWriter) AddWritev(id int, total uint64, srcFile stateio.Sourc
 }
 
 // AddWritevAt implements stateio.PositionedWriter.AddWritevAt.
-func (rw *asyncReadWriter) AddWritevAt(id int, off uint64, priority bool, total uint64, srcFile stateio.SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec) {
+func (rw *asyncReadWriter) AddWritevAt(id int, off uint64, wflags stateio.WriteFlags, total uint64, srcFile stateio.SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec) {
 	if rw.ensureConnected() != nil {
 		return
 	}
 	flags := uint32(writeSubmissionFlagOffset)
-	if priority {
+	if wflags&stateio.WritePriority != 0 {
 		flags |= writeSubmissionFlagPriority
+	}
+	if wflags&stateio.WriteRepeat != 0 {
+		flags |= writeSubmissionFlagRepeat
 	}
 	subHdr := rw.ioep.scanWriteSubmissionHeader()
 	numRanges := uint32(len(srcFRs))

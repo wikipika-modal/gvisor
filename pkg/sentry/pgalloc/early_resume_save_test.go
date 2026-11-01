@@ -31,29 +31,39 @@ import (
 )
 
 // heldWriter completes priority writes at once, and other writes only after
-// release(). It copies each write's source when completing it, as an external
-// server would.
+// release() or, if holds is true, when a repeat of them arrives. It copies each
+// write's source when completing it, as an external server would.
 type heldWriter struct {
 	stateio.NoRegisterClientFD
 
 	mu        sync.Mutex
 	cond      sync.Cond
+	holds     bool
 	released  bool
 	pending   []heldWrite
 	file      []byte
 	priority  int
+	repeats   int
 	finalized bool
 }
 
 type heldWrite struct {
-	id       int
-	off      uint64
-	priority bool
-	srcs     []unix.Iovec
+	id    int
+	off   uint64
+	flags stateio.WriteFlags
+	srcs  []unix.Iovec
 }
 
-func newHeldWriter() *heldWriter {
-	w := &heldWriter{}
+func (hw *heldWrite) end() uint64 {
+	end := hw.off
+	for _, iov := range hw.srcs {
+		end += iov.Len
+	}
+	return end
+}
+
+func newHeldWriter(holds bool) *heldWriter {
+	w := &heldWriter{holds: holds}
 	w.cond.L = &w.mu
 	return w
 }
@@ -65,11 +75,24 @@ func (w *heldWriter) release() {
 	w.cond.Broadcast()
 }
 
+// holding returns true if a write at off is held.
+func (w *heldWriter) holding(off uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, hw := range w.pending {
+		if hw.off == off {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *heldWriter) Close() error          { return nil }
 func (w *heldWriter) MaxWriteBytes() uint64 { return uint64(hostarch.PageSize) }
 func (w *heldWriter) MaxRanges() int        { return 4 }
 func (w *heldWriter) MaxParallel() int      { return 8 }
 func (w *heldWriter) Reserve(uint64)        {}
+func (w *heldWriter) HoldsWrites() bool     { return w.holds }
 
 func (w *heldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")
@@ -79,14 +102,33 @@ func (w *heldWriter) AddWritev(int, uint64, stateio.SourceFile, []memmap.FileRan
 	panic("appending write during early-resume save")
 }
 
-func (w *heldWriter) AddWritevAt(id int, off uint64, priority bool, total uint64, _ stateio.SourceFile, _ []memmap.FileRange, srcs []unix.Iovec) {
+func (w *heldWriter) AddWritevAt(id int, off uint64, flags stateio.WriteFlags, total uint64, _ stateio.SourceFile, _ []memmap.FileRange, srcs []unix.Iovec) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if priority {
+	if flags&stateio.WriteRepeat != 0 && !w.holds {
+		panic("repeated write to a pages file that doesn't hold writes")
+	}
+	if flags&stateio.WritePriority != 0 {
 		w.priority++
 	}
-	w.pending = append(w.pending, heldWrite{id, off, priority, append([]unix.Iovec(nil), srcs...)})
+	if flags&stateio.WriteRepeat != 0 {
+		w.repeats++
+	}
+	w.pending = append(w.pending, heldWrite{id, off, flags, append([]unix.Iovec(nil), srcs...)})
 	w.cond.Broadcast()
+}
+
+// repeated returns true if a pending repeat overlaps hw.
+//
+// Preconditions: w.mu must be locked.
+func (w *heldWriter) repeated(hw *heldWrite) bool {
+	for i := range w.pending {
+		r := &w.pending[i]
+		if r.flags&stateio.WriteRepeat != 0 && r.off < hw.end() && hw.off < r.end() {
+			return true
+		}
+	}
+	return false
 }
 
 // Wait returns early while it holds writes, as PositionedWriter allows.
@@ -95,9 +137,10 @@ func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 	defer w.mu.Unlock()
 	for {
 		var rest []heldWrite
-		for _, hw := range w.pending {
-			if !hw.priority && !w.released {
-				rest = append(rest, hw)
+		for i := range w.pending {
+			hw := &w.pending[i]
+			if hw.flags&stateio.WritePriority == 0 && !w.released && !w.repeated(hw) {
+				rest = append(rest, *hw)
 				continue
 			}
 			off := hw.off
@@ -133,17 +176,18 @@ func (w *heldWriter) Finalize() error {
 	return nil
 }
 
-func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
-	f := newSaveTestMemoryFile(t, false)
-	const pages = 16
+// startEarlyResumeSave fills 16 pages of f and starts saving them to w. It
+// returns the pages, their contents, and a channel that receives the result of
+// saving.
+func startEarlyResumeSave(t *testing.T, f *MemoryFile, w *heldWriter) (memmap.FileRange, []byte, chan error) {
+	t.Helper()
 	fr := allocateSaveTestPages(t, f)
-	for i := 0; i < pages; i++ {
+	for i := 0; i < 16; i++ {
 		pwritePage(t, f, fr, i, byte(i+1))
 	}
 	want := make([]byte, fr.Length())
 	f.forEachMappingSlice(fr, func(bs []byte) { copy(want, bs) })
 
-	w := newHeldWriter()
 	done := make(chan error, 1)
 	apfs, err := StartAsyncPagesFileSave(w, func(err error) { done <- err })
 	if err != nil {
@@ -160,27 +204,13 @@ func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
 	if !f.IsEarlyResumeSaving() {
 		t.Fatalf("IsEarlyResumeSaving: got false after SaveTo")
 	}
+	return fr, want, done
+}
 
-	page := func(i int) memmap.FileRange {
-		start := fr.Start + uint64(i)*uint64(hostarch.PageSize)
-		return memmap.FileRange{start, start + uint64(hostarch.PageSize)}
-	}
-	if _, err := f.MapInternal(page(3), hostarch.Read); err != nil {
-		t.Fatalf("MapInternal(Read): %v", err)
-	}
-	if !f.HasUnsaved(page(12)) {
-		t.Fatalf("page 12 saved while writes are held")
-	}
-	ims, err := f.MapInternal(page(12), hostarch.Write)
-	if err != nil {
-		t.Fatalf("MapInternal(Write): %v", err)
-	}
-	if f.HasUnsaved(page(12)) {
-		t.Fatalf("page 12 unsaved after MapInternal(Write)")
-	}
-	ims.Head().ToSlice()[17] = 0xff
-	f.Decommit(page(13))
-
+// finishEarlyResumeSave releases w's writes, waits for saving to finish, and
+// checks that w holds want.
+func finishEarlyResumeSave(t *testing.T, f *MemoryFile, w *heldWriter, want []byte, done chan error) {
+	t.Helper()
 	w.release()
 	select {
 	case err := <-done:
@@ -196,16 +226,65 @@ func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
 	if !w.finalized {
 		t.Errorf("pages file not finalized")
 	}
-	if w.priority == 0 {
-		t.Errorf("no priority writes")
-	}
 	if !bytes.Equal(w.file, want) {
 		t.Errorf("pages file differs from memory at save time")
 	}
 }
 
+func testPage(fr memmap.FileRange, i int) memmap.FileRange {
+	start := fr.Start + uint64(i)*uint64(hostarch.PageSize)
+	return memmap.FileRange{start, start + uint64(hostarch.PageSize)}
+}
+
+func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(false)
+	fr, want, done := startEarlyResumeSave(t, f, w)
+
+	if _, err := f.MapInternal(testPage(fr, 3), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal(Read): %v", err)
+	}
+	if !f.HasUnsaved(testPage(fr, 12)) {
+		t.Fatalf("page 12 saved while writes are held")
+	}
+	ims, err := f.MapInternal(testPage(fr, 12), hostarch.Write)
+	if err != nil {
+		t.Fatalf("MapInternal(Write): %v", err)
+	}
+	if f.HasUnsaved(testPage(fr, 12)) {
+		t.Fatalf("page 12 unsaved after MapInternal(Write)")
+	}
+	ims.Head().ToSlice()[17] = 0xff
+	f.Decommit(testPage(fr, 13))
+
+	finishEarlyResumeSave(t, f, w, want, done)
+	if w.priority == 0 {
+		t.Errorf("no priority writes")
+	}
+}
+
+func TestEarlyResumeSaveRepeatsHeldWrites(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(true)
+	fr, want, done := startEarlyResumeSave(t, f, w)
+
+	for !w.holding(3 * uint64(hostarch.PageSize)) {
+		time.Sleep(time.Millisecond)
+	}
+	ims, err := f.MapInternal(testPage(fr, 3), hostarch.Write)
+	if err != nil {
+		t.Fatalf("MapInternal(Write): %v", err)
+	}
+	ims.Head().ToSlice()[17] = 0xff
+	if w.repeats == 0 {
+		t.Errorf("no repeated writes")
+	}
+
+	finishEarlyResumeSave(t, f, w, want, done)
+}
+
 func TestEarlyResumeRefusedWithoutPositionedWrites(t *testing.T) {
-	apfs, err := StartAsyncPagesFileSave(struct{ stateio.AsyncWriter }{newHeldWriter()}, nil)
+	apfs, err := StartAsyncPagesFileSave(struct{ stateio.AsyncWriter }{newHeldWriter(false)}, nil)
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileSave: %v", err)
 	}

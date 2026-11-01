@@ -62,6 +62,7 @@ func (w *heldWriter) MaxRanges() int        { return 2 }
 func (w *heldWriter) MaxParallel() int      { return 8 }
 func (w *heldWriter) Reserve(uint64)        {}
 func (w *heldWriter) Finalize() error       { return nil }
+func (w *heldWriter) HoldsWrites() bool     { return false }
 
 func (w *heldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")
@@ -71,10 +72,10 @@ func (w *heldWriter) AddWritev(int, uint64, stateio.SourceFile, []memmap.FileRan
 	panic("appending write during early-resume save")
 }
 
-func (w *heldWriter) AddWritevAt(id int, _ uint64, priority bool, _ uint64, _ stateio.SourceFile, frs []memmap.FileRange, srcs []unix.Iovec) {
+func (w *heldWriter) AddWritevAt(id int, _ uint64, flags stateio.WriteFlags, _ uint64, _ stateio.SourceFile, frs []memmap.FileRange, srcs []unix.Iovec) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.pending = append(w.pending, heldWrite{id, priority, time.Now(), append([]memmap.FileRange(nil), frs...), append([]unix.Iovec(nil), srcs...)})
+	w.pending = append(w.pending, heldWrite{id, flags&stateio.WritePriority != 0, time.Now(), append([]memmap.FileRange(nil), frs...), append([]unix.Iovec(nil), srcs...)})
 }
 
 // Wait returns early while it holds writes, as stateio.PositionedWriter
