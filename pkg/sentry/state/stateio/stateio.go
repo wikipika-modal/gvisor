@@ -146,6 +146,10 @@ type SourceRetainer interface {
 
 // PositionedWriter is implemented by AsyncWriters that can write at explicit
 // offsets, so that writes can complete out of order.
+//
+// Once AddWritevAt has been called, AsyncWriter.Wait may return fewer than
+// minCompletions completions, so that a caller isn't kept from adding a write
+// that it's blocked on while the AsyncWriter holds other writes.
 type PositionedWriter interface {
 	// AddWritevAt is like AsyncWriter.AddWritev, but writes at offset off
 	// rather than appending. If priority is true, a caller is blocked on the

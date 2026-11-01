@@ -89,6 +89,7 @@ func (w *heldWriter) AddWritevAt(id int, off uint64, priority bool, total uint64
 	w.cond.Broadcast()
 }
 
+// Wait returns early while it holds writes, as PositionedWriter allows.
 func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -113,6 +114,12 @@ func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 		}
 		w.pending = rest
 		if minCompletions <= 0 {
+			return cs, nil
+		}
+		if len(rest) != 0 {
+			w.mu.Unlock()
+			time.Sleep(time.Millisecond)
+			w.mu.Lock()
 			return cs, nil
 		}
 		w.cond.Wait()

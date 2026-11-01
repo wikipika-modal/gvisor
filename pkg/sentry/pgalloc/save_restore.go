@@ -1024,8 +1024,9 @@ func (apfs *AsyncPagesFileSave) main() {
 
 	prevFull := false
 	for {
-		// Enqueue as many writes as possible.
-		if !apfs.canEnqueue() {
+		// Enqueue as many writes as possible. A PositionedWriter's Wait may
+		// return without completions.
+		if !apfs.canEnqueue() && !apfs.earlyResume {
 			panic("main loop invariant failed")
 		}
 		apfs.mu.Lock()
