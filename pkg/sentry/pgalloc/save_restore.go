@@ -190,9 +190,23 @@ type SaveOpts struct {
 	Prescan *ZeroPagesPrescan
 }
 
-// lazyMinBytes is the smallest contiguous unloaded range that is loaded only
-// when awaited, when loading lazily.
-const lazyMinBytes = 32 << 20
+const (
+	// lazyMinBytes is the smallest contiguous unloaded range that is loaded
+	// only when awaited, when loading lazily. Awaited ranges smaller than this
+	// also load the rest of their lazyMinBytes-aligned window in the
+	// background.
+	lazyMinBytes = 32 << 20
+
+	// lazyReadaheadMinBytes and lazyReadaheadMaxBytes bound how far ahead of a
+	// sequence of adjacent awaited ranges pages are loaded in the background,
+	// when loading lazily. The window doubles each time it is reached.
+	lazyReadaheadMinBytes = 64 << 20
+	lazyReadaheadMaxBytes = 128 << 20
+
+	// lazyStreams is the number of sequences of adjacent awaited ranges that
+	// are tracked for readahead at once.
+	lazyStreams = 16
+)
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
@@ -1427,6 +1441,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			doneCallback: opts.DoneCallback,
 			timeline:     mfTimeline.Transfer(),
 		}
+		amfl.readaheadTrigger.Store(math.MaxUint64)
 		amfl.pf.amflsMu.Lock()
 		if err := amfl.pf.err(); err != nil {
 			amfl.pf.amflsMu.Unlock()
@@ -1673,6 +1688,34 @@ type asyncMemoryFileLoad struct {
 	// minUnstarted is the lowest offset that may map to a segment in unloaded
 	// for which aplUnloadedInfo.started == false.
 	minUnstarted uint64
+
+	// The following fields are only used when loading lazily, and are
+	// protected by pf.mu.
+
+	// readahead holds ranges to load ahead of all unawaited loads.
+	readahead ringdeque.Deque[memmap.FileRange]
+
+	// streams are the readahead windows last loaded for sequences of adjacent
+	// awaited ranges.
+	streams [lazyStreams]aplStream
+
+	// recent holds the most recently awaited ranges, in a ring.
+	recent     [lazyStreams]memmap.FileRange
+	recentNext int
+	tick       uint64
+
+	// readaheadTrigger is the lowest start of a forward stream's window, so
+	// that awaiting a loaded range in it still advances the stream.
+	readaheadTrigger atomicbitops.Uint64
+}
+
+// aplStream is a sequence of adjacent awaited ranges. When a range in window
+// is awaited, the next window, twice as large up to lazyReadaheadMaxBytes, is
+// loaded ahead of it, after window.End or (if reverse) before window.Start.
+type aplStream struct {
+	window  memmap.FileRange
+	reverse bool
+	used    uint64
 }
 
 // aplUnloadedInfo is the value type of asyncMemoryFileLoad.unloaded.
@@ -1838,7 +1881,7 @@ func (f *MemoryFile) AwaitLoadAll() error {
 // fr.
 func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	// Lockless fast path:
-	if fr.End <= amfl.minUnloaded.Load() {
+	if fr.End <= amfl.minUnloaded.Load() && fr.End <= amfl.readaheadTrigger.Load() {
 		return nil
 	}
 
@@ -1889,8 +1932,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.numWaiters++
 		apfl.totalWaiters++
 	}
+	wake := pending
+	if apfl.lazy && amfl.lfDone && amfl.readaheadLocked(fr, pending) {
+		wake = true
+	}
 	apfl.mu.Unlock()
-	if pending && apfl.lazy {
+	if wake && apfl.lazy {
 		apfl.lfStatus.Notify(aplLazyWake)
 	}
 	if pending {
@@ -1921,6 +1968,84 @@ func (apfl *AsyncPagesFileLoad) reapLoaded() bool {
 		amfl = next
 	}
 	return !apfl.amfls.Empty()
+}
+
+// readaheadLocked queues pages to load in the background after fr is awaited,
+// and returns true if it queued any:
+//   - If fr is in a stream's window, the stream's next window.
+//   - Otherwise, if fr was not loaded yet (missed):
+//   - If fr is adjacent to a recently awaited range, the first window of a new
+//     stream continuing in that direction.
+//   - If fr is smaller than lazyMinBytes, the rest of its lazyMinBytes-aligned
+//     window, as a fault on it would load.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) readaheadLocked(fr memmap.FileRange, missed bool) bool {
+	amfl.tick++
+	queued := false
+	defer func() {
+		amfl.recent[amfl.recentNext] = fr
+		amfl.recentNext = (amfl.recentNext + 1) % len(amfl.recent)
+		trigger := uint64(math.MaxUint64)
+		for i := range amfl.streams {
+			if s := &amfl.streams[i]; s.window.Length() != 0 && !s.reverse {
+				trigger = min(trigger, s.window.Start)
+			}
+		}
+		amfl.readaheadTrigger.Store(trigger)
+	}()
+	for i := range amfl.streams {
+		s := &amfl.streams[i]
+		if !s.window.Overlaps(fr) {
+			continue
+		}
+		size := min(2*s.window.Length(), lazyReadaheadMaxBytes)
+		if s.reverse {
+			s.window = memmap.FileRange{s.window.Start - min(size, s.window.Start), s.window.Start}
+		} else {
+			s.window = memmap.FileRange{s.window.End, s.window.End + size}
+		}
+		s.used = amfl.tick
+		if s.window.Length() != 0 {
+			amfl.readahead.PushBack(s.window)
+		}
+		return true
+	}
+	if !missed {
+		return false
+	}
+	if fr.Length() < lazyMinBytes {
+		amfl.readahead.PushBack(memmap.FileRange{
+			fr.Start &^ (lazyMinBytes - 1),
+			(fr.End + lazyMinBytes - 1) &^ (lazyMinBytes - 1),
+		})
+		queued = true
+	}
+	for _, r := range amfl.recent {
+		var s aplStream
+		switch {
+		case r.Length() == 0:
+			continue
+		case r.End == fr.Start:
+			s.window = memmap.FileRange{fr.End, fr.End + lazyReadaheadMinBytes}
+		case r.Start == fr.End && fr.Start != 0:
+			s.window = memmap.FileRange{fr.Start - min(lazyReadaheadMinBytes, fr.Start), fr.Start}
+			s.reverse = true
+		default:
+			continue
+		}
+		s.used = amfl.tick
+		lru := &amfl.streams[0]
+		for i := range amfl.streams {
+			if amfl.streams[i].used < lru.used {
+				lru = &amfl.streams[i]
+			}
+		}
+		*lru = s
+		amfl.readahead.PushBack(s.window)
+		return true
+	}
+	return queued
 }
 
 // markLazyLocked marks unloaded ranges of at least lazyMinBytes as loaded
@@ -2293,6 +2418,11 @@ func (apfl *AsyncPagesFileLoad) main() {
 				}
 				amfl.f.mu.Lock()
 				apfl.mu.Lock()
+				if !apfl.enqueueReadaheadLocked(amfl) {
+					apfl.mu.Unlock()
+					amfl.f.mu.Unlock()
+					break amflsLoop
+				}
 				ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
 				for ulseg.Ok() {
 					ul := ulseg.ValuePtr()
@@ -2454,6 +2584,39 @@ func (apfl *AsyncPagesFileLoad) main() {
 		wakeups = wakeups[:0]
 		dropDelayedDecRefs()
 	}
+}
+
+// enqueueReadaheadLocked enqueues unawaited reads of amfl's unstarted pages in
+// amfl.readahead, and returns false if it ran out of queue space first.
+//
+// Preconditions: amfl.f.mu and apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) enqueueReadaheadLocked(amfl *asyncMemoryFileLoad) bool {
+	for !amfl.readahead.Empty() {
+		fr := amfl.readahead.PopFront()
+		for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; {
+			if ulseg.ValuePtr().started {
+				ulseg = ulseg.NextSegment()
+				continue
+			}
+			if !apfl.canEnqueue() {
+				amfl.readahead.PushFront(memmap.FileRange{max(fr.Start, ulseg.Start()), fr.End})
+				return false
+			}
+			ulseg = amfl.unloaded.Isolate(ulseg, fr)
+			ulFR := ulseg.Range()
+			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */)
+			if n == 0 {
+				amfl.readahead.PushFront(memmap.FileRange{ulFR.Start, fr.End})
+				return false
+			}
+			ulFR.End = ulFR.Start + n
+			ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
+			ulseg.ValuePtr().started = true
+			amfl.f.incRefLocked(ulFR)
+			ulseg = ulseg.NextSegment()
+		}
+	}
+	return apfl.canEnqueue()
 }
 
 // Preconditions:
