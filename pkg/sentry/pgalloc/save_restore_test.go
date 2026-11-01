@@ -399,6 +399,23 @@ func TestLazyLoadReadsWindowAroundSmallAwaits(t *testing.T) {
 	checkLoaded(t, restored, fr, want)
 }
 
+func TestDecommitDuringLazyLoad(t *testing.T) {
+	f, fr, want := newLazyWindowsMemoryFile(t, 1)
+	metadata, pages := saveToPagesFile(t, f, false)
+	restored, _, _ := loadPagesFile(t, metadata, pages, fr, true)
+	page := testPage(fr, 5)
+	restored.Decommit(page)
+	bs, err := restored.MapInternal(page, hostarch.Read)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if got := bs.Head().ToSlice()[17]; got != 0 {
+		t.Errorf("decommitted page: got %d, want 0", got)
+	}
+	clear(want[5*hostarch.PageSize : 6*hostarch.PageSize])
+	checkLoaded(t, restored, fr, want)
+}
+
 func TestSaveAfterLazyLoad(t *testing.T) {
 	for _, exclude := range []bool{false, true} {
 		f, fr, want := newLazyTestMemoryFile(t)
