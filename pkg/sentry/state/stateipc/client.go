@@ -157,6 +157,7 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		maxRanges:   resp.MaxRanges,
 		maxParallel: resp.MaxParallel,
 		lazy:        resp.Lazy,
+		prefetch:    resp.Prefetch,
 		retains:     resp.RetainsSources,
 		holds:       resp.HoldsWrites,
 		handle:      resp.Handle,
@@ -192,6 +193,7 @@ type asyncReadWriter struct {
 	maxRanges   uint32
 	maxParallel uint32
 	lazy        bool
+	prefetch    []memmap.FileRange
 	retains     bool
 	holds       bool
 	handle      uint32
@@ -358,6 +360,11 @@ func (rw *asyncReadWriter) AddReadv(id int, off int64, total uint64, dstFile sta
 // Lazy implements stateio.LazyReader.Lazy.
 func (rw *asyncReadWriter) Lazy() bool {
 	return rw.lazy
+}
+
+// Prefetch implements stateio.PrefetchReader.Prefetch.
+func (rw *asyncReadWriter) Prefetch() []memmap.FileRange {
+	return rw.prefetch
 }
 
 // HoldsWrites implements stateio.PositionedWriter.HoldsWrites.

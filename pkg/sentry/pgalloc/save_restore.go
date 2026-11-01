@@ -1586,6 +1586,11 @@ type AsyncPagesFileLoad struct {
 	// (see asyncMemoryFileLoad.markLazyLocked). lazy is immutable.
 	lazy bool
 
+	// prefetch is the ranges of the pages file that ar suggests loading
+	// eagerly when loading lazily, sorted and disjoint. prefetch is
+	// immutable.
+	prefetch []memmap.FileRange
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -1747,6 +1752,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
 		lazy:             isLazy(ar),
+		prefetch:         prefetchRanges(ar),
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1770,6 +1776,31 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 func isLazy(ar stateio.AsyncReader) bool {
 	lr, ok := ar.(stateio.LazyReader)
 	return ok && lr.Lazy()
+}
+
+// prefetchRanges returns the non-empty ranges that a lazy ar suggests
+// prefetching, sorted and merged.
+func prefetchRanges(ar stateio.AsyncReader) []memmap.FileRange {
+	pr, ok := ar.(stateio.PrefetchReader)
+	if !ok || !isLazy(ar) {
+		return nil
+	}
+	var frs []memmap.FileRange
+	for _, fr := range pr.Prefetch() {
+		if fr.WellFormed() && fr.Length() != 0 {
+			frs = append(frs, fr)
+		}
+	}
+	slices.SortFunc(frs, func(a, b memmap.FileRange) int { return cmp.Compare(a.Start, b.Start) })
+	var merged []memmap.FileRange
+	for _, fr := range frs {
+		if n := len(merged); n != 0 && fr.Start <= merged[n-1].End {
+			merged[n-1].End = max(merged[n-1].End, fr.End)
+		} else {
+			merged = append(merged, fr)
+		}
+	}
+	return merged
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -1886,16 +1917,38 @@ func (apfl *AsyncPagesFileLoad) reapLoaded() bool {
 }
 
 // markLazyLocked marks unloaded ranges of at least lazyMinBytes as loaded
-// only when awaited. Smaller ones are usually small, scattered allocations
-// that a fault would load whole anyway, and loading each on demand would cost
-// one synchronous read per fault, so they are still loaded in the background.
+// only when awaited, except for pages in the pages file ranges that
+// amfl.pf.prefetch suggests. Smaller ones are usually small, scattered
+// allocations that a fault would load whole anyway, and loading each on demand
+// would cost one synchronous read per fault, so they are still loaded in the
+// background.
 //
 // Preconditions: amfl.pf.mu must be locked.
 func (amfl *asyncMemoryFileLoad) markLazyLocked() {
+	prefetch := amfl.pf.prefetch
 	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
-		if ulseg.Range().Length() >= lazyMinBytes {
-			ulseg.ValuePtr().lazy = true
+		fr := ulseg.Range()
+		if fr.Length() < lazyMinBytes {
+			continue
 		}
+		ulseg.ValuePtr().lazy = true
+		off := ulseg.ValuePtr().off
+		src := memmap.FileRange{off, off + fr.Length()}
+		i, _ := slices.BinarySearchFunc(prefetch, src.Start, func(p memmap.FileRange, start uint64) int {
+			return cmp.Compare(p.End, start+1)
+		})
+		for ; i < len(prefetch) && prefetch[i].Start < src.End; i++ {
+			o := prefetch[i].Intersect(src)
+			pfr := memmap.FileRange{
+				hostarch.PageRoundDown(fr.Start + (o.Start - off)),
+				hostarch.MustPageRoundUp(fr.Start + (o.End - off)),
+			}
+			amfl.unloaded.MutateRange(pfr, func(pseg aplUnloadedIterator) bool {
+				pseg.ValuePtr().lazy = false
+				return true
+			})
+		}
+		ulseg = amfl.unloaded.FindSegment(fr.End - 1)
 	}
 }
 
