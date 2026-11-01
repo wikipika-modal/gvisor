@@ -210,13 +210,11 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, entries uint32, par
 		return nil, err
 	}
 
-	iouringfd.mf.IncCachedWriters()
 	return &iouringfd.vfsfd, nil
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *FileDescription) Release(ctx context.Context) {
-	fd.mf.DecCachedWriters()
 	fd.mf.DecRef(fd.rbmf.fr)
 	fd.mf.DecRef(fd.sqemf.fr)
 }
@@ -404,6 +402,10 @@ func (fd *FileDescription) ProcessSubmissions(t *kernel.Task, toSubmit uint32, m
 
 		// Dispatch request from unmarshalled entry.
 		cqe := fd.ProcessSubmission(t, &sqe, flags)
+
+		// The ring is written below through a cached internal mapping, which
+		// doesn't wait for an early-resume save of its pages.
+		fd.mf.AwaitSaved(fd.rbmf.fr)
 
 		// Advance sq head.
 		sqHeadPtr.Add(1)

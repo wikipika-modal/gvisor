@@ -149,7 +149,7 @@ func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileSave: %v", err)
 	}
-	if err := apfs.EnableEarlyResume(f); err != nil {
+	if err := apfs.EnableEarlyResume(); err != nil {
 		t.Fatalf("EnableEarlyResume: %v", err)
 	}
 	var meta bytes.Buffer
@@ -204,22 +204,16 @@ func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
 	}
 }
 
-func TestEarlyResumeRefusedWithCachedWriters(t *testing.T) {
-	f := newSaveTestMemoryFile(t, false)
-	apfs, err := StartAsyncPagesFileSave(newHeldWriter(), nil)
+func TestEarlyResumeRefusedWithoutPositionedWrites(t *testing.T) {
+	apfs, err := StartAsyncPagesFileSave(struct{ stateio.AsyncWriter }{newHeldWriter()}, nil)
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileSave: %v", err)
 	}
 	defer apfs.MemoryFilesDone()
-	f.IncCachedWriters()
-	if err := apfs.EnableEarlyResume(f); !errors.Is(err, ErrEarlyResumeUnsupported) {
-		t.Fatalf("EnableEarlyResume with a cached writer: got %v, want ErrEarlyResumeUnsupported", err)
+	if err := apfs.EnableEarlyResume(); !errors.Is(err, ErrEarlyResumeUnsupported) {
+		t.Fatalf("EnableEarlyResume: got %v, want ErrEarlyResumeUnsupported", err)
 	}
 	if apfs.earlyResume {
 		t.Fatalf("early resume enabled after refusal")
-	}
-	f.DecCachedWriters()
-	if err := apfs.EnableEarlyResume(f); err != nil {
-		t.Fatalf("EnableEarlyResume: %v", err)
 	}
 }

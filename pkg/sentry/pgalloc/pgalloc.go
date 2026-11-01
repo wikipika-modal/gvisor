@@ -210,10 +210,6 @@ type MemoryFile struct {
 	// pages of f.
 	earlyResumeSave atomic.Pointer[asyncMemoryFileSave]
 
-	// cachedWriters is the number of long-lived writable internal mappings of
-	// f, which early-resume saving can't write-protect.
-	cachedWriters atomic.Int64
-
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
