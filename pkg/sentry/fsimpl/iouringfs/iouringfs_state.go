@@ -30,6 +30,7 @@ func (fd *FileDescription) beforeSave() {
 // afterLoad is invoked by stateify.
 func (fd *FileDescription) afterLoad(ctx context.Context) {
 	fd.mf = pgalloc.MemoryFileFromContext(ctx)
+	fd.mf.IncCachedWriters()
 	// Remap shared buffers.
 	fd.remap = true
 	fd.runC = make(chan struct{}, 1)

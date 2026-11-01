@@ -15,6 +15,7 @@
 package pgalloc
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -79,17 +80,40 @@ func (apsUnsavedSetFunctions) Split(fr memmap.FileRange, us apsUnsavedInfo, spli
 	return us, us2
 }
 
+// ErrEarlyResumeUnsupported is returned by EnableEarlyResume if early-resume
+// saving can't write-protect the given MemoryFiles or the pages file.
+var ErrEarlyResumeUnsupported = errors.New("early-resume saving unsupported")
+
+// IncCachedWriters records a long-lived writable internal mapping of f, such as
+// an io_uring ring. Early-resume saving is refused while any exist, since
+// writes through them can't be made to wait for saving.
+func (f *MemoryFile) IncCachedWriters() {
+	f.cachedWriters.Add(1)
+}
+
+// DecCachedWriters undoes a call to IncCachedWriters.
+func (f *MemoryFile) DecCachedWriters() {
+	f.cachedWriters.Add(-1)
+}
+
 // EnableEarlyResume makes apfs save pages after MemoryFile.SaveTo() returns,
-// while MemoryFiles saved to apfs may be written to. It must be called before
-// any call to MemoryFile.SaveTo() with apfs.
-func (apfs *AsyncPagesFileSave) EnableEarlyResume() error {
+// while mfs, the MemoryFiles saved to apfs, may be written to. It must be
+// called before any call to MemoryFile.SaveTo() with apfs. If it returns an
+// error wrapping ErrEarlyResumeUnsupported, apfs is unchanged and may be used
+// for an ordinary save.
+func (apfs *AsyncPagesFileSave) EnableEarlyResume(mfs ...*MemoryFile) error {
+	for _, f := range mfs {
+		if n := f.cachedWriters.Load(); n != 0 {
+			return fmt.Errorf("%w: MemoryFile(%p) has %d long-lived writable mappings", ErrEarlyResumeUnsupported, f, n)
+		}
+	}
 	pw, ok := apfs.aw.(stateio.PositionedWriter)
 	if !ok {
-		return fmt.Errorf("pages file %T does not support positioned writes", apfs.aw)
+		return fmt.Errorf("%w: pages file %T does not support positioned writes", ErrEarlyResumeUnsupported, apfs.aw)
 	}
 	maxRanges := apfs.aw.MaxRanges()
 	if maxRanges < 2 {
-		return fmt.Errorf("pages file MaxRanges() (%d) must be at least 2", maxRanges)
+		return fmt.Errorf("%w: pages file MaxRanges() (%d) is below 2", ErrEarlyResumeUnsupported, maxRanges)
 	}
 	apfs.pw = pw
 	apfs.earlyResume = true
