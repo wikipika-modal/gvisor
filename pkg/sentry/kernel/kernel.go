@@ -808,7 +808,10 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 // If earlyResume is true, SaveTo returns once all state other than page
 // contents has been saved, and the caller may resume the kernel before
 // calling the returned function, which waits for page saving to complete.
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume, earlyResume bool, fsOpts *FSSaveOpts) (func() error, error) {
+//
+// If appMFPrescan is not nil, it is the result of
+// k.MemoryFile().PrescanZeroPages(appMFExcludeCommittedZeroPages).
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, fsOpts *FSSaveOpts) (func() error, error) {
 	// The bypass is saved task state and covers both resume and restore.
 	k.armSeccompRestartSyscallBypasses()
 
@@ -839,7 +842,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	var waitPages func() error
 	err := k.quiescePausedAnd(ctx, func() error {
 		var err error
-		waitPages, err = k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, earlyResume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		waitPages, err = k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, appMFPrescan, resume, earlyResume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 		return err
 	})
 	return waitPages, err
@@ -848,7 +851,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume, earlyResume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (_ func() error, retErr error) {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (_ func() error, retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
@@ -895,7 +898,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			mfSaveWait, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, earlyResume) // transfers ownership
+			mfSaveWait, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, earlyResume) // transfers ownership
 		}()
 		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -965,7 +968,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return nil, mfSaveErr
 		}
 	} else {
-		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, false)
+		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, false)
 		if mfSaveErr != nil {
 			return nil, mfSaveErr
 		}
@@ -996,7 +999,7 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 //
 // If earlyResume is true, saveMemoryFiles returns without waiting for page
 // saving, and returns a function that does.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, earlyResume bool) (func() error, error) {
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, earlyResume bool) (func() error, error) {
 	memoryStart := time.Now()
 
 	pmw := w
@@ -1009,6 +1012,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 
 	mfOpts := pgalloc.SaveOpts{
 		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
+		Prescan:                   appMFPrescan,
 	}
 	var (
 		asyncPageSaveWg      sync.WaitGroup
@@ -1046,6 +1050,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
 	// usage behavior, but not necessarily usage of private MemoryFiles.
 	mfOpts.ExcludeCommittedZeroPages = false
+	mfOpts.Prescan = nil
 	if err := savePrivateMFs(ctx, pmw, mfsToSave, &mfOpts); err != nil {
 		return nil, err
 	}

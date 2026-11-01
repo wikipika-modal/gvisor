@@ -16,12 +16,14 @@ package pgalloc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -178,6 +180,10 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If Prescan is not nil, SaveTo() checks only pages that Prescan didn't
+	// find non-zero.
+	Prescan *ZeroPagesPrescan
 }
 
 // SaveTo writes f's state to the given stream.
@@ -250,6 +256,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		alreadyUncommittedBytes uint64
 		newUncommittedBytes     uint64
 		hostHoleBytes           uint64
+		checkedBytes            uint64
 	)
 	asyncWritePages := func(fr memmap.FileRange) {}
 	if amfs != nil {
@@ -403,7 +410,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			return
 		}
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			zero := zeroPages(chunk.sliceAt(chunkFR))
+			zero := opts.Prescan.zeroPages(chunk.sliceAt(chunkFR), chunkFR, &checkedBytes)
 			for i := 0; i < len(zero); {
 				j := i + 1
 				for j < len(zero) && zero[j] == zero[i] {
@@ -507,10 +514,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	durScan := time.Duration(gohacks.Nanotime() - timeScanStart)
-	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected including %d bytes of host holes, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
+	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes (%d bytes checked): %d bytes of zero pages (%d bytes expected including %d bytes of host holes, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
 		f,
 		durScan,
 		allocatedBytes,
+		checkedBytes,
 		alreadyUncommittedBytes+newUncommittedBytes,
 		alreadyUncommittedBytes,
 		hostHoleBytes,
@@ -1165,6 +1173,116 @@ func zeroPages(bs []byte) []bool {
 		}()
 	}
 	wg.Wait()
+	return zero
+}
+
+// ZeroPagesPrescan holds the pages that MemoryFile.PrescanZeroPages() found
+// non-zero.
+type ZeroPagesPrescan struct {
+	// nonZero is sorted and non-overlapping.
+	nonZero []memmap.FileRange
+}
+
+// PrescanZeroPages finds the pages of f that SaveTo() would check for zero
+// bytes, given excludeCommittedZeroPages, and that hold non-zero bytes. It
+// runs while f is in use, so that SaveTo(), given the result in
+// SaveOpts.Prescan, checks only the other pages while the kernel is paused.
+// Pages found non-zero are saved even if they have since become zero, so
+// SaveTo() still excludes only pages it finds zero.
+func (f *MemoryFile) PrescanZeroPages(excludeCommittedZeroPages bool) *ZeroPagesPrescan {
+	start := gohacks.Nanotime()
+	p := &ZeroPagesPrescan{}
+	var scanned, nonZero uint64
+	scan := func(fr memmap.FileRange) {
+		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			zero := zeroPages(chunk.sliceAt(chunkFR))
+			for i := 0; i < len(zero); i++ {
+				if zero[i] {
+					continue
+				}
+				pfr := memmap.FileRange{
+					Start: chunkFR.Start + uint64(i)*hostarch.PageSize,
+					End:   chunkFR.Start + uint64(i+1)*hostarch.PageSize,
+				}
+				if n := len(p.nonZero); n != 0 && p.nonZero[n-1].End == pfr.Start {
+					p.nonZero[n-1].End = pfr.End
+				} else {
+					p.nonZero = append(p.nonZero, pfr)
+				}
+				nonZero += hostarch.PageSize
+			}
+			scanned += chunkFR.Length()
+			return true
+		})
+	}
+	dataSeeker := f.newHostFileDataSeeker()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Scan one huge page at a time with f.mu locked, so that scanned pages
+	// aren't released, and let other users of f.mu proceed in between.
+	for start := uint64(0); start < f.TotalSize(); start += hostarch.HugePageSize {
+		unitFR := memmap.FileRange{start, start + hostarch.HugePageSize}
+		for maseg := f.memAcct.LowerBoundSegment(start); maseg.Ok() && maseg.Start() < unitFR.End; maseg = maseg.NextSegment() {
+			ma := maseg.ValuePtr()
+			fr := maseg.Range().Intersect(unitFR)
+			switch {
+			case ma.wasteOrReleasing:
+			case ma.knownCommitted:
+				if excludeCommittedZeroPages {
+					scan(fr)
+				}
+			case dataSeeker == nil:
+				scan(fr)
+			default:
+				for fr.Length() != 0 {
+					data, err := dataSeeker.dataAtOrAfter(fr.Start)
+					if err != nil {
+						log.Warningf("MemoryFile(%p): prescanning stopped: %v", f, err)
+						return p
+					}
+					dataFR := memmap.FileRange{max(fr.Start, data.Start), min(data.End, fr.End)}
+					if dataFR.Length() == 0 {
+						break
+					}
+					scan(dataFR)
+					fr.Start = dataFR.End
+				}
+			}
+		}
+		f.mu.Unlock()
+		f.mu.Lock()
+	}
+	log.Infof("MemoryFile(%p): prescanning took %s for %d bytes: %d bytes of non-zero pages", f, time.Duration(gohacks.Nanotime()-start), scanned, nonZero)
+	return p
+}
+
+// zeroPages returns whether each page in bs, the contents of fr, is zero,
+// checking only pages that p didn't find non-zero, and adds the bytes it
+// checks to checked.
+func (p *ZeroPagesPrescan) zeroPages(bs []byte, fr memmap.FileRange, checked *uint64) []bool {
+	if p == nil {
+		*checked += fr.Length()
+		return zeroPages(bs)
+	}
+	zero := make([]bool, len(bs)/hostarch.PageSize)
+	check := func(start, end uint64) {
+		copy(zero[(start-fr.Start)/hostarch.PageSize:], zeroPages(bs[start-fr.Start:end-fr.Start]))
+		*checked += end - start
+	}
+	i, _ := slices.BinarySearchFunc(p.nonZero, fr.Start, func(nz memmap.FileRange, off uint64) int {
+		return cmp.Compare(nz.End, off+1)
+	})
+	start := fr.Start
+	for ; i < len(p.nonZero) && p.nonZero[i].Start < fr.End; i++ {
+		nz := p.nonZero[i].Intersect(fr)
+		if start < nz.Start {
+			check(start, nz.Start)
+		}
+		start = nz.End
+	}
+	if start < fr.End {
+		check(start, fr.End)
+	}
 	return zero
 }
 

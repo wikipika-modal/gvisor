@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -131,6 +132,13 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Infof("Before save wall time: %s", wt.String())
 	}
 
+	// Checking application memory for zero pages before pausing leaves only
+	// the pages found zero, or allocated since, to check while paused.
+	var appMFPrescan *pgalloc.ZeroPagesPrescan
+	if opts.EarlyResume {
+		appMFPrescan = k.MemoryFile().PrescanZeroPages(opts.AppMFExcludeCommittedZeroPages)
+	}
+
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
 	k.ReceiveTaskStates()
@@ -177,7 +185,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.Destination = nil
 		// Save the kernel.
 		var waitPages func() error
-		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.EarlyResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, appMFPrescan, opts.Resume, opts.EarlyResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
