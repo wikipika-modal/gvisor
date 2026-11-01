@@ -388,13 +388,13 @@ func TestLazyLoadReadsAheadOfAdjacentAwaits(t *testing.T) {
 				t.Fatalf("MapInternal: %v", err)
 			}
 		}
-		// The two windows beyond the second one are loaded without being
-		// awaited, as readahead.
-		if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
-			t.Errorf("reverse=%v: read %d bytes, want %d", reverse, got, 4*lazyMinBytes)
+		// The window beyond the second one is loaded without being awaited, as
+		// readahead.
+		if got := waitForReads(r, 3*lazyMinBytes); got != 3*lazyMinBytes {
+			t.Errorf("reverse=%v: read %d bytes, want %d", reverse, got, 3*lazyMinBytes)
 		}
-		if got := r.readahead.Load(); got != 2*lazyMinBytes {
-			t.Errorf("reverse=%v: read %d bytes as readahead, want %d", reverse, got, 2*lazyMinBytes)
+		if got := r.readahead.Load(); got != lazyReadaheadMinBytes {
+			t.Errorf("reverse=%v: read %d bytes as readahead, want %d", reverse, got, lazyReadaheadMinBytes)
 		}
 		checkLoaded(t, restored, fr, want)
 	}

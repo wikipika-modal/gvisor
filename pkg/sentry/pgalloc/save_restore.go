@@ -200,8 +200,8 @@ const (
 	// lazyReadaheadMinBytes and lazyReadaheadMaxBytes bound how far ahead of a
 	// sequence of adjacent awaited ranges pages are loaded in the background,
 	// when loading lazily. The window doubles each time it is reached.
-	lazyReadaheadMinBytes = 64 << 20
-	lazyReadaheadMaxBytes = 128 << 20
+	lazyReadaheadMinBytes = 32 << 20
+	lazyReadaheadMaxBytes = 64 << 20
 
 	// lazyStreams is the number of sequences of adjacent awaited ranges that
 	// are tracked for readahead at once.
