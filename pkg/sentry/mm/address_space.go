@@ -53,11 +53,25 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 const asyncLoadMapUnit = 32 << 20
 
 // lazyLoadMapUnit replaces asyncLoadMapUnit while pages are loaded lazily,
-// which loads the rest of each awaited range's window in the background.
+// which loads the rest of each awaited range's window in the background,
+// unless the asyncLoadMapUnit-aligned range is already loaded.
 const lazyLoadMapUnit = hostarch.HugePageSize
 
-func loadMapUnit(mf *pgalloc.MemoryFile) uint64 {
-	if mf.IsLazyLoading() {
+// alignedAR returns ar expanded to multiples of unit, except for an end that
+// would overflow.
+func alignedAR(ar hostarch.AddrRange, unit uint64) hostarch.AddrRange {
+	mask := hostarch.Addr(unit - 1)
+	aligned := hostarch.AddrRange{ar.Start &^ mask, ^hostarch.Addr(hostarch.PageSize - 1)}
+	if end := (ar.End + mask) &^ mask; end >= ar.End {
+		aligned.End = end
+	}
+	return aligned
+}
+
+// loadMapUnit returns the unit in which mapASLocked maps ar, starting in pseg,
+// while mf is loading asynchronously.
+func loadMapUnit(mf *pgalloc.MemoryFile, pseg pmaIterator, ar hostarch.AddrRange) uint64 {
+	if mf.IsLazyLoading() && !mf.IsLoaded(pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, asyncLoadMapUnit)))) {
 		return lazyLoadMapUnit
 	}
 	return asyncLoadMapUnit
@@ -73,12 +87,11 @@ func (mm *MemoryManager) unloadedMapRangeLocked(pseg pmaIterator, ar hostarch.Ad
 	if !ok || mm.p.MapUnit() != 0 || mf.IsEarlyResumeSaving() || !mf.IsAsyncLoading() {
 		return nil, memmap.FileRange{}, false
 	}
-	mask := hostarch.Addr(loadMapUnit(mf) - 1)
-	mapAR := hostarch.AddrRange{ar.Start &^ mask, ^hostarch.Addr(hostarch.PageSize - 1)}
-	if end := (ar.End + mask) &^ mask; end >= ar.End {
-		mapAR.End = end
+	unit := uint64(asyncLoadMapUnit)
+	if mf.IsLazyLoading() {
+		unit = lazyLoadMapUnit
 	}
-	fr := pseg.fileRangeOf(pseg.Range().Intersect(mapAR))
+	fr := pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, unit)))
 	if mf.IsLoaded(fr) {
 		return nil, memmap.FileRange{}, false
 	}
@@ -123,7 +136,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsEarlyResumeSaving() {
 		setMapUnit(earlyResumeMapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		setMapUnit(loadMapUnit(mf))
+		setMapUnit(loadMapUnit(mf, pseg, ar))
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
