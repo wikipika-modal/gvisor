@@ -1031,11 +1031,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		})
 		mfOpts.PagesFile = apfs
 		if earlyResume {
-			mfs := []*pgalloc.MemoryFile{k.mf}
-			for _, mf := range mfsToSave {
-				mfs = append(mfs, mf)
-			}
-			if err := apfs.EnableEarlyResume(mfs...); errors.Is(err, pgalloc.ErrEarlyResumeUnsupported) {
+			if err := apfs.EnableEarlyResume(); errors.Is(err, pgalloc.ErrEarlyResumeUnsupported) {
 				log.Warningf("Saving pages before resuming: %v", err)
 				earlyResume = false
 			} else if err != nil {
