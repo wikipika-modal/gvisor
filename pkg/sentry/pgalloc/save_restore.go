@@ -1789,6 +1789,9 @@ type aplOp struct {
 	// If tempRef is true, a temporary reference is held on pages in frs that
 	// should be dropped after completion.
 	tempRef bool
+
+	// readahead is true if the read loads pages lazily ahead of waiters.
+	readahead bool
 }
 
 func (op *aplOp) off() int64 {
@@ -2184,6 +2187,11 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 			p.PrioritizeLastRead()
 		}
 	}
+	if op.readahead {
+		if m, ok := apfl.ar.(stateio.ReadaheadMarker); ok {
+			m.MarkLastReadReadahead()
+		}
+	}
 	if logAwaitedLoads && !op.tempRef {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}
@@ -2193,7 +2201,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef, readahead bool) uint64 {
 	for {
 		if apfl.curOp == nil {
 			id, err := apfl.opsBusy.FirstZero(0)
@@ -2205,11 +2213,13 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			op.total = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
+			op.readahead = false
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
 		n := apfl.combine(amfl, fr, off, tempRef)
 		if n > 0 {
+			apfl.curOp.readahead = apfl.curOp.readahead || readahead
 			return n
 		}
 		// Flush the existing (conflicting) op and try again with a new one.
@@ -2431,7 +2441,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// fr.amfl.awaitLoad() precondition), so they can't become
 				// waste (which would allow them to be racily released or
 				// recycled).
-				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */)
+				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */, false /* readahead */)
 				if n == 0 {
 					// Try again in the next iteration of the main loop, when
 					// we have space in the queue again.
@@ -2491,7 +2501,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					// We need to take page references during reading to
 					// prevent pages from becoming waste due to concurrent
 					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */, false /* readahead */)
 					if n == 0 {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
@@ -2666,7 +2676,7 @@ func (apfl *AsyncPagesFileLoad) enqueueReadaheadLocked(amfl *asyncMemoryFileLoad
 			}
 			ulseg = amfl.unloaded.Isolate(ulseg, fr)
 			ulFR := ulseg.Range()
-			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */)
+			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */, true /* readahead */)
 			if n == 0 {
 				amfl.readahead.PushFront(memmap.FileRange{ulFR.Start, fr.End})
 				return false

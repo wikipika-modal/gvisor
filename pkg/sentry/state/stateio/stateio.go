@@ -131,6 +131,15 @@ type ReadPrioritizer interface {
 	PrioritizeLastRead()
 }
 
+// ReadaheadMarker is implemented by AsyncReaders that track which reads a
+// lazy load needed.
+type ReadaheadMarker interface {
+	// MarkLastReadReadahead marks the read most recently enqueued by AddRead
+	// or AddReadv as loading pages lazily ahead of callers that are expected
+	// to need them.
+	MarkLastReadReadahead()
+}
+
 // LazyReader is implemented by AsyncReaders that can ask to load only pages
 // that someone waits for.
 type LazyReader interface {
