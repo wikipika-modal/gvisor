@@ -2097,8 +2097,17 @@ func (l *Loader) waitPID(tgid kernel.ThreadID, cid string, waitStatus *uint32) e
 // wait waits for the process with TGID 'tgid' in a container's PID namespace
 // to exit.
 func (l *Loader) wait(tg *kernel.ThreadGroup) uint32 {
-	tg.WaitExited()
-	return uint32(tg.ExitStatus())
+	exited := make(chan struct{})
+	go func() {
+		tg.WaitExited()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		return uint32(tg.ExitStatus())
+	case <-l.k.RetainedSaveStopped():
+		return uint32(linux.WaitStatusExit(0))
+	}
 }
 
 // WaitForStartSignal waits for a start signal from the control server.
@@ -2107,8 +2116,45 @@ func (l *Loader) WaitForStartSignal() {
 }
 
 // WaitExit waits for the sandbox to finish and returns the root container's
-// exit status, or zero if there is no root container.
+// exit status, or zero if there is no root container. A save that stopped the
+// sandbox for good (see StoppedForRetainedSave) finishes it with status zero,
+// as killing it after the save would.
 func (l *Loader) WaitExit() linux.WaitStatus {
+	exited := make(chan linux.WaitStatus, 1)
+	go func() {
+		exited <- l.waitKernelExit()
+	}()
+	select {
+	case ws := <-exited:
+		return ws
+	case <-l.k.RetainedSaveStopped():
+		return linux.WaitStatusExit(0)
+	}
+}
+
+// StoppedForRetainedSave returns whether a save stopped every task for good,
+// see kernel.Kernel.StopForRetainedSave. The sandbox must then exit through
+// StopAfterRetainedSave instead of Destroy.
+func (l *Loader) StoppedForRetainedSave() bool {
+	select {
+	case <-l.k.RetainedSaveStopped():
+		return true
+	default:
+		return false
+	}
+}
+
+// StopAfterRetainedSave answers every pending RPC, including the save's own,
+// and stops the control server, without releasing the kernel.
+func (l *Loader) StopAfterRetainedSave() {
+	l.watchdog.Stop()
+	err := fmt.Errorf("sandbox stopped after save")
+	l.k.SignalAllCheckpointWaiters(err)
+	l.k.SignalAllFSSaveWaiters(err)
+	l.ctrl.stop()
+}
+
+func (l *Loader) waitKernelExit() linux.WaitStatus {
 	if l.noRootContainer.enabled {
 		// Not k.WaitExited(): it returns as soon as nothing is running and
 		// blocks new tasks, so the sandbox could never take another container.

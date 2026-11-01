@@ -323,6 +323,11 @@ type Kernel struct {
 	// +checklocks:extMu
 	saveStatus error `state:"nosave"`
 
+	// retainedSaveStopped is closed by StopForRetainedSave.
+	retainedSaveStopped     chan struct{} `state:"nosave"`
+	retainedSaveStoppedInit sync.Once     `state:"nosave"`
+	retainedSaveStop        sync.Once     `state:"nosave"`
+
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 
@@ -733,7 +738,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 }
 
 // quiescePausedAnd runs f with kernel timers and CPU-clock updates paused,
-// and resumes them afterwards if resumeTime is true. f runs synchronously with k.extMu held and must not release or reacquire it.
+// and resumes them afterwards if resumeTime is true. f runs synchronously
+// with k.extMu held and must not release or reacquire it.
 //
 // Preconditions: The kernel must be paused throughout the call.
 //
@@ -2272,6 +2278,29 @@ func (k *Kernel) SetSaveError(err error) {
 	if k.saveStatus == nil {
 		k.saveStatus = err
 	}
+}
+
+// StopForRetainedSave stops every task for good after a save whose pages file
+// server keeps reading saved memory. The sandbox must then exit without
+// running or releasing anything that writes to or frees that memory.
+func (k *Kernel) StopForRetainedSave() {
+	k.retainedSaveStop.Do(func() {
+		k.Pause()
+		close(k.retainedSaveChan())
+	})
+}
+
+// RetainedSaveStopped returns a channel that is closed once
+// StopForRetainedSave has stopped every task.
+func (k *Kernel) RetainedSaveStopped() <-chan struct{} {
+	return k.retainedSaveChan()
+}
+
+func (k *Kernel) retainedSaveChan() chan struct{} {
+	k.retainedSaveStoppedInit.Do(func() {
+		k.retainedSaveStopped = make(chan struct{})
+	})
+	return k.retainedSaveStopped
 }
 
 // SetMemoryFile sets Kernel.mf. SetMemoryFile must be called before Init or

@@ -209,10 +209,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		k.BeforeResume(ctx)
 	} else if err == nil && retainsPages {
 		// Exiting tasks would write to and free memory that the pages file
-		// server still reads, so leave every task stopped. The caller destroys
-		// the sandbox.
-		log.Infof("Pages file server retains sources: leaving tasks stopped")
-		k.Pause()
+		// server still reads, so stop them for good; the sandbox exits without
+		// releasing the kernel.
+		log.Infof("Pages file server retains sources: exiting with tasks stopped")
+		k.StopForRetainedSave()
 	} else {
 		// Kill the sandbox.
 		k.Kill(linux.WaitStatusExit(0))
