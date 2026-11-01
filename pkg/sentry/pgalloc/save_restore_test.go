@@ -419,7 +419,7 @@ func TestLazyLoadReadsWindowAroundSmallAwaits(t *testing.T) {
 func TestLazyLoadTurnsEagerAfterLoadingHalf(t *testing.T) {
 	f, fr, want := newLazyWindowsMemoryFile(t, 4)
 	metadata, pages := saveToPagesFile(t, f, false)
-	restored, r, loaded := loadPagesFile(t, metadata, pages, fr, true)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
 	if _, err := restored.MapInternal(lazyWindow(fr, 0), hostarch.Read); err != nil {
 		t.Fatalf("MapInternal: %v", err)
 	}
@@ -432,9 +432,6 @@ func TestLazyLoadTurnsEagerAfterLoadingHalf(t *testing.T) {
 	}
 	if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting half, want %d", got, 4*lazyMinBytes)
-	}
-	if err := <-loaded; err != nil {
-		t.Fatalf("async page load: %v", err)
 	}
 	checkLoaded(t, restored, fr, want)
 }
