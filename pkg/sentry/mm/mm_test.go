@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio/stateiotest"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -1217,5 +1218,86 @@ func TestIODuringAsyncPageLoad(t *testing.T) {
 	}
 	if want := bytes.Repeat([]byte{1}, len(b)); !bytes.Equal(b, want) {
 		t.Errorf("CopyIn got %v want %v", b, want)
+	}
+}
+
+// TestIODuringEarlyResumeSave tests that I/O reading pages that an
+// early-resume save hasn't saved yet doesn't wait for them, while I/O writing
+// them waits until they are saved.
+func TestIODuringEarlyResumeSave(t *testing.T) {
+	// Larger than a huge page, so that MMap doesn't populate the mapping.
+	const size = 2 * earlyResumeMapUnit
+	ctx := contexttest.Context(t)
+
+	mf := newTestMemoryFile(t)
+	fr, err := mf.Allocate(size, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate got err %v want nil", err)
+	}
+	want := bytes.Repeat([]byte{1}, size)
+	if _, err := unix.Pwrite(mf.FD(), want, int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite got err %v want nil", err)
+	}
+	mm := testMemoryManager(ctx, t)
+	mm.mf = mf // mm has no mappings yet.
+	defer mm.DecUsers(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   size,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + size}
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	w := stateiotest.NewHeldWriter(time.Hour)
+	saveDone := make(chan error, 1)
+	apfs, err := pgalloc.StartAsyncPagesFileSave(w, func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave got err %v want nil", err)
+	}
+	if err := apfs.EnableEarlyResume(); err != nil {
+		t.Fatalf("EnableEarlyResume got err %v want nil", err)
+	}
+	if err := mf.SaveTo(ctx, io.Discard, &pgalloc.SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo got err %v want nil", err)
+	}
+	apfs.MemoryFilesDone()
+	mm.PrepareEarlyResumeSave()
+
+	// The first pages are held in flight; the last page isn't sent yet.
+	last := addr + size - pageSizeAddr
+	b := make([]byte, 8)
+	if _, err := mm.CopyIn(ctx, last, b, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyIn got err %v want nil", err)
+	}
+	if n := w.PriorityWrites(); n != 0 {
+		t.Errorf("CopyIn made %d priority writes, want 0", n)
+	}
+	if _, err := mm.CopyOut(ctx, last, []byte{2}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyOut got err %v want nil", err)
+	}
+	if w.PriorityWrites() == 0 {
+		t.Errorf("CopyOut made no priority writes")
+	}
+	w.Release()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("early-resume save got err %v want nil", err)
+	}
+	if got := w.Saved(fr.End - pageSize); !bytes.Equal(got, want[:hostarch.PageSize]) {
+		t.Errorf("saved page differs from the page when saving began")
 	}
 }

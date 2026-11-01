@@ -199,6 +199,7 @@ go_test(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/stateio/stateiotest",
         "//pkg/sentry/usage",
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
