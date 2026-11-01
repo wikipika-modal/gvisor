@@ -279,3 +279,29 @@ func TestLazyLoadReadsOnlyAwaitedPages(t *testing.T) {
 		}
 	})
 }
+
+func TestSaveAfterLazyLoad(t *testing.T) {
+	for _, exclude := range []bool{false, true} {
+		f, fr, want := newLazyTestMemoryFile(t)
+		metadata, pages := saveToPagesFile(t, f, false)
+		restored, _, loaded := loadPagesFile(t, metadata, pages, fr, true)
+		if _, err := restored.MapInternal(testPage(fr, 5), hostarch.Read); err != nil {
+			t.Fatalf("MapInternal: %v", err)
+		}
+
+		// Saving loads the rest of the large range.
+		metadata, pages = saveToPagesFile(t, restored, exclude)
+		if err := <-loaded; err != nil {
+			t.Fatalf("async page load: %v", err)
+		}
+		again, _, loaded := loadPagesFile(t, metadata, pages, fr, false)
+		if err := <-loaded; err != nil {
+			t.Fatalf("async page load: %v", err)
+		}
+		again.forEachMappingSlice(fr, func(bs []byte) {
+			if !bytes.Equal(bs, want) {
+				t.Errorf("exclude=%v: contents saved after a lazy load differ", exclude)
+			}
+		})
+	}
+}
