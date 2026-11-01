@@ -52,6 +52,17 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 // unnecessarily large ranges, resulting in unnecessarily long waits.
 const asyncLoadMapUnit = 32 << 20
 
+// lazyLoadMapUnit replaces asyncLoadMapUnit while pages are loaded lazily,
+// which loads the rest of each awaited range's window in the background.
+const lazyLoadMapUnit = hostarch.HugePageSize
+
+func loadMapUnit(mf *pgalloc.MemoryFile) uint64 {
+	if mf.IsLazyLoading() {
+		return lazyLoadMapUnit
+	}
+	return asyncLoadMapUnit
+}
+
 // unloadedMapRangeLocked returns the range of pseg's MemoryFile that
 // mapASLocked would wait for async page loading of to map ar, and true if any
 // of it isn't loaded yet.
@@ -62,7 +73,7 @@ func (mm *MemoryManager) unloadedMapRangeLocked(pseg pmaIterator, ar hostarch.Ad
 	if !ok || mm.p.MapUnit() != 0 || mf.IsEarlyResumeSaving() || !mf.IsAsyncLoading() {
 		return nil, memmap.FileRange{}, false
 	}
-	mask := hostarch.Addr(asyncLoadMapUnit - 1)
+	mask := hostarch.Addr(loadMapUnit(mf) - 1)
 	mapAR := hostarch.AddrRange{ar.Start &^ mask, ^hostarch.Addr(hostarch.PageSize - 1)}
 	if end := (ar.End + mask) &^ mask; end >= ar.End {
 		mapAR.End = end
@@ -112,7 +123,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsEarlyResumeSaving() {
 		setMapUnit(earlyResumeMapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		setMapUnit(asyncLoadMapUnit)
+		setMapUnit(loadMapUnit(mf))
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
