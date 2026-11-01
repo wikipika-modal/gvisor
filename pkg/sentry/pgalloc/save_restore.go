@@ -708,6 +708,7 @@ type AsyncPagesFileSave struct {
 	earlyResume bool
 	pw          stateio.PositionedWriter
 	prioReserve int
+	repeats     bool
 
 	// erFiles are the MemoryFiles being saved, in pages file order.
 	erFiles []*asyncMemoryFileSave
@@ -728,6 +729,7 @@ type AsyncPagesFileSave struct {
 
 	prioOps   uint64
 	prioBytes uint64
+	repeatOps uint64
 	erWaits   uint64
 	erWaitDur time.Duration
 }
@@ -771,10 +773,9 @@ type apsOp struct {
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
 
-	// For early-resume saving, off is the pages file offset of the write, and
-	// priority is true if a writer is waiting for it.
-	off      uint64
-	priority bool
+	// For early-resume saving, off is the pages file offset of the write.
+	off   uint64
+	flags stateio.WriteFlags
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
