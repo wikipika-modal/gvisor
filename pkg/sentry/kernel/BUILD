@@ -444,6 +444,7 @@ go_test(
         "task_syscall_benchmark_test.go",
         "task_test.go",
         "timekeeper_test.go",
+        "vdso_save_test.go",
     ],
     embed = [":kernel"],
     deps = [
@@ -460,6 +461,7 @@ go_test(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",
@@ -471,5 +473,6 @@ go_test(
         "//pkg/sync",
         "//pkg/tcpip",
         "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
