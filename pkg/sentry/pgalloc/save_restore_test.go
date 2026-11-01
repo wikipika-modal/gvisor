@@ -400,6 +400,30 @@ func TestLazyLoadReadsAheadOfAdjacentAwaits(t *testing.T) {
 	}
 }
 
+func TestLazyLoadReadsAheadOfAwaitsAfterLoadedWindows(t *testing.T) {
+	neverEager(t)
+	f, fr, want := newLazyWindowsMemoryFile(t, 4)
+	metadata, pages := saveToPagesFile(t, f, false)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
+	hugePage := func(i uint64) memmap.FileRange {
+		w := lazyWindow(fr, i)
+		return memmap.FileRange{w.Start, w.Start + hostarch.HugePageSize}
+	}
+	if _, err := restored.MapInternal(hugePage(0), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	// The rest of window 0 is loaded before anything in it is awaited, so the
+	// next await is the first in window 1, which continues window 0.
+	waitForReads(r, lazyMinBytes)
+	if _, err := restored.MapInternal(hugePage(1), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if got, want := waitForReads(r, 2*lazyMinBytes+hostarch.HugePageSize), uint64(2*lazyMinBytes+hostarch.HugePageSize); got != want {
+		t.Errorf("read %d bytes, want %d", got, want)
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
 func TestLazyLoadReadsWindowAroundSmallAwaits(t *testing.T) {
 	f, fr, want := newLazyWindowsMemoryFile(t, 4)
 	metadata, pages := saveToPagesFile(t, f, false)
@@ -436,12 +460,31 @@ func TestLazyLoadTurnsEagerAfterLoadingHalf(t *testing.T) {
 	checkLoaded(t, restored, fr, want)
 }
 
+func TestLazyLoadReadaheadDoesNotTurnEager(t *testing.T) {
+	f, fr, want := newLazyWindowsMemoryFile(t, 4)
+	metadata, pages := saveToPagesFile(t, f, false)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
+	for _, i := range []uint64{0, 2} {
+		if _, err := restored.MapInternal(testPage(lazyWindow(fr, i), 5), hostarch.Read); err != nil {
+			t.Fatalf("MapInternal: %v", err)
+		}
+	}
+	// Half of the pages are loaded, but only two of them were awaited.
+	if got := waitForReads(r, 2*lazyMinBytes); got != 2*lazyMinBytes {
+		t.Errorf("read %d bytes, want %d", got, 2*lazyMinBytes)
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
 func TestDecommitDuringLazyLoad(t *testing.T) {
 	f, fr, want := newLazyWindowsMemoryFile(t, 1)
 	metadata, pages := saveToPagesFile(t, f, false)
-	restored, _, _ := loadPagesFile(t, metadata, pages, fr, true)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
 	page := testPage(fr, 5)
 	restored.Decommit(page)
+	if got := waitForReads(r, hostarch.PageSize); got != hostarch.PageSize {
+		t.Errorf("read %d bytes, want only the decommitted page", got)
+	}
 	bs, err := restored.MapInternal(page, hostarch.Read)
 	if err != nil {
 		t.Fatalf("MapInternal: %v", err)
