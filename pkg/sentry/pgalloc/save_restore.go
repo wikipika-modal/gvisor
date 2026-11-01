@@ -1866,6 +1866,27 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
 }
 
+// IsLoaded returns true if async page loading has loaded every page in fr.
+func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
+	amfl := f.asyncPageLoad.Load()
+	if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
+		return true
+	}
+	amfl.pf.mu.Lock()
+	defer amfl.pf.mu.Unlock()
+	return amfl.unloaded.IsEmptyRange(fr)
+}
+
+// AwaitLoad blocks until async page loading has loaded every page in fr.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) AwaitLoad(fr memmap.FileRange) error {
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		return amfl.awaitLoad(fr)
+	}
+	return nil
+}
+
 // AwaitLoadAll blocks until async page loading has completed. If async page
 // loading is not in progress, AwaitLoadAll returns immediately.
 func (f *MemoryFile) AwaitLoadAll() error {
