@@ -208,8 +208,9 @@ const (
 	lazyStreams = 16
 )
 
-// Once lazyEagerPercent of the pages a MemoryFile marked lazy have been
-// awaited, the rest are loaded in the background as if loading eagerly.
+// Once pages have been awaited in lazyMinBytes-aligned windows as large as
+// lazyEagerPercent of the pages a MemoryFile marked lazy, the rest are loaded
+// in the background as if loading eagerly.
 var lazyEagerPercent uint64 = 50
 
 // SaveTo writes f's state to the given stream.
@@ -1713,11 +1714,13 @@ type asyncMemoryFileLoad struct {
 	// that awaiting a loaded range in it still advances the stream.
 	readaheadTrigger atomicbitops.Uint64
 
-	// lazyBytes is the number of bytes markLazyLocked marked lazy, and
-	// lazyAwaitedBytes how many of them have been loaded for waiters since.
-	// Both are protected by pf.mu.
-	lazyBytes        uint64
-	lazyAwaitedBytes uint64
+	// lazyBytes is the number of bytes markLazyLocked marked lazy, touched
+	// holds the starts of the lazyMinBytes-aligned windows in which unloaded
+	// lazy pages have been awaited since, and touchedBytes their total size.
+	// All are protected by pf.mu.
+	lazyBytes    uint64
+	touched      map[uint64]struct{}
+	touchedBytes uint64
 }
 
 // aplStream is a sequence of adjacent awaited ranges. When a range in window
@@ -1918,8 +1921,9 @@ func (f *MemoryFile) AwaitLoadAll() error {
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr. If
-// readahead is true and pages are loaded lazily, it also loads pages that are
-// likely to be awaited next in the background.
+// readahead is true, fr is being accessed: when loading lazily, pages likely
+// to be awaited next are loaded in the background, and fr's windows count
+// toward lazyEagerPercent.
 //
 // Preconditions: At least one reference must be held on all unloaded pages in
 // fr.
@@ -1965,6 +1969,9 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange, readahead bool) 
 		}
 		ul.waiters = append(ul.waiters, w)
 		w.pending += ullen
+		if readahead && ul.lazy && amfl.lazyBytes != 0 {
+			amfl.touchLocked(ulFR)
+		}
 		return true
 	})
 	pending := w.pending != 0
@@ -2094,6 +2101,18 @@ func (amfl *asyncMemoryFileLoad) readaheadLocked(fr memmap.FileRange, missed boo
 	return window.Length() != 0
 }
 
+// touchLocked records that lazy pages in fr have been awaited.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) touchLocked(fr memmap.FileRange) {
+	for start := fr.Start &^ (lazyMinBytes - 1); start < fr.End; start += lazyMinBytes {
+		if _, ok := amfl.touched[start]; !ok {
+			amfl.touched[start] = struct{}{}
+			amfl.touchedBytes += lazyMinBytes
+		}
+	}
+}
+
 // rememberLocked records fr as recently awaited, for readaheadLocked.
 //
 // Preconditions: amfl.pf.mu must be locked.
@@ -2141,6 +2160,7 @@ func (amfl *asyncMemoryFileLoad) markLazyLocked() {
 			amfl.lazyBytes += ulseg.Range().Length()
 		}
 	}
+	amfl.touched = make(map[uint64]struct{})
 }
 
 // eagerLocked marks every unloaded page in amfl as loaded in the background.
@@ -2148,8 +2168,9 @@ func (amfl *asyncMemoryFileLoad) markLazyLocked() {
 // Preconditions: amfl.pf.mu must be locked. Must be called by the async page
 // loader goroutine.
 func (amfl *asyncMemoryFileLoad) eagerLocked() {
-	log.Infof("MemoryFile(%p): awaited %d of %d lazy bytes; loading the rest eagerly", amfl.f, amfl.lazyAwaitedBytes, amfl.lazyBytes)
+	log.Infof("MemoryFile(%p): awaited pages in %d bytes of windows of %d lazy bytes; loading the rest eagerly", amfl.f, amfl.touchedBytes, amfl.lazyBytes)
 	amfl.lazyBytes = 0
+	amfl.touched = nil
 	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
 		ulseg.ValuePtr().lazy = false
 	}
@@ -2620,9 +2641,6 @@ func (apfl *AsyncPagesFileLoad) main() {
 					if !ul.started {
 						panic(fmt.Sprintf("MemoryFile(%p): completion of %v includes pages %v that were never started", amfl.f, fr, ulseg.Range()))
 					}
-					if ul.lazy && len(ul.waiters) != 0 {
-						amfl.lazyAwaitedBytes += ullen
-					}
 					for _, w := range ul.waiters {
 						haveWaiters = true
 						w.pending -= ullen
@@ -2648,7 +2666,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			if logAwaitedLoads && haveWaiters {
 				log.Infof("MemoryFile(%p): awaited opid %d complete, read %d bytes: %v", op.amfl.f, c.ID, op.total, op.frs)
 			}
-			if amfl.lazyBytes != 0 && amfl.lazyAwaitedBytes*100 >= amfl.lazyBytes*lazyEagerPercent {
+			if amfl.lazyBytes != 0 && amfl.touchedBytes*100 >= amfl.lazyBytes*lazyEagerPercent {
 				amfl.eagerLocked()
 			}
 			// Keep amfl.minUnloaded up to date. We can only determine this
