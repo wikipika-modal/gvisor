@@ -141,6 +141,11 @@ type PositionedWriter interface {
 	// Preconditions: As for AsyncWriter.AddWritev, and len(srcFRs) <
 	// AsyncWriter.MaxRanges().
 	AddWritevAt(id int, off uint64, priority bool, total uint64, srcFile SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec)
+
+	// PriorityUnit returns the alignment, a power of two no smaller than a
+	// page, to which a caller should expand a range it is blocked on before
+	// writing it with priority, or 0 for the caller's choice.
+	PriorityUnit() uint64
 }
 
 // AsyncWriter represents a file supporting asynchronous sequential writes.

@@ -93,6 +93,9 @@ func (w *HeldWriter) Reserve(uint64) {}
 // Finalize implements stateio.AsyncWriter.Finalize.
 func (w *HeldWriter) Finalize() error { return nil }
 
+// PriorityUnit implements stateio.PositionedWriter.PriorityUnit.
+func (w *HeldWriter) PriorityUnit() uint64 { return 0 }
+
 // AddWrite implements stateio.AsyncWriter.AddWrite.
 func (w *HeldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")

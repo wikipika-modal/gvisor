@@ -702,11 +702,18 @@ type AsyncPagesFileSave struct {
 	err error
 
 	// The following fields are used only by early-resume saving; see
-	// EnableEarlyResume. earlyResume, pw and prioReserve are immutable after
-	// EnableEarlyResume; the remaining fields are protected by mu.
-	earlyResume bool
-	pw          stateio.PositionedWriter
-	prioReserve int
+	// EnableEarlyResume. earlyResume, pw, prioUnit, prioReserve,
+	// maxPrioInflight are immutable after EnableEarlyResume; the
+	// remaining fields are protected by mu.
+	earlyResume     bool
+	pw              stateio.PositionedWriter
+	prioUnit        uint64
+	prioReserve     int
+	maxPrioInflight int
+
+	// prioInflight is the number of priority writes enqueued and not yet
+	// completed.
+	prioInflight int
 
 	// erFiles are the MemoryFiles being saved, in pages file order.
 	erFiles []*asyncMemoryFileSave

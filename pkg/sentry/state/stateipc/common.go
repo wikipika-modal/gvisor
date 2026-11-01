@@ -64,6 +64,11 @@ type OpenResponse struct {
 	// MaxParallel is the maximum number of parallel read/write requests.
 	MaxParallel uint32 `json:"max_parallel"`
 
+	// PriorityUnit, if not zero, is the alignment to which the client should
+	// expand ranges it is blocked on before writing them with
+	// writeSubmissionFlagPriority.
+	PriorityUnit uint64 `json:"priority_unit"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload

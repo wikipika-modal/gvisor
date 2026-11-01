@@ -70,6 +70,7 @@ func (w *heldWriter) MaxWriteBytes() uint64 { return uint64(hostarch.PageSize) }
 func (w *heldWriter) MaxRanges() int        { return 4 }
 func (w *heldWriter) MaxParallel() int      { return 8 }
 func (w *heldWriter) Reserve(uint64)        {}
+func (w *heldWriter) PriorityUnit() uint64  { return hostarch.PageSize }
 
 func (w *heldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")
