@@ -137,6 +137,13 @@ type LazyReader interface {
 	Lazy() bool
 }
 
+// SourceRetainer is implemented by AsyncWriters that may still read a write's
+// source after completing it. Their sources must not change after the write
+// completes, even if the sandbox exits.
+type SourceRetainer interface {
+	RetainsSources() bool
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

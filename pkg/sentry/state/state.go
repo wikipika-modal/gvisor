@@ -160,6 +160,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	}
 	addSaveMetadata(opts.Metadata)
 
+	sr, ok := opts.PagesFile.(stateio.SourceRetainer)
+	retainsPages := ok && sr.RetainsSources()
+
 	// Open the statefile.
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
 	if err != nil {
@@ -184,6 +187,12 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	}
 	if opts.Resume {
 		k.BeforeResume(ctx)
+	} else if err == nil && retainsPages {
+		// Exiting tasks would write to and free memory that the pages file
+		// server still reads, so leave every task stopped. The caller destroys
+		// the sandbox.
+		log.Infof("Pages file server retains sources: leaving tasks stopped")
+		k.Pause()
 	} else {
 		// Kill the sandbox.
 		k.Kill(linux.WaitStatusExit(0))

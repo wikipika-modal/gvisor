@@ -67,6 +67,10 @@ type OpenResponse struct {
 	// Lazy asks the client to read only what it waits for.
 	Lazy bool `json:"lazy"`
 
+	// RetainsSources tells the client that the server may read a write's
+	// source after completing it.
+	RetainsSources bool `json:"retains_sources"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload

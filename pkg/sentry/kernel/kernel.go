@@ -732,15 +732,15 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	return nil
 }
 
-// quiescePausedAnd runs f with kernel timers and CPU-clock updates paused.
-// f runs synchronously with k.extMu held and must not release or reacquire it.
+// quiescePausedAnd runs f with kernel timers and CPU-clock updates paused,
+// and resumes them afterwards if resumeTime is true. f runs synchronously with k.extMu held and must not release or reacquire it.
 //
 // Preconditions: The kernel must be paused throughout the call.
 //
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
-func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
+func (k *Kernel) quiescePausedAnd(ctx context.Context, resumeTime bool, f func() error) error {
 	// Do not allow other Kernel methods to affect it while it's being saved.
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
@@ -751,7 +751,9 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 
 	// Stop time.
 	k.pauseTimeLocked(ctx)
-	defer k.resumeTimeLocked(ctx)
+	if resumeTime {
+		defer k.resumeTimeLocked(ctx)
+	}
 
 	// Evict all evictable MemoryFile allocations.
 	k.mf.StartEvictions()
@@ -814,7 +816,11 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	}
 	defer fsCleanup.Clean()
 
-	return k.quiescePausedAnd(ctx, func() error {
+	// A pages file server that retains sources reads saved memory after the
+	// save, so time, which updates the VDSO parameter page, stays stopped.
+	sr, ok := pagesFile.(stateio.SourceRetainer)
+	resumeTime := resume || !ok || !sr.RetainsSources()
+	return k.quiescePausedAnd(ctx, resumeTime, func() error {
 		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
 }
