@@ -46,11 +46,8 @@ go_test(
         "//pkg/sentry/fsimpl/tmpfs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
-        "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/stateio/stateiotest",
         "//pkg/sentry/vfs",
-        "//pkg/sync",
-        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
