@@ -148,3 +148,39 @@ func TestSaveToPreservesContents(t *testing.T) {
 		})
 	}
 }
+
+func TestSaveToExcludesZeroPagesScannedInParallel(t *testing.T) {
+	const pages = 4 * zeroPageScanMinPages
+	f := newSaveTestMemoryFile(t, false)
+	fr, err := f.Allocate(pages*hostarch.PageSize, AllocOpts{Mode: AllocateUncommitted})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	t.Cleanup(func() { f.DecRef(fr) })
+	want := make([]byte, fr.Length())
+	for i := uint64(0); i < pages; i += 3 {
+		want[i*hostarch.PageSize+17] = byte(i%255 + 1)
+	}
+	if _, err := unix.Pwrite(f.FD(), want, int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite: %v", err)
+	}
+
+	var checkpoint bytes.Buffer
+	if err := f.SaveTo(context.Background(), &checkpoint, &SaveOpts{ExcludeCommittedZeroPages: true}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	if got, want := f.knownCommittedBytes, uint64((pages+2)/3*hostarch.PageSize); got != want {
+		t.Errorf("knownCommittedBytes: got %d, want %d", got, want)
+	}
+
+	restored := newSaveTestMemoryFile(t, false)
+	if err := restored.LoadFrom(context.Background(), &checkpoint, &LoadOpts{}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	t.Cleanup(func() { restored.DecRef(fr) })
+	var got []byte
+	restored.forEachMappingSlice(fr, func(bs []byte) { got = append(got, bs...) })
+	if !bytes.Equal(got, want) {
+		t.Error("restored contents differ from saved contents")
+	}
+}
