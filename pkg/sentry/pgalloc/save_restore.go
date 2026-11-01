@@ -182,6 +182,9 @@ type SaveOpts struct {
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if f.IsEarlyResumeSaving() {
+		return fmt.Errorf("a previous save is still saving pages")
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -218,6 +221,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			pf: opts.PagesFile,
 			sf: sf,
 		}
+		if amfs.pf.earlyResume {
+			if err := amfs.registerEarlyResume(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// We only want to explicitly include pages containing non-zero bytes in
@@ -248,10 +256,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
 			amfs.pf.mu.Lock()
-			amfs.pf.unsaved.PushBack(apsRange{
-				amfs:      amfs,
-				FileRange: fr,
-			})
+			if amfs.pf.earlyResume {
+				amfs.addUnsavedLocked(fr, amfs.pf.saveOff)
+			} else {
+				amfs.pf.unsaved.PushBack(apsRange{
+					amfs:      amfs,
+					FileRange: fr,
+				})
+			}
 			amfs.pf.saveOff += amount
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
@@ -677,6 +689,35 @@ type AsyncPagesFileSave struct {
 	// AsyncPagesFileSave.err is never returned to application syscalls and
 	// hence is not constrained to being an errno.
 	err error
+
+	// The following fields are used only by early-resume saving; see
+	// EnableEarlyResume. earlyResume, pw and prioReserve are immutable after
+	// EnableEarlyResume; the remaining fields are protected by mu.
+	earlyResume bool
+	pw          stateio.PositionedWriter
+	prioReserve int
+
+	// erFiles are the MemoryFiles being saved, in pages file order.
+	erFiles []*asyncMemoryFileSave
+
+	// erCursorFile and erCursor are the index into erFiles and MemoryFile
+	// offset before which all pages are saved, inflight or prioritized.
+	erCursorFile int
+	erCursor     uint64
+
+	// priority holds ranges awaited by writers.
+	priority ringdeque.Deque[apsRange]
+
+	// savedCh is closed and replaced whenever writes complete.
+	savedCh chan struct{}
+
+	// erDone is true once saving has ended.
+	erDone bool
+
+	prioOps   uint64
+	prioBytes uint64
+	erWaits   uint64
+	erWaitDur time.Duration
 }
 
 // Possible events in AsyncPagesFileSave.stStatus:
@@ -692,6 +733,10 @@ type asyncMemoryFileSave struct {
 	f  *MemoryFile
 	pf *AsyncPagesFileSave
 	sf stateio.SourceFile
+
+	// unsaved tracks pages that have not been saved, during early-resume
+	// saving. unsaved is protected by pf.mu.
+	unsaved apsUnsavedSet
 }
 
 type apsRange struct {
@@ -713,6 +758,11 @@ type apsOp struct {
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// For early-resume saving, off is the pages file offset of the write, and
+	// priority is true if a writer is waiting for it.
+	off      uint64
+	priority bool
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
@@ -782,7 +832,9 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 
 	apfs.qavail--
 	apfs.curOp = nil
-	if len(op.frs) == 1 && len(op.iovecs) == 1 {
+	if apfs.earlyResume {
+		apfs.enqueueEarlyResumeOp(op)
+	} else if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized write to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncWriter implementation.
 		apfs.aw.AddWrite(int(apfs.curOpID), op.amfs.sf, op.frs[0], stateio.SliceFromIovec(op.iovecs[0]))
@@ -894,6 +946,9 @@ func (apfs *AsyncPagesFileSave) main() {
 		if apfs.err != nil {
 			log.Warningf("Async page saving failed: %v", apfs.err)
 		}
+		if apfs.earlyResume {
+			apfs.endEarlyResume()
+		}
 		if err := apfs.aw.Close(); err != nil {
 			// Saving success is independent of err, so log it rather than
 			// propagating it.
@@ -967,6 +1022,9 @@ func (apfs *AsyncPagesFileSave) main() {
 		}
 		apfs.mu.Lock()
 		apfs.aw.Reserve(apfs.saveOff)
+		if apfs.earlyResume {
+			apfs.enqueueEarlyResumeLocked()
+		}
 		for !apfs.unsaved.Empty() {
 			mfr := apfs.unsaved.PeekFrontPtr()
 			n := apfs.enqueueRange(*mfr)
@@ -1065,6 +1123,12 @@ func (apfs *AsyncPagesFileSave) main() {
 			if full {
 				apfs.bytesFull += op.total
 			}
+			if apfs.earlyResume {
+				apfs.savedLocked(op)
+			}
+		}
+		if apfs.earlyResume {
+			apfs.wakeSaveWaitersLocked()
 		}
 		apfs.mu.Unlock()
 	}

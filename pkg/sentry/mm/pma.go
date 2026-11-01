@@ -56,7 +56,7 @@ func (mm *MemoryManager) existingPMAsLocked(ar hostarch.AddrRange, at hostarch.A
 		if !perms.SupersetOf(at) {
 			return pmaIterator{}
 		}
-		if needInternalMappings && pma.internalMappings.IsEmpty() {
+		if needInternalMappings && pma.internalMappings.IsEmpty() && !pseg.internalMappingsUncached() {
 			return pmaIterator{}
 		}
 
@@ -899,7 +899,7 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
 //   - pseg.Range().Contains(ar.Start).
 //
 // +checklocksread:mm.activeMu
-func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.AddrRange) safemem.BlockSeq {
+func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
@@ -910,16 +910,18 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 	}
 
 	if ar.End <= pseg.End() {
-		// Since only one pma is involved, we can use pma.internalMappings
+		// Since only one pma is involved, we can return its internal mappings
 		// directly, avoiding a slice allocation.
-		offset := uint64(ar.Start - pseg.Start())
-		return pseg.ValuePtr().internalMappings.DropFirst64(offset).TakeFirst64(uint64(ar.Length()))
+		return pseg.internalMappingsOfLocked(ar)
 	}
 
 	var ims []safemem.Block
 	for {
-		pr := pseg.Range().Intersect(ar)
-		for pims := pseg.ValuePtr().internalMappings.DropFirst64(uint64(pr.Start - pseg.Start())).TakeFirst64(uint64(pr.Length())); !pims.IsEmpty(); pims = pims.Tail() {
+		pims, err := pseg.internalMappingsOfLocked(pseg.Range().Intersect(ar))
+		if err != nil {
+			return safemem.BlockSeq{}, err
+		}
+		for ; !pims.IsEmpty(); pims = pims.Tail() {
 			ims = append(ims, pims.Head())
 		}
 		if ar.End <= pseg.End() {
@@ -927,7 +929,7 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 		}
 		pseg = pseg.NextSegment()
 	}
-	return safemem.BlockSeqFromSlice(ims)
+	return safemem.BlockSeqFromSlice(ims), nil
 }
 
 // vecInternalMappingsLocked returns cached internal mappings for addresses in
@@ -938,18 +940,22 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 // in ars.
 //
 // +checklocksread:mm.activeMu
-func (mm *MemoryManager) vecInternalMappingsLocked(ars hostarch.AddrRangeSeq) safemem.BlockSeq {
+func (mm *MemoryManager) vecInternalMappingsLocked(ars hostarch.AddrRangeSeq) (safemem.BlockSeq, error) {
 	var ims []safemem.Block
 	for ; !ars.IsEmpty(); ars = ars.Tail() {
 		ar := ars.Head()
 		if ar.Length() == 0 {
 			continue
 		}
-		for pims := mm.internalMappingsLocked(mm.pmas.FindSegment(ar.Start), ar); !pims.IsEmpty(); pims = pims.Tail() {
+		pims, err := mm.internalMappingsLocked(mm.pmas.FindSegment(ar.Start), ar)
+		if err != nil {
+			return safemem.BlockSeq{}, err
+		}
+		for ; !pims.IsEmpty(); pims = pims.Tail() {
 			ims = append(ims, pims.Head())
 		}
 	}
-	return safemem.BlockSeqFromSlice(ims)
+	return safemem.BlockSeqFromSlice(ims), nil
 }
 
 // addRSSLocked updates the current and maximum resident set size of a
@@ -1041,28 +1047,54 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 	return mm.pmas.UpperBoundSegment(addr)
 }
 
-// getInternalMappingsLocked ensures that pseg.ValuePtr().internalMappings is
-// non-empty. The generated iterator identifies a set node and index, not its
-// MemoryManager, so checklocks cannot name the owning mutex.
+// getInternalMappingsLocked returns mappings for ar, caching the whole pma
+// unless an early-resume save requires each access to wait for its own pages.
+// The generated iterator has no MemoryManager, so checklocks cannot name its mutex.
 //
 // Preconditions: the owning MemoryManager's activeMu is held for writing.
-func (pseg pmaIterator) getInternalMappingsLocked() error {
+func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
-	if pma.internalMappings.IsEmpty() {
-		// This must use maxPerms (instead of perms) because some permission
-		// constraints are only visible to vmas; for example, mappings of
-		// read-only files have vma.maxPerms.Write unset, but this may not be
-		// visible to the memmap.Mappable.
-		perms := pma.maxPerms
-		// We will never execute application code through an internal mapping.
-		perms.Execute = false
-		ims, err := pma.file.MapInternal(pseg.fileRange(), perms)
+	if pma.internalMappings.IsEmpty() && !pseg.internalMappingsUncached() {
+		ims, err := pseg.internalMappingsOfLocked(pseg.Range())
 		if err != nil {
-			return err
+			return safemem.BlockSeq{}, err
 		}
 		pma.internalMappings = ims
 	}
-	return nil
+	return pseg.internalMappingsOfLocked(ar)
+}
+
+// internalMappingsOfLocked returns internal mappings for addresses in ar,
+// from pseg.ValuePtr().internalMappings if it is non-empty and from
+// memmap.File.MapInternal otherwise.
+//
+// Preconditions:
+//   - The owning MemoryManager's activeMu is locked.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
+func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
+	pma := pseg.ValuePtr()
+	if !pma.internalMappings.IsEmpty() {
+		return pma.internalMappings.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length())), nil
+	}
+	// This must use maxPerms (instead of perms) because some permission
+	// constraints are only visible to vmas; for example, mappings of read-only
+	// files have vma.maxPerms.Write unset, but this may not be visible to the
+	// memmap.Mappable.
+	perms := pma.maxPerms
+	// We will never execute application code through an internal mapping.
+	perms.Execute = false
+	return pma.file.MapInternal(pseg.fileRangeOf(ar), perms)
+}
+
+// internalMappingsUncached returns true if internal mappings for pseg should
+// not be cached, so that each access waits only for saving the pages it
+// accesses rather than the whole pma. Uncached internal mappings
+// do not mutate the pma, so they only require activeMu to be locked for
+// reading.
+func (pseg pmaIterator) internalMappingsUncached() bool {
+	mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+	return ok && mf.IsEarlyResumeSaving()
 }
 
 func (pseg pmaIterator) fileRange() memmap.FileRange {

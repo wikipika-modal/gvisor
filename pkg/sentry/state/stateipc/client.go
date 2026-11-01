@@ -383,6 +383,28 @@ func (rw *asyncReadWriter) AddWritev(id int, total uint64, srcFile stateio.Sourc
 	rw.numSubmissions++
 }
 
+// AddWritevAt implements stateio.PositionedWriter.AddWritevAt.
+func (rw *asyncReadWriter) AddWritevAt(id int, off uint64, priority bool, total uint64, srcFile stateio.SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec) {
+	if rw.ensureConnected() != nil {
+		return
+	}
+	flags := uint32(writeSubmissionFlagOffset)
+	if priority {
+		flags |= writeSubmissionFlagPriority
+	}
+	subHdr := rw.ioep.scanWriteSubmissionHeader()
+	numRanges := uint32(len(srcFRs))
+	*subHdr = writeSubmissionHeader{
+		ID:        uint32(id),
+		SrcHandle: uint32(srcFile.(clientFileHandle)),
+		NumRanges: numRanges,
+		Flags:     flags,
+	}
+	*rw.ioep.scanUint64() = off
+	copy(rw.ioep.scanFileRanges(numRanges), srcFRs)
+	rw.numSubmissions++
+}
+
 // Wait implements stateio.AsyncReader.Wait and stateio.AsyncWriter.Wait.
 func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
 	if err := rw.ensureConnected(); err != nil {

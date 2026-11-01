@@ -68,6 +68,12 @@ type SaveOpts struct {
 	// Resume indicates if the statefile is used for save-resume.
 	Resume bool
 
+	// EarlyResume resumes the kernel as soon as all state other than page
+	// contents has been saved, while pages are saved in the background and
+	// writes to unsaved pages wait for them to be saved. It requires Resume
+	// and PagesFile.
+	EarlyResume bool
+
 	// Autosave indicates if the statefile is used for autosave.
 	Autosave bool
 
@@ -128,9 +134,12 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
 	k.ReceiveTaskStates()
+	resumed := false
 	defer func() {
-		k.Unpause()
-		log.Infof("Tasks resumed after save.")
+		if !resumed {
+			k.Unpause()
+			log.Infof("Tasks resumed after save.")
+		}
 	}()
 
 	w.Stop()
@@ -167,10 +176,19 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		var waitPages func() error
+		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.EarlyResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
+		if err == nil && waitPages != nil {
+			k.BeforeResume(ctx)
+			k.Unpause()
+			resumed = true
+			log.Infof("Tasks resumed after save, before saving pages.")
+			err = waitPages()
+			log.Infof("Pages saved after resuming.")
+		}
 	}
 
 	t1, _ := CPUTime()
@@ -182,7 +200,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Warningf("Save failed: exiting... %v", err)
 		k.SetSaveError(err)
 	}
-	if opts.Resume {
+	if resumed {
+		// k.BeforeResume() was called before resuming.
+	} else if opts.Resume {
 		k.BeforeResume(ctx)
 	} else {
 		// Kill the sandbox.

@@ -129,6 +129,7 @@ go_library(
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
         "debug.go",
+        "early_resume_save.go",
         "io.go",
         "io_list.go",
         "lifecycle.go",

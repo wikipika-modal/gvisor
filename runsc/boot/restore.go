@@ -864,6 +864,9 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	l.saveMu.Lock()
 	defer l.saveMu.Unlock()
 
+	if saveOpts.EarlyResume && (l.root.conf.NVProxy || l.root.conf.TPUProxy) {
+		return fmt.Errorf("early resume is unsupported with device proxies, which can write to memory without faulting")
+	}
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.

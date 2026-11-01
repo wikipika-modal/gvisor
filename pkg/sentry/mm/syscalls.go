@@ -63,6 +63,13 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		mm.activeMu.Unlock()
 		return err
 	}
+	if at.Write {
+		if mf, fr, ok := pseg.unsavedFileRange(ar); ok {
+			mm.activeMu.Unlock()
+			mf.AwaitSaved(fr)
+			return mm.HandleUserFault(ctx, addr, at, sp)
+		}
+	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
