@@ -160,6 +160,7 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		prefetch:    resp.Prefetch,
 		retains:     resp.RetainsSources,
 		holds:       resp.HoldsWrites,
+		prioUnit:    resp.PriorityUnit,
 		handle:      resp.Handle,
 		isReader:    mode == OpenModeRead,
 	}
@@ -196,6 +197,7 @@ type asyncReadWriter struct {
 	prefetch    []memmap.FileRange
 	retains     bool
 	holds       bool
+	prioUnit    uint64
 	handle      uint32
 	isReader    bool
 
@@ -370,6 +372,11 @@ func (rw *asyncReadWriter) Prefetch() []memmap.FileRange {
 // HoldsWrites implements stateio.PositionedWriter.HoldsWrites.
 func (rw *asyncReadWriter) HoldsWrites() bool {
 	return rw.holds
+}
+
+// PriorityUnit implements stateio.PositionedWriter.PriorityUnit.
+func (rw *asyncReadWriter) PriorityUnit() uint64 {
+	return rw.prioUnit
 }
 
 // RetainsSources implements stateio.SourceRetainer.RetainsSources.

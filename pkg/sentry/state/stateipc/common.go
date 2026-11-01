@@ -81,6 +81,11 @@ type OpenResponse struct {
 	// writeSubmissionFlagRepeat.
 	HoldsWrites bool `json:"holds_writes"`
 
+	// PriorityUnit, if not zero, is the alignment to which the client should
+	// expand ranges it is blocked on before writing them with
+	// writeSubmissionFlagPriority.
+	PriorityUnit uint64 `json:"priority_unit"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload

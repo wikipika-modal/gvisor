@@ -37,8 +37,13 @@ import (
 
 // earlyResumePriorityUnit is the alignment to which ranges awaited by writers
 // are expanded when they are moved to the front of the write queue, so that
-// sequential writers wait less often.
+// sequential writers wait less often, unless the pages file's
+// PositionedWriter.PriorityUnit() says otherwise.
 const earlyResumePriorityUnit = 2 << 20
+
+// maxEarlyResumePriorityUnit is the largest PositionedWriter.PriorityUnit()
+// accepted.
+const maxEarlyResumePriorityUnit = 1 << 30
 
 // apsUnsavedInfo is the value type of asyncMemoryFileSave.unsaved.
 type apsUnsavedInfo struct {
@@ -101,10 +106,19 @@ func (apfs *AsyncPagesFileSave) EnableEarlyResume() error {
 	if maxRanges < 2 {
 		return fmt.Errorf("%w: pages file MaxRanges() (%d) is below 2", ErrEarlyResumeUnsupported, maxRanges)
 	}
+	prioUnit := uint64(earlyResumePriorityUnit)
+	if unit := pw.PriorityUnit(); unit != 0 {
+		if unit < hostarch.PageSize || unit > maxEarlyResumePriorityUnit || unit&(unit-1) != 0 {
+			return fmt.Errorf("pages file PriorityUnit() (%d) is not a power of two between a page and %d bytes", unit, maxEarlyResumePriorityUnit)
+		}
+		prioUnit = unit
+	}
 	apfs.pw = pw
 	apfs.earlyResume = true
 	apfs.repeats = pw.HoldsWrites()
+	apfs.prioUnit = prioUnit
 	apfs.prioReserve = min(4, apfs.qavail/4)
+	apfs.maxPrioInflight = max(1, apfs.qavail/2)
 	apfs.savedCh = make(chan struct{})
 	for i := range apfs.ops {
 		op := &apfs.ops[i]
@@ -132,11 +146,13 @@ func (amfs *asyncMemoryFileSave) addUnsavedLocked(fr memmap.FileRange, off uint6
 }
 
 // enqueueEarlyResumeLocked enqueues priority writes, repeating writes that the
-// pages file may hold, then writes in pages file order.
+// pages file may hold, then writes in pages file order. Priority writes use at
+// most half of the queue, so that writes in pages file order progress even
+// while the pages file holds priority writes.
 //
 // Preconditions: apfs.mu must be locked.
 func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
-	for apfs.canEnqueue() && !apfs.priority.Empty() {
+	for apfs.canEnqueue() && apfs.prioInflight < apfs.maxPrioInflight && !apfs.priority.Empty() {
 		pr := apfs.priority.PeekFrontPtr()
 		useg := pr.amfs.unsaved.LowerBoundSegment(pr.Start)
 		for useg.Ok() && useg.Start() < pr.End && (!useg.ValuePtr().priority || useg.ValuePtr().prioritySent) {
@@ -231,6 +247,7 @@ func (apfs *AsyncPagesFileSave) enqueueUnsaved(amfs *asyncMemoryFileSave, useg a
 // enqueueEarlyResumeOp enqueues apfs.curOp.
 func (apfs *AsyncPagesFileSave) enqueueEarlyResumeOp(op *apsOp) {
 	if op.flags&stateio.WritePriority != 0 {
+		apfs.prioInflight++
 		apfs.prioOps++
 		apfs.prioBytes += op.total
 	}
@@ -244,6 +261,9 @@ func (apfs *AsyncPagesFileSave) enqueueEarlyResumeOp(op *apsOp) {
 //
 // Preconditions: apfs.mu must be locked.
 func (apfs *AsyncPagesFileSave) savedLocked(op *apsOp) {
+	if op.flags&stateio.WritePriority != 0 {
+		apfs.prioInflight--
+	}
 	for _, fr := range op.frs {
 		op.amfs.unsaved.RemoveRange(fr)
 	}
@@ -267,8 +287,8 @@ func (apfs *AsyncPagesFileSave) endEarlyResume() {
 		amfs.f.earlyResumeSave.CompareAndSwap(amfs, nil)
 	}
 	apfs.wakeSaveWaitersLocked()
-	log.Infof("Early-resume page saving: %d priority writes (%d bytes, %d repeats); %d waits for %s",
-		apfs.prioOps, apfs.prioBytes, apfs.repeatOps, apfs.erWaits, apfs.erWaitDur)
+	log.Infof("Early-resume page saving: %d priority writes (%d bytes, %d repeats, %d-byte unit); %d waits for %s",
+		apfs.prioOps, apfs.prioBytes, apfs.repeatOps, apfs.prioUnit, apfs.erWaits, apfs.erWaitDur)
 }
 
 // IsEarlyResumeSaving returns true if pages of f may still be unsaved after an
@@ -326,11 +346,11 @@ func (f *MemoryFile) UnsavedRanges(fr memmap.FileRange, frs []memmap.FileRange) 
 func (amfs *asyncMemoryFileSave) awaitSaved(fr memmap.FileRange) {
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = hostarch.MustPageRoundUp(fr.End)
-	pfr := memmap.FileRange{
-		Start: fr.Start &^ (earlyResumePriorityUnit - 1),
-		End:   (fr.End + earlyResumePriorityUnit - 1) &^ (earlyResumePriorityUnit - 1),
-	}
 	apfs := amfs.pf
+	pfr := memmap.FileRange{
+		Start: fr.Start &^ (apfs.prioUnit - 1),
+		End:   (fr.End + apfs.prioUnit - 1) &^ (apfs.prioUnit - 1),
+	}
 	apfs.mu.Lock()
 	if apfs.erDone || amfs.unsaved.IsEmptyRange(fr) {
 		apfs.mu.Unlock()

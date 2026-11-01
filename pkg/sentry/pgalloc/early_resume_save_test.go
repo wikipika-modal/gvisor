@@ -30,21 +30,29 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
-// heldWriter completes priority writes at once, and other writes only after
-// release() or, if holds is true, when a repeat of them arrives. It copies each
-// write's source when completing it, as an external server would.
+// heldWriter completes priority writes at once, unless holdPriority is true,
+// and other writes only after release() or completeNormal(), or, if holds is
+// true, when a repeat of them arrives. It copies each write's source when
+// completing it, as an external server would.
 type heldWriter struct {
 	stateio.NoRegisterClientFD
 
-	mu        sync.Mutex
-	cond      sync.Cond
-	holds     bool
-	released  bool
-	pending   []heldWrite
-	file      []byte
-	priority  int
-	repeats   int
-	finalized bool
+	mu           sync.Mutex
+	cond         sync.Cond
+	holds        bool
+	holdPriority bool
+	unit         uint64
+	normalDone   bool
+	released     bool
+	pending      []heldWrite
+	file         []byte
+	priority     int
+	repeats      int
+	finalized    bool
+
+	priorityBytes      uint64
+	pendingPriority    int
+	maxPendingPriority int
 }
 
 type heldWrite struct {
@@ -75,6 +83,22 @@ func (w *heldWriter) release() {
 	w.cond.Broadcast()
 }
 
+// completeNormal stops holding writes other than priority writes.
+func (w *heldWriter) completeNormal() {
+	w.mu.Lock()
+	w.normalDone = true
+	w.mu.Unlock()
+	w.cond.Broadcast()
+}
+
+// stats returns the bytes of priority writes so far, and the most priority
+// writes pending at once.
+func (w *heldWriter) stats() (uint64, int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.priorityBytes, w.maxPendingPriority
+}
+
 // holding returns true if a write at off is held.
 func (w *heldWriter) holding(off uint64) bool {
 	w.mu.Lock()
@@ -93,6 +117,7 @@ func (w *heldWriter) MaxRanges() int        { return 4 }
 func (w *heldWriter) MaxParallel() int      { return 8 }
 func (w *heldWriter) Reserve(uint64)        {}
 func (w *heldWriter) HoldsWrites() bool     { return w.holds }
+func (w *heldWriter) PriorityUnit() uint64  { return w.unit }
 
 func (w *heldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")
@@ -110,6 +135,9 @@ func (w *heldWriter) AddWritevAt(id int, off uint64, flags stateio.WriteFlags, t
 	}
 	if flags&stateio.WritePriority != 0 {
 		w.priority++
+		w.priorityBytes += total
+		w.pendingPriority++
+		w.maxPendingPriority = max(w.maxPendingPriority, w.pendingPriority)
 	}
 	if flags&stateio.WriteRepeat != 0 {
 		w.repeats++
@@ -139,9 +167,17 @@ func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 		var rest []heldWrite
 		for i := range w.pending {
 			hw := &w.pending[i]
-			if hw.flags&stateio.WritePriority == 0 && !w.released && !w.repeated(hw) {
+			priority := hw.flags&stateio.WritePriority != 0
+			held := !w.normalDone
+			if priority {
+				held = w.holdPriority
+			}
+			if held && !w.released && !w.repeated(hw) {
 				rest = append(rest, *hw)
 				continue
+			}
+			if priority {
+				w.pendingPriority--
 			}
 			off := hw.off
 			for _, iov := range hw.srcs {
@@ -290,4 +326,56 @@ func TestEarlyResumeRefusedWithoutPositionedWrites(t *testing.T) {
 	if apfs.earlyResume {
 		t.Fatalf("early resume enabled after refusal")
 	}
+}
+
+func TestEarlyResumeSaveUsesPriorityUnit(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(false)
+	w.unit = hostarch.PageSize
+	fr, want, done := startEarlyResumeSave(t, f, w)
+
+	if _, err := f.MapInternal(testPage(fr, 12), hostarch.Write); err != nil {
+		t.Fatalf("MapInternal(Write): %v", err)
+	}
+	if got, _ := w.stats(); got != hostarch.PageSize {
+		t.Errorf("priority writes of %d bytes, want one page", got)
+	}
+
+	finishEarlyResumeSave(t, f, w, want, done)
+}
+
+func TestEarlyResumeSaveLimitsHeldPriorityWrites(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(false)
+	w.unit = hostarch.PageSize
+	w.holdPriority = true
+	fr, want, done := startEarlyResumeSave(t, f, w)
+
+	for i := uint64(8); i < 16; i++ {
+		go f.AwaitSaved(testPage(fr, i))
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if _, n := w.stats(); n != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no priority writes sent")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Once other writes complete, held priority writes may take at most half
+	// of the queue, leaving the rest for pages 6 and 7.
+	w.completeNormal()
+	for deadline := time.Now().Add(10 * time.Second); f.HasUnsaved(testPage(fr, 6)) || f.HasUnsaved(testPage(fr, 7)); {
+		if time.Now().After(deadline) {
+			_, n := w.stats()
+			t.Fatalf("pages 6 and 7 unsaved with %d priority writes held", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, n := w.stats(); n > w.MaxParallel()/2 {
+		t.Errorf("%d priority writes held at once, want at most %d", n, w.MaxParallel()/2)
+	}
+
+	finishEarlyResumeSave(t, f, w, want, done)
 }

@@ -172,6 +172,11 @@ type PositionedWriter interface {
 	// write's source long after the write is added, in which case a caller
 	// blocked on an incomplete write may repeat it with WriteRepeat.
 	HoldsWrites() bool
+
+	// PriorityUnit returns the alignment, a power of two no smaller than a
+	// page, to which a caller should expand a range it is blocked on before
+	// writing it with WritePriority, or 0 for the caller's choice.
+	PriorityUnit() uint64
 }
 
 // WriteFlags qualifies a write added by PositionedWriter.AddWritevAt.
