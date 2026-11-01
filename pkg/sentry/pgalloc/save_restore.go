@@ -184,6 +184,10 @@ type SaveOpts struct {
 	ExcludeCommittedZeroPages bool
 }
 
+// lazyMinBytes is the smallest contiguous unloaded range that is loaded only
+// when awaited, when loading lazily.
+const lazyMinBytes = 32 << 20
+
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
 	if f.IsEarlyResumeSaving() {
@@ -1278,6 +1282,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			amfl.pf.mu.Lock()
 			defer amfl.pf.mu.Unlock()
 			amfl.lfDone = true
+			if amfl.pf.lazy {
+				amfl.markLazyLocked()
+				amfl.pf.lfStatus.Notify(aplLFPending)
+			}
 			if amfl.unloaded.IsEmpty() {
 				// The async page loader goroutine does this when it
 				// transitions amfl.unloaded from non-empty to empty with
@@ -1421,7 +1429,8 @@ type AsyncPagesFileLoad struct {
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
 
-	// If lazy is true, only awaited pages are loaded. lazy is immutable.
+	// If lazy is true, large unloaded ranges are only loaded when awaited
+	// (see asyncMemoryFileLoad.markLazyLocked). lazy is immutable.
 	lazy bool
 
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
@@ -1509,6 +1518,9 @@ type aplUnloadedInfo struct {
 
 	// started is true if a read has been enqueued for these pages.
 	started bool
+
+	// lazy is true if these pages are only loaded when awaited.
+	lazy bool
 
 	// waiters queues goroutines waiting for these pages to be loaded.
 	waiters []*aplWaiter
@@ -1718,6 +1730,20 @@ func (apfl *AsyncPagesFileLoad) reapLoaded() bool {
 		amfl = next
 	}
 	return !apfl.amfls.Empty()
+}
+
+// markLazyLocked marks unloaded ranges of at least lazyMinBytes as loaded
+// only when awaited. Smaller ones are usually small, scattered allocations
+// that a fault would load whole anyway, and loading each on demand would cost
+// one synchronous read per fault, so they are still loaded in the background.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) markLazyLocked() {
+	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+		if ulseg.Range().Length() >= lazyMinBytes {
+			ulseg.ValuePtr().lazy = true
+		}
+	}
 }
 
 // Preconditions: apfl.amflsMu and apfl.mu must be locked.
@@ -2034,7 +2060,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() && !apfl.lazy {
+		if apfl.canEnqueue() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -2048,13 +2074,17 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// awaited loads vs. elevated disk latency.
 		amflsLoop:
 			for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+				if apfl.lazy && !amfl.lfDone {
+					// Lazy ranges are not marked yet.
+					continue
+				}
 				amfl.f.mu.Lock()
 				apfl.mu.Lock()
 				ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
 				for ulseg.Ok() {
 					ul := ulseg.ValuePtr()
 					ulFR := ulseg.Range()
-					if ul.started {
+					if ul.started || ul.lazy {
 						amfl.minUnstarted = ulFR.End
 						ulseg = ulseg.NextSegment()
 						continue
@@ -2104,7 +2134,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				continue
 			}
 			if ev&aplLFDone != 0 && apfl.lazy && apfl.reapLoaded() {
-				// Pages remain unloaded until something waits for them.
+				// Lazy ranges remain unloaded until something waits for them.
 				apfl.lfStatus.WaitFor(aplLazyWake)
 				continue
 			}
@@ -2260,6 +2290,9 @@ func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, 
 	if ul1.off+fr1.Length() != ul2.off {
 		return aplUnloadedInfo{}, false
 	}
+	if ul1.lazy != ul2.lazy {
+		return aplUnloadedInfo{}, false
+	}
 	if ul1.started || ul2.started || len(ul1.waiters) != 0 || len(ul2.waiters) != 0 {
 		// Merging would be counterproductive, since we expect that these
 		// segments will shortly be removed (separately) based on AIO
@@ -2273,6 +2306,7 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 	ul2 := aplUnloadedInfo{
 		off:     ul.off + (splitAt - fr.Start),
 		started: ul.started,
+		lazy:    ul.lazy,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be
