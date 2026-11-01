@@ -341,3 +341,39 @@ func TestSaveToExcludesZeroPagesScannedInParallel(t *testing.T) {
 		t.Error("restored contents differ from saved contents")
 	}
 }
+
+func TestSaveToTrustsPrescannedNonZeroPages(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	fr := allocateSaveTestPages(t, f)
+	pwritePage(t, f, fr, 1, 1)
+	pwritePage(t, f, fr, 2, 2)
+	pwritePage(t, f, fr, 4, 0)
+	prescan := f.PrescanZeroPages(true)
+	// Page 2 became zero and page 4 non-zero since prescanning.
+	pwritePage(t, f, fr, 2, 0)
+	pwritePage(t, f, fr, 4, 4)
+	want := make([]byte, fr.Length())
+	want[1*hostarch.PageSize+17] = 1
+	want[4*hostarch.PageSize+17] = 4
+
+	var checkpoint bytes.Buffer
+	if err := f.SaveTo(context.Background(), &checkpoint, &SaveOpts{ExcludeCommittedZeroPages: true, Prescan: prescan}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	// Page 2 is saved since prescanning found it non-zero; page 4 since
+	// SaveTo checked it.
+	if got, want := f.knownCommittedBytes, 3*uint64(hostarch.PageSize); got != want {
+		t.Errorf("knownCommittedBytes: got %d, want %d", got, want)
+	}
+
+	restored := newSaveTestMemoryFile(t, false)
+	if err := restored.LoadFrom(context.Background(), &checkpoint, &LoadOpts{}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	t.Cleanup(func() { restored.DecRef(fr) })
+	var got []byte
+	restored.forEachMappingSlice(fr, func(bs []byte) { got = append(got, bs...) })
+	if !bytes.Equal(got, want) {
+		t.Error("restored contents differ from contents at SaveTo")
+	}
+}
