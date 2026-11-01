@@ -208,7 +208,7 @@ const (
 	lazyStreams = 16
 )
 
-// Once pages have been awaited in lazyMinBytes-aligned windows as large as
+// Once pages have been awaited in lazyMinBytes-aligned windows holding
 // lazyEagerPercent of the pages a MemoryFile marked lazy, the rest are loaded
 // in the background as if loading eagerly.
 var lazyEagerPercent uint64 = 50
@@ -1706,7 +1706,7 @@ type asyncMemoryFileLoad struct {
 
 	// recent holds the most recently awaited ranges, and the windows
 	// readaheadLocked loaded around them, in a ring.
-	recent     [lazyStreams]memmap.FileRange
+	recent     [2 * lazyStreams]memmap.FileRange
 	recentNext int
 	tick       uint64
 
@@ -1716,7 +1716,8 @@ type asyncMemoryFileLoad struct {
 
 	// lazyBytes is the number of bytes markLazyLocked marked lazy, touched
 	// holds the starts of the lazyMinBytes-aligned windows in which unloaded
-	// lazy pages have been awaited since, and touchedBytes their total size.
+	// lazy pages have been awaited since, and touchedBytes how many lazy
+	// bytes were unloaded in them when they were first touched.
 	// All are protected by pf.mu.
 	lazyBytes    uint64
 	touched      map[uint64]struct{}
@@ -2080,9 +2081,14 @@ func (amfl *asyncMemoryFileLoad) readaheadLocked(fr memmap.FileRange, missed boo
 		case r.Length() == 0:
 			continue
 		case r.End == fr.Start:
-			s.window = memmap.FileRange{fr.End, fr.End + lazyReadaheadMinBytes}
+			start := max(fr.End, window.End)
+			s.window = memmap.FileRange{start, start + lazyReadaheadMinBytes}
 		case r.Start == fr.End && fr.Start != 0:
-			s.window = memmap.FileRange{fr.Start - min(lazyReadaheadMinBytes, fr.Start), fr.Start}
+			end := fr.Start
+			if window.Length() != 0 {
+				end = window.Start
+			}
+			s.window = memmap.FileRange{end - min(lazyReadaheadMinBytes, end), end}
 			s.reverse = true
 		default:
 			continue
@@ -2101,14 +2107,21 @@ func (amfl *asyncMemoryFileLoad) readaheadLocked(fr memmap.FileRange, missed boo
 	return window.Length() != 0
 }
 
-// touchLocked records that lazy pages in fr have been awaited.
+// touchLocked records that lazy pages in fr have been awaited, counting the
+// unloaded lazy pages in each window that is touched for the first time.
 //
 // Preconditions: amfl.pf.mu must be locked.
 func (amfl *asyncMemoryFileLoad) touchLocked(fr memmap.FileRange) {
 	for start := fr.Start &^ (lazyMinBytes - 1); start < fr.End; start += lazyMinBytes {
-		if _, ok := amfl.touched[start]; !ok {
-			amfl.touched[start] = struct{}{}
-			amfl.touchedBytes += lazyMinBytes
+		if _, ok := amfl.touched[start]; ok {
+			continue
+		}
+		amfl.touched[start] = struct{}{}
+		window := memmap.FileRange{start, start + lazyMinBytes}
+		for ulseg := amfl.unloaded.LowerBoundSegment(start); ulseg.Ok() && ulseg.Start() < window.End; ulseg = ulseg.NextSegment() {
+			if ulseg.ValuePtr().lazy {
+				amfl.touchedBytes += ulseg.Range().Intersect(window).Length()
+			}
 		}
 	}
 }

@@ -413,13 +413,14 @@ func TestLazyLoadReadsAheadOfAwaitsAfterLoadedWindows(t *testing.T) {
 		t.Fatalf("MapInternal: %v", err)
 	}
 	// The rest of window 0 is loaded before anything in it is awaited, so the
-	// next await is the first in window 1, which continues window 0.
+	// next await is the first in window 1, which continues window 0. Window 2
+	// is read ahead beyond the rest of window 1.
 	waitForReads(r, lazyMinBytes)
 	if _, err := restored.MapInternal(hugePage(1), hostarch.Read); err != nil {
 		t.Fatalf("MapInternal: %v", err)
 	}
-	if got, want := waitForReads(r, 2*lazyMinBytes+hostarch.HugePageSize), uint64(2*lazyMinBytes+hostarch.HugePageSize); got != want {
-		t.Errorf("read %d bytes, want %d", got, want)
+	if got := waitForReads(r, 3*lazyMinBytes); got != 3*lazyMinBytes {
+		t.Errorf("read %d bytes, want %d", got, 3*lazyMinBytes)
 	}
 	checkLoaded(t, restored, fr, want)
 }
@@ -456,6 +457,39 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	}
 	if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting in half of the windows, want %d", got, 4*lazyMinBytes)
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
+func TestLazyLoadCountsOnlyLazyPagesInTouchedWindows(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	fr, err := f.Allocate(4*lazyMinBytes, AllocOpts{Mode: AllocateUncommitted})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	t.Cleanup(func() { f.DecRef(fr) })
+	if fr.Start%lazyMinBytes != 0 {
+		t.Skipf("allocated %v, not aligned to %d", fr, lazyMinBytes)
+	}
+	// Two lazy ranges, each starting a page before the end of a window, with
+	// zero pages around them.
+	want := make([]byte, fr.Length())
+	for _, start := range []uint64{lazyMinBytes - hostarch.PageSize, 3*lazyMinBytes - hostarch.PageSize} {
+		for off := start; off < start+lazyMinBytes; off += hostarch.PageSize {
+			want[off+17] = 1
+		}
+	}
+	if _, err := unix.Pwrite(f.FD(), want, int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite: %v", err)
+	}
+	metadata, pages := saveToPagesFile(t, f, true)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
+	// Window 0 holds only the first page of the first range.
+	if _, err := restored.MapInternal(testPage(fr, lazyMinBytes/hostarch.PageSize-1), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if got := waitForReads(r, hostarch.PageSize); got != hostarch.PageSize {
+		t.Errorf("read %d bytes, want %d", got, hostarch.PageSize)
 	}
 	checkLoaded(t, restored, fr, want)
 }
