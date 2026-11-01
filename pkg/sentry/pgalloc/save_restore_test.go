@@ -154,11 +154,14 @@ func TestSaveToPreservesContents(t *testing.T) {
 
 type lazyReader struct {
 	stateio.AsyncReader
-	lazy  bool
-	bytes atomic.Uint64
+	lazy     bool
+	prefetch []memmap.FileRange
+	bytes    atomic.Uint64
 }
 
 func (r *lazyReader) Lazy() bool { return r.lazy }
+
+func (r *lazyReader) Prefetch() []memmap.FileRange { return r.prefetch }
 
 func (r *lazyReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
 	r.bytes.Add(uint64(len(dstMap)))
@@ -190,11 +193,11 @@ func saveToPagesFile(t *testing.T, f *MemoryFile, exclude bool) (metadata, pages
 }
 
 // loadPagesFile restores a MemoryFile saved by saveToPagesFile, loading
-// lazily if lazy is true. The returned channel receives the end of async
-// loading.
-func loadPagesFile(t *testing.T, metadata, pages *bytes.Buffer, fr memmap.FileRange, lazy bool) (*MemoryFile, *lazyReader, chan error) {
+// lazily if lazy is true, with the reader suggesting prefetch. The returned
+// channel receives the end of async loading.
+func loadPagesFile(t *testing.T, metadata, pages *bytes.Buffer, fr memmap.FileRange, lazy bool, prefetch ...memmap.FileRange) (*MemoryFile, *lazyReader, chan error) {
 	t.Helper()
-	r := &lazyReader{AsyncReader: stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 1<<20, 16, 4), lazy: lazy}
+	r := &lazyReader{AsyncReader: stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 1<<20, 16, 4), lazy: lazy, prefetch: prefetch}
 	loaded := make(chan error, 1)
 	apfl, err := StartAsyncPagesFileLoad(r, func(err error) { loaded <- err }, nil)
 	if err != nil {
@@ -252,12 +255,7 @@ func TestLazyLoadReadsOnlyAwaitedPages(t *testing.T) {
 	}
 	// The small range is loaded in the background; the large one only where
 	// awaited.
-	deadline := time.Now().Add(10 * time.Second)
-	for r.bytes.Load() < 2*hostarch.PageSize && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if got := r.bytes.Load(); got != 2*hostarch.PageSize {
+	if got := waitForReads(r, 2*hostarch.PageSize); got != 2*hostarch.PageSize {
 		t.Errorf("read %d bytes, want %d (one awaited page and the small range)", got, 2*hostarch.PageSize)
 	}
 	if !restored.IsAsyncLoading() {
@@ -278,6 +276,47 @@ func TestLazyLoadReadsOnlyAwaitedPages(t *testing.T) {
 			t.Error("restored contents differ from saved contents")
 		}
 	})
+}
+
+// waitForReads waits until r has read at least n bytes, then a little longer
+// for any reads beyond n, and returns how many bytes r has read.
+func waitForReads(r *lazyReader, n uint64) uint64 {
+	deadline := time.Now().Add(10 * time.Second)
+	for r.bytes.Load() < n && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	return r.bytes.Load()
+}
+
+func TestLazyLoadPrefetchesSuggestedRanges(t *testing.T) {
+	f, fr, want := newLazyTestMemoryFile(t)
+	metadata, pages := saveToPagesFile(t, f, false)
+	// The large range comes first in the pages file. Suggest pages 10 and 11
+	// of it, and part of page 12.
+	suggested := memmap.FileRange{10 * hostarch.PageSize, 12*hostarch.PageSize + 1}
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true, suggested)
+
+	// Pages 10 to 12 and the small range are loaded without being awaited.
+	const prefetched = 4 * hostarch.PageSize
+	if got := waitForReads(r, prefetched); got != prefetched {
+		t.Errorf("read %d bytes, want %d (three suggested pages and the small range)", got, prefetched)
+	}
+	if !restored.IsAsyncLoading() {
+		t.Fatal("the large range was loaded without being awaited")
+	}
+	pfr := memmap.FileRange{testPage(fr, 10).Start, testPage(fr, 12).End}
+	if _, err := restored.MapInternal(pfr, hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	restored.forEachMappingSlice(pfr, func(bs []byte) {
+		if !bytes.Equal(bs, want[10*hostarch.PageSize:13*hostarch.PageSize]) {
+			t.Error("prefetched contents differ from saved contents")
+		}
+	})
+	if got := r.bytes.Load(); got != prefetched {
+		t.Errorf("awaiting prefetched pages read %d more bytes", got-prefetched)
+	}
 }
 
 func TestSaveAfterLazyLoad(t *testing.T) {

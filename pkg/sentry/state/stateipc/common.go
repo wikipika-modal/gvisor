@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -66,6 +67,10 @@ type OpenResponse struct {
 
 	// Lazy asks the client to read only what it waits for.
 	Lazy bool `json:"lazy"`
+
+	// Prefetch suggests ranges of a lazily read file that the client should
+	// read without waiting for them.
+	Prefetch []memmap.FileRange `json:"prefetch"`
 
 	// RetainsSources tells the client that the server may read a write's
 	// source after completing it.

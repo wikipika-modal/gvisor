@@ -137,6 +137,15 @@ type LazyReader interface {
 	Lazy() bool
 }
 
+// PrefetchReader is implemented by lazy AsyncReaders that know which ranges
+// of their source are likely to be awaited soon, e.g. from a profile of an
+// earlier restore.
+type PrefetchReader interface {
+	// Prefetch returns ranges of the source, in source offsets, to load
+	// without waiting for anyone to await them.
+	Prefetch() []memmap.FileRange
+}
+
 // SourceRetainer is implemented by AsyncWriters that may still read a write's
 // source after completing it. Their sources must not change after the write
 // completes, even if the sandbox exits.
