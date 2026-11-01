@@ -1099,7 +1099,7 @@ func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem
 // reading.
 func (pseg pmaIterator) internalMappingsUncached() bool {
 	mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
-	return ok && mf.IsAsyncLoading() && pseg.Range().Length() > asyncLoadMapUnit
+	return ok && (mf.IsEarlyResumeSaving() || mf.IsAsyncLoading() && pseg.Range().Length() > asyncLoadMapUnit)
 }
 
 func (pseg pmaIterator) fileRange() memmap.FileRange {

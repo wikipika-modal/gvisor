@@ -206,6 +206,10 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// If earlyResumeSave is non-nil, an early-resume save may still be saving
+	// pages of f.
+	earlyResumeSave atomic.Pointer[asyncMemoryFileSave]
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -1148,6 +1152,7 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
+	f.AwaitSaved(fr)
 	if err := f.decommitFile(fr); err != nil {
 		log.Warningf("Failed to decommit %v: %v", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
@@ -1498,6 +1503,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		if err := amfl.awaitLoad(fr); err != nil {
 			return safemem.BlockSeq{}, err
 		}
+	}
+	if at.Write {
+		f.AwaitSaved(fr)
 	}
 
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)

@@ -65,6 +65,23 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "aps_unsaved_set",
+    out = "aps_unsaved_set.go",
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "pgalloc",
+    prefix = "apsUnsaved",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "apsUnsavedInfo",
+        "Functions": "apsUnsavedSetFunctions",
+    },
+)
+
+go_template_instance(
     name = "evictable_range",
     out = "evictable_range.go",
     package = "pgalloc",
@@ -159,8 +176,10 @@ go_library(
         "apfl_mutex.go",
         "apfs_mutex.go",
         "apl_unloaded_set.go",
+        "aps_unsaved_set.go",
         "context.go",
         "debug.go",
+        "early_resume_save.go",
         "evictable_range.go",
         "evictable_range_set.go",
         "memacct_set.go",
@@ -207,6 +226,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "early_resume_save_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "save_restore_test.go",

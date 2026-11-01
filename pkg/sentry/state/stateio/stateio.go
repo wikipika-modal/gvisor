@@ -144,6 +144,18 @@ type SourceRetainer interface {
 	RetainsSources() bool
 }
 
+// PositionedWriter is implemented by AsyncWriters that can write at explicit
+// offsets, so that writes can complete out of order.
+type PositionedWriter interface {
+	// AddWritevAt is like AsyncWriter.AddWritev, but writes at offset off
+	// rather than appending. If priority is true, a caller is blocked on the
+	// write, and the AsyncWriter may complete it ahead of other writes.
+	//
+	// Preconditions: As for AsyncWriter.AddWritev, and len(srcFRs) <
+	// AsyncWriter.MaxRanges().
+	AddWritevAt(id int, off uint64, priority bool, total uint64, srcFile SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec)
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

@@ -594,6 +594,13 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 		}
 		ar.End = pendaddr
 	}
+	if at.Write {
+		if mf, fr, ok := pseg.unsavedFileRange(ar); ok {
+			mm.activeMu.Unlock()
+			mf.AwaitSaved(fr)
+			return mm.handleASIOFault(ctx, addr, ioar, at)
+		}
+	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.

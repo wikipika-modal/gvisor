@@ -198,9 +198,18 @@ type writeSubmissionHeader struct {
 	// NumRanges is the number of FileRanges that make up the write's source.
 	NumRanges uint32
 
-	// Padding is unused, but aligns following FileRanges to 8 bytes.
-	Padding uint32
+	// Flags is a bitmask of writeSubmissionFlag*. Older clients always send 0.
+	Flags uint32
 }
+
+// writeSubmissionFlagPriority marks a write that the client is blocked on,
+// which the server may complete ahead of other writes.
+const writeSubmissionFlagPriority = 1 << 0
+
+// writeSubmissionFlagOffset indicates that the writeSubmissionHeader is
+// followed by a uint64 file offset at which the write begins, rather than
+// appending, and then by at most MaxRanges-1 FileRanges.
+const writeSubmissionFlagOffset = 1 << 1
 
 type ioResponseHeader struct {
 	// If Errno is non-zero, it is a fatal unix.Errno.
