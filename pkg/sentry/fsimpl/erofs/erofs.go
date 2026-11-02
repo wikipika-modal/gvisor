@@ -84,6 +84,9 @@ type filesystem struct {
 	// image is the EROFS image. image is immutable.
 	image *erofs.Image
 
+	// imageChanged is set on restore if the image's superblock changed.
+	imageChanged bool `state:"nosave"`
+
 	// mf implements memmap.File for this image.
 	mf imageMemmapFile
 
