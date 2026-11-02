@@ -213,6 +213,15 @@ const (
 // in the background as if loading eagerly.
 var lazyEagerPercent uint64 = 50
 
+// Once the application has waited on async page loading for as long as loading
+// the bytes loaded so far, plus lazyEagerWaitPercent of the pages a MemoryFile
+// marked lazy, would take at lazyEagerBytesPerSecond, the rest are also loaded
+// as if loading eagerly.
+var (
+	lazyEagerWaitPercent    float64 = 10
+	lazyEagerBytesPerSecond float64 = 1 << 30
+)
+
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
 	if f.IsEarlyResumeSaving() {
@@ -2714,7 +2723,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			if logAwaitedLoads && haveWaiters {
 				log.Infof("MemoryFile(%p): awaited opid %d complete, read %d bytes: %v", op.amfl.f, c.ID, op.total, op.frs)
 			}
-			if amfl.lazyBytes != 0 && amfl.touchedBytes*100 >= amfl.lazyBytes*lazyEagerPercent {
+			if amfl.lazyBytes != 0 && (amfl.touchedBytes*100 >= amfl.lazyBytes*lazyEagerPercent || apfl.behindLocked(amfl)) {
 				amfl.eagerLocked()
 			}
 			// Keep amfl.minUnloaded up to date. We can only determine this
@@ -2742,6 +2751,18 @@ func (apfl *AsyncPagesFileLoad) main() {
 //
 // Preconditions: apfl.mu must be locked. Must be called by the async page
 // loader goroutine.
+// behindLocked returns true if lazy loading should turn eager because the
+// application has waited too long (see lazyEagerWaitPercent).
+//
+// Preconditions: apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) behindLocked(amfl *asyncMemoryFileLoad) bool {
+	waited := apfl.durWaitedOne
+	if apfl.numWaiters != 0 {
+		waited += time.Duration(gohacks.Nanotime() - apfl.timeStartWaiters)
+	}
+	return waited.Seconds()*lazyEagerBytesPerSecond >= float64(apfl.bytesLoaded)+float64(amfl.lazyBytes)*lazyEagerWaitPercent/100
+}
+
 func (apfl *AsyncPagesFileLoad) promoteLocked(fr aplFileRange) {
 	p, ok := apfl.ar.(stateio.ReadPromoter)
 	if !ok {

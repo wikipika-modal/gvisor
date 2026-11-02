@@ -369,6 +369,12 @@ func checkLoaded(t *testing.T, f *MemoryFile, fr memmap.FileRange, want []byte) 
 	})
 }
 
+// Waits in tests take arbitrarily long, so only TestLazyLoadTurnsEagerAfterWaiting
+// turns eager on waiting.
+func init() {
+	lazyEagerBytesPerSecond = 0
+}
+
 // neverEager keeps lazy loading from turning eager for the rest of the test.
 func neverEager(t *testing.T) {
 	old := lazyEagerPercent
@@ -474,6 +480,24 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	// of window 2 is readahead.
 	if got := r.eager.Load(); got != 2*lazyMinBytes {
 		t.Errorf("marked %d bytes eager after turning eager, want %d", got, 2*lazyMinBytes)
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
+func TestLazyLoadTurnsEagerAfterWaiting(t *testing.T) {
+	lazyEagerBytesPerSecond = 1 << 62
+	t.Cleanup(func() { lazyEagerBytesPerSecond = 0 })
+	f, fr, want := newLazyWindowsMemoryFile(t, 8)
+	metadata, pages := saveToPagesFile(t, f, false)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
+	if _, err := restored.MapInternal(testPage(lazyWindow(fr, 0), 5), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if got := waitForReads(r, 8*lazyMinBytes); got != 8*lazyMinBytes {
+		t.Errorf("read %d bytes after waiting in one of 8 windows, want %d", got, 8*lazyMinBytes)
+	}
+	if restored.IsLazyLoading() {
+		t.Error("still loading lazily after waiting longer than loading would take")
 	}
 	checkLoaded(t, restored, fr, want)
 }
