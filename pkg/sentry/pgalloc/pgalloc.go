@@ -1106,7 +1106,7 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 	// Pages that async page loading hasn't loaded yet would otherwise be
 	// loaded after being zeroed.
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		if err := amfl.awaitLoad(fr); err != nil {
+		if err := amfl.awaitLoad(fr, false /* readahead */); err != nil {
 			log.Warningf("Decommit(%v): async page loading failed: %v", fr, err)
 		}
 	}
@@ -1507,7 +1507,7 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 	}
 
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		if err := amfl.awaitLoad(fr); err != nil {
+		if err := amfl.awaitLoad(fr, true /* readahead */); err != nil {
 			return safemem.BlockSeq{}, err
 		}
 	}
@@ -1875,7 +1875,7 @@ func (f *MemoryFile) File() *os.File {
 // DataFD implements memmap.File.DataFD.
 func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		if err := amfl.awaitLoad(fr); err != nil {
+		if err := amfl.awaitLoad(fr, true /* readahead */); err != nil {
 			return -1, err
 		}
 	}
