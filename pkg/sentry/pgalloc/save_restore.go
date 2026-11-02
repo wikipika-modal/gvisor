@@ -1722,6 +1722,9 @@ type asyncMemoryFileLoad struct {
 	lazyBytes    uint64
 	touched      map[uint64]struct{}
 	touchedBytes uint64
+
+	// eager is true once loading has turned eager (see lazyEagerPercent).
+	eager atomicbitops.Bool
 }
 
 // aplStream is a sequence of adjacent awaited ranges. When a range in window
@@ -1888,7 +1891,7 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 // only the pages it is asked for and those near them.
 func (f *MemoryFile) IsLazyLoading() bool {
 	amfl := f.asyncPageLoad.Load()
-	return amfl != nil && amfl.pf.lazy
+	return amfl != nil && amfl.pf.lazy && !amfl.eager.Load()
 }
 
 // IsLoaded returns true if async page loading has loaded every page in fr.
@@ -2184,6 +2187,7 @@ func (amfl *asyncMemoryFileLoad) eagerLocked() {
 	log.Infof("MemoryFile(%p): awaited pages in %d bytes of windows of %d lazy bytes; loading the rest eagerly", amfl.f, amfl.touchedBytes, amfl.lazyBytes)
 	amfl.lazyBytes = 0
 	amfl.touched = nil
+	amfl.eager.Store(true)
 	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
 		ulseg.ValuePtr().lazy = false
 	}

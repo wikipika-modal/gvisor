@@ -451,9 +451,15 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	if got := waitForReads(r, lazyMinBytes); got != lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting in a quarter of the windows, want %d", got, uint64(lazyMinBytes))
 	}
+	if !restored.IsLazyLoading() {
+		t.Error("not loading lazily after awaiting in a quarter of the windows")
+	}
 	// Windows 0 and 2 aren't adjacent, so this doesn't read ahead.
 	if _, err := restored.MapInternal(testPage(lazyWindow(fr, 2), 5), hostarch.Read); err != nil {
 		t.Fatalf("MapInternal: %v", err)
+	}
+	if restored.IsLazyLoading() {
+		t.Error("still loading lazily after awaiting in half of the windows")
 	}
 	if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting in half of the windows, want %d", got, 4*lazyMinBytes)
