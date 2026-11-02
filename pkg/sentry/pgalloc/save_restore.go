@@ -2011,7 +2011,7 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange, readahead bool) 
 		apfl.totalWaiters++
 	}
 	wake := pending
-	if readahead && apfl.lazy && amfl.lfDone && amfl.readaheadLocked(fr, pending) {
+	if readahead && apfl.lazy && amfl.lfDone && !amfl.eager.Load() && amfl.readaheadLocked(fr, pending) {
 		wake = true
 	}
 	apfl.mu.Unlock()
@@ -2202,7 +2202,8 @@ func (amfl *asyncMemoryFileLoad) markLazyLocked() {
 	amfl.touched = make(map[uint64]struct{})
 }
 
-// eagerLocked marks every unloaded page in amfl as loaded in the background.
+// eagerLocked marks every unloaded page in amfl as loaded in the background,
+// in order, with no more readahead.
 //
 // Preconditions: amfl.pf.mu must be locked. Must be called by the async page
 // loader goroutine.
@@ -2211,6 +2212,7 @@ func (amfl *asyncMemoryFileLoad) eagerLocked() {
 	amfl.lazyBytes = 0
 	amfl.touched = nil
 	amfl.eager.Store(true)
+	amfl.readaheadTrigger.Store(math.MaxUint64)
 	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
 		ulseg.ValuePtr().lazy = false
 	}

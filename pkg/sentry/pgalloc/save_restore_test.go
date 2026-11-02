@@ -591,6 +591,71 @@ func (r *gatedReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 	return r.ReaderAt.ReadAt(dst, off)
 }
 
+func TestLazyLoadStopsReadingAheadOnceEager(t *testing.T) {
+	old := lazyEagerPercent
+	lazyEagerPercent = 1
+	t.Cleanup(func() { lazyEagerPercent = old })
+	f, fr, want := newLazyWindowsMemoryFile(t, 3)
+	metadata, pages := saveToPagesFile(t, f, false)
+	// The pages file holds fr's pages in order. Once loading turns eager, its
+	// first four 1 MiB reads in window 1 fill the queue until released.
+	src := &gatedReaderAt{
+		ReaderAt: bytes.NewReader(pages.Bytes()),
+		gates:    make(map[int64]chan struct{}),
+		started:  make(chan int64, 4),
+	}
+	for i := int64(0); i < 4; i++ {
+		src.gates[lazyMinBytes+i<<20] = make(chan struct{})
+	}
+	r := &lazyReader{AsyncReader: stateio.NewIOReader(src, 1<<20, 16, 4), lazy: true}
+	apfl, err := StartAsyncPagesFileLoad(r, nil, nil)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	restored := newSaveTestMemoryFile(t, false)
+	if err := restored.LoadFrom(context.Background(), metadata, &LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+	t.Cleanup(func() { restored.DecRef(fr) })
+	// This reads the rest of window 0 ahead and turns loading eager.
+	if _, err := restored.MapInternal(testPage(fr, 5), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		<-src.started
+	}
+	// Window 1 continues window 0, which would start a stream.
+	mapped := make(chan error, 1)
+	go func() {
+		_, err := restored.MapInternal(testPage(lazyWindow(fr, 1), 0), hostarch.Read)
+		mapped <- err
+	}()
+	for {
+		apfl.mu.Lock()
+		waiters := apfl.numWaiters
+		apfl.mu.Unlock()
+		if waiters != 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, gate := range src.gates {
+		close(gate)
+	}
+	if err := <-mapped; err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	waitForReads(r, 3*lazyMinBytes)
+	checkLoaded(t, restored, fr, want)
+	if got, want := r.readahead.Load(), uint64(lazyMinBytes-hostarch.PageSize); got != want {
+		t.Errorf("marked %d bytes readahead, want %d (the rest of window 0)", got, want)
+	}
+	if got := r.eager.Load(); got != 2*lazyMinBytes {
+		t.Errorf("marked %d bytes eager, want %d (windows 1 and 2)", got, 2*lazyMinBytes)
+	}
+}
+
 // promoteReader sends the offsets of the reads it is asked to promote to
 // promoted.
 type promoteReader struct {
