@@ -668,6 +668,12 @@ func TestPromoteRead(t *testing.T) {
 		t.Fatalf("failed to open remote file: %v", err)
 	}
 	defer ar.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
 	df, err := ar.RegisterDestinationFD(memfd, 2*chunkSize, nil)
 	if err != nil {
 		t.Fatalf("failed to register destination file: %v", err)
@@ -686,6 +692,7 @@ func TestPromoteRead(t *testing.T) {
 		t.Fatalf("AsyncReader.Wait after promoting: got %d completions, error %v; want none", len(cs), err)
 	}
 	close(release)
+	released = true
 	if cs, err = ar.Wait(cs, 2 /* minCompletions */); err != nil || len(cs) != 2 {
 		t.Fatalf("AsyncReader.Wait after release: got %d completions, error %v; want 2", len(cs), err)
 	}
