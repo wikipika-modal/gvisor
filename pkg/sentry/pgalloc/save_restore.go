@@ -1866,6 +1866,13 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
 }
 
+// IsLazyLoading returns true if async page loading is in progress and loads
+// only the pages it is asked for and those near them.
+func (f *MemoryFile) IsLazyLoading() bool {
+	amfl := f.asyncPageLoad.Load()
+	return amfl != nil && amfl.pf.lazy
+}
+
 // IsLoaded returns true if async page loading has loaded every page in fr.
 func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
 	amfl := f.asyncPageLoad.Load()
