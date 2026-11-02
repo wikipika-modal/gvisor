@@ -152,7 +152,8 @@ type ReadPromoter interface {
 // differently once it loads all remaining pages.
 type EagerMarker interface {
 	// MarkLastReadEager marks the read most recently enqueued by AddRead or
-	// AddReadv as loading pages of a lazy load that now loads everything.
+	// AddReadv as one of the reads, in file order, of the remaining pages of a
+	// lazy load that now loads everything.
 	MarkLastReadEager()
 }
 

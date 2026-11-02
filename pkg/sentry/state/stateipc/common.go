@@ -196,8 +196,8 @@ const readSubmissionFlagPriority = 1 << 0
 // client that is expected to need them.
 const readSubmissionFlagReadahead = 1 << 1
 
-// readSubmissionFlagEager marks a read of a file that the client was reading
-// lazily and now reads in full.
+// readSubmissionFlagEager marks one of the reads, in file order, of the rest
+// of a file that the client was reading lazily and now reads in full.
 const readSubmissionFlagEager = 1 << 2
 
 // readSubmissionFlagPromote marks a submission without ranges or completion,

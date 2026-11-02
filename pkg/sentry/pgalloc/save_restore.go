@@ -2257,7 +2257,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 			m.MarkLastReadReadahead()
 		}
 	}
-	if op.tempRef && op.amfl.eager.Load() {
+	if op.tempRef && !op.readahead && op.amfl.eager.Load() {
 		if m, ok := apfl.ar.(stateio.EagerMarker); ok {
 			m.MarkLastReadEager()
 		}
