@@ -71,6 +71,19 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		}
 	}
 
+	if mf, fr, ok := mm.unloadedMapRangeLocked(pseg, ar); ok {
+		// Wait for async page loading without holding activeMu, so that other
+		// faults and syscalls don't wait for it.
+		mf.IncRef(fr, 0)
+		mm.activeMu.Unlock()
+		err := mf.AwaitLoad(fr)
+		mf.DecRef(fr)
+		if err != nil {
+			return err
+		}
+		return mm.HandleUserFault(ctx, addr, at, sp)
+	}
+
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
 	mm.activeMu.DowngradeLock()

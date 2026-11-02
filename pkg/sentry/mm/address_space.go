@@ -46,6 +46,34 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 	return nil
 }
 
+// asyncLoadMapUnit bounds the ranges that are mapped at once while async page
+// loading is in progress, in order to avoid calling
+// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal() with
+// unnecessarily large ranges, resulting in unnecessarily long waits.
+const asyncLoadMapUnit = 32 << 20
+
+// unloadedMapRangeLocked returns the range of pseg's MemoryFile that
+// mapASLocked would wait for async page loading of to map ar, and true if any
+// of it isn't loaded yet.
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) unloadedMapRangeLocked(pseg pmaIterator, ar hostarch.AddrRange) (*pgalloc.MemoryFile, memmap.FileRange, bool) {
+	mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+	if !ok || mm.p.MapUnit() != 0 || mf.IsEarlyResumeSaving() || !mf.IsAsyncLoading() {
+		return nil, memmap.FileRange{}, false
+	}
+	mask := hostarch.Addr(asyncLoadMapUnit - 1)
+	mapAR := hostarch.AddrRange{ar.Start &^ mask, ^hostarch.Addr(hostarch.PageSize - 1)}
+	if end := (ar.End + mask) &^ mask; end >= ar.End {
+		mapAR.End = end
+	}
+	fr := pseg.fileRangeOf(pseg.Range().Intersect(mapAR))
+	if mf.IsLoaded(fr) {
+		return nil, memmap.FileRange{}, false
+	}
+	return mf, fr, true
+}
+
 // mapASLocked maps addresses in ar into mm.as.
 //
 // Preconditions:
@@ -88,7 +116,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
 		// with unnecessarily large ranges, resulting in unnecessarily long
 		// waits.
-		setMapUnit(32 << 20)
+		setMapUnit(asyncLoadMapUnit)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
