@@ -82,6 +82,35 @@ func (s *testWriteServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 	return nil, fs.ErrNotExist
 }
 
+// blockingReadServer implements AsyncFileServerImpl by serving a single file
+// whose reads block until release is closed.
+type blockingReadServer struct {
+	path    string
+	release chan struct{}
+}
+
+// Destroy implements AsyncFileServerImpl.Destroy.
+func (s *blockingReadServer) Destroy() {}
+
+// OpenRead implements AsyncFileServerImpl.OpenRead.
+func (s *blockingReadServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	if path == s.path {
+		return stateio.NewIOReader(s, 4096 /* maxReadBytes */, 2 /* maxRanges */, testParallel), nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+// OpenWrite implements AsyncFileServerImpl.OpenWrite.
+func (s *blockingReadServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// ReadAt implements io.ReaderAt.ReadAt.
+func (s *blockingReadServer) ReadAt(dst []byte, off int64) (int, error) {
+	<-s.release
+	return 0, io.ErrUnexpectedEOF
+}
+
 func TestRead(t *testing.T) {
 	// Create random data.
 	const testPath = "testfile"
@@ -501,4 +530,74 @@ func TestClientWatchdog(t *testing.T) {
 		t.Errorf("AsyncReader.Wait after shutdown got error nil, completions: %+v", cs)
 	}
 	t.Logf("AsyncReader.Wait after shutdown got error: %v", err)
+}
+
+func TestClientWatchdogStalledRead(t *testing.T) {
+	defer func(tick time.Duration, ticks int) {
+		watchdogTick, readStallTicks = tick, ticks
+	}(watchdogTick, readStallTicks)
+	watchdogTick, readStallTicks = 10*time.Millisecond, 3
+
+	const testPath = "testfile"
+	const chunkSize = 4096
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestClientWatchdogStalledRead", chunkSize)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	release := make(chan struct{})
+	defer close(release)
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&blockingReadServer{
+		path:    testPath,
+		release: release,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	df, err := ar.RegisterDestinationFD(memfd, chunkSize, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, chunkSize}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := ar.Wait(nil, 1 /* minCompletions */)
+		waited <- err
+	}()
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Errorf("AsyncReader.Wait of a stalled read got error nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AsyncReader.Wait of a stalled read didn't return")
+	}
+	closed := make(chan error, 1)
+	go func() {
+		closed <- ar.Close()
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AsyncReader.Close after a stalled read didn't return")
+	}
 }
