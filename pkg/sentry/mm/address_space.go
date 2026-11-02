@@ -54,7 +54,7 @@ const asyncLoadMapUnit = 32 << 20
 
 // lazyLoadMapUnit replaces asyncLoadMapUnit while pages are loaded lazily,
 // which loads the rest of each awaited range's window in the background,
-// unless the asyncLoadMapUnit-aligned range is already loaded.
+// unless all of the asyncLoadMapUnit-aligned range is loaded or loading.
 const lazyLoadMapUnit = hostarch.HugePageSize
 
 // alignedAR returns ar expanded to multiples of unit, except for an end that
@@ -71,7 +71,7 @@ func alignedAR(ar hostarch.AddrRange, unit uint64) hostarch.AddrRange {
 // loadMapUnit returns the unit in which mapASLocked maps ar, starting in pseg,
 // while mf is loading asynchronously.
 func loadMapUnit(mf *pgalloc.MemoryFile, pseg pmaIterator, ar hostarch.AddrRange) uint64 {
-	if mf.IsLazyLoading() && !mf.IsLoaded(pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, asyncLoadMapUnit)))) {
+	if mf.IsLazyLoading() && !mf.IsStarted(pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, asyncLoadMapUnit)))) {
 		return lazyLoadMapUnit
 	}
 	return asyncLoadMapUnit
@@ -87,11 +87,7 @@ func (mm *MemoryManager) unloadedMapRangeLocked(pseg pmaIterator, ar hostarch.Ad
 	if !ok || mm.p.MapUnit() != 0 || mf.IsEarlyResumeSaving() || !mf.IsAsyncLoading() {
 		return nil, memmap.FileRange{}, false
 	}
-	unit := uint64(asyncLoadMapUnit)
-	if mf.IsLazyLoading() {
-		unit = lazyLoadMapUnit
-	}
-	fr := pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, unit)))
+	fr := pseg.fileRangeOf(pseg.Range().Intersect(alignedAR(ar, loadMapUnit(mf, pseg, ar))))
 	if mf.IsLoaded(fr) {
 		return nil, memmap.FileRange{}, false
 	}
