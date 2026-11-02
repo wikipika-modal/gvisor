@@ -159,6 +159,7 @@ type lazyReader struct {
 	bytes     atomic.Uint64
 	last      uint64
 	readahead atomic.Uint64
+	eager     atomic.Uint64
 }
 
 func (r *lazyReader) Lazy() bool { return r.lazy }
@@ -178,6 +179,8 @@ func (r *lazyReader) AddReadv(id int, off int64, total uint64, dstFile stateio.D
 }
 
 func (r *lazyReader) MarkLastReadReadahead() { r.readahead.Add(r.last) }
+
+func (r *lazyReader) MarkLastReadEager() { r.eager.Add(r.last) }
 
 // saveToPagesFile saves f with its pages in a separate pages file.
 func saveToPagesFile(t *testing.T, f *MemoryFile, exclude bool) (metadata, pages *bytes.Buffer) {
@@ -454,6 +457,9 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	if !restored.IsLazyLoading() {
 		t.Error("not loading lazily after awaiting in a quarter of the windows")
 	}
+	if got := r.eager.Load(); got != 0 {
+		t.Errorf("marked %d bytes eager while loading lazily", got)
+	}
 	// Windows 0 and 2 aren't adjacent, so this doesn't read ahead.
 	if _, err := restored.MapInternal(testPage(lazyWindow(fr, 2), 5), hostarch.Read); err != nil {
 		t.Fatalf("MapInternal: %v", err)
@@ -463,6 +469,10 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	}
 	if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting in half of the windows, want %d", got, 4*lazyMinBytes)
+	}
+	// Windows 1 and 3 are only loaded because loading turned eager.
+	if got := r.eager.Load(); got < 2*lazyMinBytes {
+		t.Errorf("marked %d bytes eager after turning eager, want at least %d", got, 2*lazyMinBytes)
 	}
 	checkLoaded(t, restored, fr, want)
 }

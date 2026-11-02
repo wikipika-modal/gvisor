@@ -148,6 +148,14 @@ type ReadPromoter interface {
 	PromoteRead(id int)
 }
 
+// EagerMarker is implemented by AsyncReaders that can serve a lazy load
+// differently once it loads all remaining pages.
+type EagerMarker interface {
+	// MarkLastReadEager marks the read most recently enqueued by AddRead or
+	// AddReadv as loading pages of a lazy load that now loads everything.
+	MarkLastReadEager()
+}
+
 // LazyReader is implemented by AsyncReaders that can ask to load only pages
 // that someone waits for.
 type LazyReader interface {

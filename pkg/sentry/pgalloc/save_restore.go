@@ -2257,6 +2257,11 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 			m.MarkLastReadReadahead()
 		}
 	}
+	if op.tempRef && op.amfl.eager.Load() {
+		if m, ok := apfl.ar.(stateio.EagerMarker); ok {
+			m.MarkLastReadEager()
+		}
+	}
 	if logAwaitedLoads && !op.tempRef {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}

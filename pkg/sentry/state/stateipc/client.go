@@ -453,6 +453,13 @@ func (rw *asyncReadWriter) MarkLastReadReadahead() {
 	}
 }
 
+// MarkLastReadEager implements stateio.EagerMarker.MarkLastReadEager.
+func (rw *asyncReadWriter) MarkLastReadEager() {
+	if rw.lastReadSub != nil {
+		rw.lastReadSub.Flags |= readSubmissionFlagEager
+	}
+}
+
 // PromoteRead implements stateio.ReadPromoter.PromoteRead.
 func (rw *asyncReadWriter) PromoteRead(id int) {
 	if !rw.promotes || rw.ensureConnected() != nil {

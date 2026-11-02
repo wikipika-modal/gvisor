@@ -196,6 +196,10 @@ const readSubmissionFlagPriority = 1 << 0
 // client that is expected to need them.
 const readSubmissionFlagReadahead = 1 << 1
 
+// readSubmissionFlagEager marks a read of a file that the client was reading
+// lazily and now reads in full.
+const readSubmissionFlagEager = 1 << 2
+
 // readSubmissionFlagPromote marks a submission without ranges or completion,
 // asking the server to serve the inflight read with its ID as if it had
 // readSubmissionFlagPriority. Its other fields are ignored.
