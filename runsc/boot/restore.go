@@ -710,6 +710,13 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	// keep loading in the background.
 	k.IncCheckpointGenOnRestore()
 
+	// Pages loaded lazily may never all be loaded, so the restore is done once
+	// the application runs.
+	lazy := r.asyncMFLoader != nil && r.mainMF.IsLazyLoading()
+	if lazy {
+		r.notifyRestoreDone(timeline)
+	}
+
 	// Wait for page loading to complete if happening in the background.
 	if r.asyncMFLoader != nil {
 		if err := r.asyncMFLoader.Wait(); err != nil {
@@ -721,6 +728,13 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		}
 	}
 
+	if !lazy {
+		r.notifyRestoreDone(timeline)
+	}
+	log.Infof("Restore successful")
+}
+
+func (r *restorer) notifyRestoreDone(timeline *timing.Timeline) {
 	var s sentryapi.Savings
 	if err := r.calculateCPUSavings(&s); err != nil {
 		log.Warningf("Failed to calculate CPU savings: %v", err)
@@ -728,10 +742,8 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	if err := r.calculateWallTimeSavings(&s); err != nil {
 		log.Warningf("Failed to calculate walltime savings: %v", err)
 	}
-
 	r.cm.onRestoreDone(s)
 	timeline.Reached("kernel notified")
-	log.Infof("Restore successful")
 }
 
 // Calculate the CPU time saved for restore.
