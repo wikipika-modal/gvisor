@@ -1059,6 +1059,13 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
+	// Pages that async page loading hasn't loaded yet would otherwise be
+	// loaded after being zeroed.
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		if err := amfl.awaitLoad(fr); err != nil {
+			log.Warningf("Decommit(%v): async page loading failed: %v", fr, err)
+		}
+	}
 	f.decommitOrManuallyZero(fr)
 
 	f.mu.Lock()
