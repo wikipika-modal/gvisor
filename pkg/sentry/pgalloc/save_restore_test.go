@@ -521,6 +521,101 @@ func TestLazyLoadReadaheadDoesNotTurnEager(t *testing.T) {
 	checkLoaded(t, restored, fr, want)
 }
 
+// gatedReaderAt blocks reads at the offsets in gates until their channels are
+// closed, sending each offset to started first.
+type gatedReaderAt struct {
+	io.ReaderAt
+	gates   map[int64]chan struct{}
+	started chan int64
+}
+
+func (r *gatedReaderAt) ReadAt(dst []byte, off int64) (int, error) {
+	if gate, ok := r.gates[off]; ok {
+		r.started <- off
+		<-gate
+	}
+	return r.ReaderAt.ReadAt(dst, off)
+}
+
+// promoteReader sends the offsets of the reads it is asked to promote to
+// promoted.
+type promoteReader struct {
+	stateio.AsyncReader
+	offs     map[int]int64
+	promoted chan int64
+}
+
+func (r *promoteReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.offs[id] = off
+	r.AsyncReader.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+func (r *promoteReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.offs[id] = off
+	r.AsyncReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+func (r *promoteReader) PromoteRead(id int) { r.promoted <- r.offs[id] }
+
+func TestLoadPromotesAwaitedBackgroundReads(t *testing.T) {
+	f, fr, want := newLazyWindowsMemoryFile(t, 1)
+	metadata, pages := saveToPagesFile(t, f, false)
+	// The pages file holds fr's pages in order, read 1 MiB at a time.
+	const awaited, other = 8 << 20, 16 << 20
+	src := &gatedReaderAt{
+		ReaderAt: bytes.NewReader(pages.Bytes()),
+		gates:    map[int64]chan struct{}{awaited: make(chan struct{}), other: make(chan struct{})},
+		started:  make(chan int64, 2),
+	}
+	r := &promoteReader{
+		AsyncReader: stateio.NewIOReader(src, 1<<20, 16, 4),
+		offs:        make(map[int]int64),
+		promoted:    make(chan int64, 4),
+	}
+	apfl, err := StartAsyncPagesFileLoad(r, nil, nil)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	restored := newSaveTestMemoryFile(t, false)
+	if err := restored.LoadFrom(context.Background(), metadata, &LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+	t.Cleanup(func() { restored.DecRef(fr) })
+	<-src.started
+	<-src.started
+
+	mapped := make(chan error, 1)
+	go func() {
+		_, err := restored.MapInternal(testPage(fr, awaited/hostarch.PageSize+1), hostarch.Read)
+		mapped <- err
+	}()
+	for {
+		apfl.mu.Lock()
+		waiters := apfl.numWaiters
+		apfl.mu.Unlock()
+		if waiters != 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The loader sees the waiter once another read completes.
+	close(src.gates[other])
+	select {
+	case off := <-r.promoted:
+		if off != awaited {
+			t.Errorf("promoted the read at %d, want %d", off, awaited)
+		}
+	case <-time.After(10 * time.Second):
+		t.Error("the awaited background read wasn't promoted")
+	}
+	close(src.gates[awaited])
+	if err := <-mapped; err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
 func TestDecommitDuringLazyLoad(t *testing.T) {
 	f, fr, want := newLazyWindowsMemoryFile(t, 1)
 	metadata, pages := saveToPagesFile(t, f, false)

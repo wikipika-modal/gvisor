@@ -140,6 +140,14 @@ type ReadaheadMarker interface {
 	MarkLastReadReadahead()
 }
 
+// ReadPromoter is implemented by AsyncReaders that can serve a read they have
+// already started ahead of others.
+type ReadPromoter interface {
+	// PromoteRead marks the inflight read with the given ID as one that a
+	// caller is blocked on. It takes effect at the next call to Wait.
+	PromoteRead(id int)
+}
+
 // LazyReader is implemented by AsyncReaders that can ask to load only pages
 // that someone waits for.
 type LazyReader interface {

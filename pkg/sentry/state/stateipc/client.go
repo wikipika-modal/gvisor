@@ -206,6 +206,7 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		retains:     resp.RetainsSources,
 		holds:       resp.HoldsWrites,
 		prioUnit:    resp.PriorityUnit,
+		promotes:    resp.PromotesReads,
 		handle:      resp.Handle,
 		isReader:    mode == OpenModeRead,
 	}
@@ -243,6 +244,7 @@ type asyncReadWriter struct {
 	retains     bool
 	holds       bool
 	prioUnit    uint64
+	promotes    bool
 	handle      uint32
 	isReader    bool
 
@@ -449,6 +451,18 @@ func (rw *asyncReadWriter) MarkLastReadReadahead() {
 	if rw.lastReadSub != nil {
 		rw.lastReadSub.Flags |= readSubmissionFlagReadahead
 	}
+}
+
+// PromoteRead implements stateio.ReadPromoter.PromoteRead.
+func (rw *asyncReadWriter) PromoteRead(id int) {
+	if !rw.promotes || rw.ensureConnected() != nil {
+		return
+	}
+	*rw.ioep.scanReadSubmissionHeader() = readSubmissionHeader{
+		ID:    uint32(id),
+		Flags: readSubmissionFlagPromote,
+	}
+	rw.numSubmissions++
 }
 
 // AddWrite implements stateio.AsyncWriter.AddWrite.

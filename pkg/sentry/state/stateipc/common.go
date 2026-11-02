@@ -86,6 +86,10 @@ type OpenResponse struct {
 	// writeSubmissionFlagPriority.
 	PriorityUnit uint64 `json:"priority_unit"`
 
+	// PromotesReads tells the client that the server accepts
+	// readSubmissionFlagPromote.
+	PromotesReads bool `json:"promotes_reads"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload
@@ -191,6 +195,11 @@ const readSubmissionFlagPriority = 1 << 0
 // readSubmissionFlagReadahead marks a read that loads pages lazily ahead of a
 // client that is expected to need them.
 const readSubmissionFlagReadahead = 1 << 1
+
+// readSubmissionFlagPromote marks a submission without ranges or completion,
+// asking the server to serve the inflight read with its ID as if it had
+// readSubmissionFlagPriority. Its other fields are ignored.
+const readSubmissionFlagPromote = 1 << 3
 
 type writeRequestHeader struct {
 	// MinCompletions is the minimum number of completions that the server

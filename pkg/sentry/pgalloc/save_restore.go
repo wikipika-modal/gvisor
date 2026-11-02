@@ -1564,6 +1564,11 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// promote contains started ranges that have gained a first waiter, whose
+	// unawaited reads should be served ahead of others. promote is protected
+	// by mu.
+	promote ringdeque.Deque[aplFileRange]
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1745,6 +1750,10 @@ type aplUnloadedInfo struct {
 	// started is true if a read has been enqueued for these pages.
 	started bool
 
+	// If started is true, op is the index of that read in
+	// AsyncPagesFileLoad.ops.
+	op uint32
+
 	// lazy is true if these pages are only loaded when awaited.
 	lazy bool
 
@@ -1800,6 +1809,9 @@ type aplOp struct {
 
 	// readahead is true if the read loads pages lazily ahead of waiters.
 	readahead bool
+
+	// promoted is true if the read has been promoted since it was enqueued.
+	promoted bool
 }
 
 func (op *aplOp) off() int64 {
@@ -1966,6 +1978,8 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange, readahead bool) 
 			apfl.bytesWaited += ullen
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+			} else if readahead {
+				apfl.promote.PushBack(aplFileRange{amfl, ulFR})
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -2265,6 +2279,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
 			op.readahead = false
+			op.promoted = false
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
@@ -2472,6 +2487,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		// Prioritize reading pages with waiters.
 		apfl.mu.Lock()
+		for !apfl.promote.Empty() {
+			apfl.promoteLocked(apfl.promote.PopFront())
+		}
 		for apfl.canEnqueue() && !apfl.priority.Empty() {
 			fr := apfl.priority.PopFront()
 			// All pages in apfl.priority have non-zero waiters and were split
@@ -2484,6 +2502,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				ul := ulseg.ValuePtr()
 				ulFR := ulseg.Range()
 				if ul.started {
+					// A read without waiters may have started fr since it was
+					// awaited.
+					apfl.promoteLocked(aplFileRange{fr.amfl, ulFR})
 					fr.Start = ulFR.End
 					ulseg = ulseg.NextSegment()
 					continue
@@ -2502,6 +2523,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				ulFR.End = ulFR.Start + n
 				ulseg = fr.amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 				ulseg.ValuePtr().started = true
+				ulseg.ValuePtr().op = apfl.curOpID
 				fr.Start = ulFR.End
 				if fr.Length() > 0 {
 					// Cycle the rest of fr to the end of apl.priority. This
@@ -2561,6 +2583,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					ulFR.End = ulFR.Start + n
 					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 					ulseg.ValuePtr().started = true
+					ulseg.ValuePtr().op = apfl.curOpID
 					amfl.minUnstarted = ulFR.End
 					amfl.f.incRefLocked(ulFR)
 					if !apfl.canEnqueue() {
@@ -2706,6 +2729,27 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}
 }
 
+// promoteLocked promotes the unawaited read of the pages at fr.Start, if it is
+// still inflight.
+//
+// Preconditions: apfl.mu must be locked. Must be called by the async page
+// loader goroutine.
+func (apfl *AsyncPagesFileLoad) promoteLocked(fr aplFileRange) {
+	p, ok := apfl.ar.(stateio.ReadPromoter)
+	if !ok {
+		return
+	}
+	ulseg := fr.amfl.unloaded.FindSegment(fr.Start)
+	if !ulseg.Ok() || !ulseg.ValuePtr().started {
+		return
+	}
+	id := ulseg.ValuePtr().op
+	if op := &apfl.ops[id]; op.tempRef && !op.promoted {
+		op.promoted = true
+		p.PromoteRead(int(id))
+	}
+}
+
 // enqueueReadaheadLocked enqueues unawaited reads of amfl's unstarted pages in
 // amfl.readahead, and returns false if it ran out of queue space first.
 //
@@ -2732,6 +2776,7 @@ func (apfl *AsyncPagesFileLoad) enqueueReadaheadLocked(amfl *asyncMemoryFileLoad
 			ulFR.End = ulFR.Start + n
 			ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 			ulseg.ValuePtr().started = true
+			ulseg.ValuePtr().op = apfl.curOpID
 			amfl.f.incRefLocked(ulFR)
 			ulseg = ulseg.NextSegment()
 		}
@@ -2802,6 +2847,7 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 	ul2 := aplUnloadedInfo{
 		off:     ul.off + (splitAt - fr.Start),
 		started: ul.started,
+		op:      ul.op,
 		lazy:    ul.lazy,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
