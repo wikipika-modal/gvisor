@@ -218,7 +218,7 @@ var lazyEagerPercent uint64 = 50
 // marked lazy, would take at lazyEagerBytesPerSecond, the rest are also loaded
 // as if loading eagerly.
 var (
-	lazyEagerWaitPercent    float64 = 10
+	lazyEagerWaitPercent    float64 = 5
 	lazyEagerBytesPerSecond float64 = 1 << 30
 )
 
