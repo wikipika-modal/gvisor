@@ -17,8 +17,10 @@ package stateipc
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -26,6 +28,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
+)
+
+// A read Wait that gets no completions for readStallTicks watchdog ticks shuts
+// the client down as if its server had disconnected, since a stopped server
+// would otherwise block page faults forever. Counting ticks rather than wall
+// time leaves out time during which the sandbox is frozen.
+var (
+	watchdogTick   = 10 * time.Second
+	readStallTicks = 12
 )
 
 // AsyncFileClient provides async I/O by communicating with an AsyncFileServer,
@@ -62,7 +73,7 @@ func NewAsyncFileClient(uc *urpc.Client) (*AsyncFileClient, error) {
 }
 
 // watchdogMain is the main function of the watchdog goroutine, which shuts
-// down Flipcall endpoints if c.uc.Socket is disconnected.
+// down Flipcall endpoints if c.uc.Socket is disconnected or a read stalls.
 func (c *AsyncFileClient) watchdogMain() {
 	defer c.watchdog.Done()
 	events := []unix.PollFd{
@@ -76,28 +87,62 @@ func (c *AsyncFileClient) watchdogMain() {
 		},
 	}
 	for {
-		_, err := unix.Ppoll(events, nil, nil)
+		ts := unix.NsecToTimespec(watchdogTick.Nanoseconds())
+		n, err := unix.Ppoll(events, &ts, nil)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
 			}
 			panic(fmt.Sprintf("stateipc.AsyncFileClient: watchdog got ppoll error: %v", err))
 		}
+		if n == 0 {
+			if c.readStalled() {
+				log.Warningf("stateipc.AsyncFileClient: no read completions for %d watchdog ticks, shutting down file connections", readStallTicks)
+				c.shutdown()
+				c.uc.Socket.Shutdown()
+				return
+			}
+			continue
+		}
 		if events[0].Revents != 0 {
 			return
 		}
 		if events[1].Revents != 0 {
 			log.Infof("stateipc.AsyncFileClient: socket disconnected, shutting down file connections")
-			c.filesMu.Lock()
-			defer c.filesMu.Unlock()
-			for rw := range c.files {
-				if !rw.destroyed {
-					rw.ioep.Shutdown()
-				}
-			}
+			c.shutdown()
 			return
 		}
 	}
+}
+
+func (c *AsyncFileClient) shutdown() {
+	c.filesMu.Lock()
+	defer c.filesMu.Unlock()
+	for rw := range c.files {
+		if !rw.destroyed {
+			rw.ioep.Shutdown()
+		}
+	}
+}
+
+// readStalled returns true if the same read Wait has been in progress for
+// readStallTicks of its calls.
+func (c *AsyncFileClient) readStalled() bool {
+	c.filesMu.Lock()
+	defer c.filesMu.Unlock()
+	for rw := range c.files {
+		waits := rw.waits.Load()
+		if waits%2 == 0 || waits != rw.lastWaits {
+			rw.lastWaits = waits
+			rw.stalls = 0
+			continue
+		}
+		rw.stalls++
+		if rw.stalls >= readStallTicks {
+			return true
+		}
+	}
+	return false
 }
 
 // DecRef decrements c's reference count.
@@ -212,6 +257,13 @@ type asyncReadWriter struct {
 	connectorWG sync.WaitGroup
 
 	reserve uint64
+
+	// waits is incremented when a read Wait starts and when it returns.
+	waits atomicbitops.Uint64
+
+	// lastWaits and stalls are the watchdog's, protected by client.filesMu.
+	lastWaits uint64
+	stalls    int
 }
 
 // Close implements stateio.AsyncReader.Close and stateio.AsyncWriter.Close.
@@ -419,6 +471,8 @@ func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]
 	}
 	minCompletions32 := uint32(max(minCompletions, 0))
 	if rw.isReader {
+		rw.waits.Add(1)
+		defer rw.waits.Add(1)
 		*rw.ioep.readRequestHeader() = readRequestHeader{MinCompletions: minCompletions32}
 	} else {
 		*rw.ioep.writeRequestHeader() = writeRequestHeader{
