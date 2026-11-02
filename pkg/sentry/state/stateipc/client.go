@@ -391,6 +391,14 @@ func (rw *asyncReadWriter) PrioritizeLastRead() {
 	}
 }
 
+// MarkLastReadReadahead implements
+// stateio.ReadaheadMarker.MarkLastReadReadahead.
+func (rw *asyncReadWriter) MarkLastReadReadahead() {
+	if rw.lastReadSub != nil {
+		rw.lastReadSub.Flags |= readSubmissionFlagReadahead
+	}
+}
+
 // AddWrite implements stateio.AsyncWriter.AddWrite.
 func (rw *asyncReadWriter) AddWrite(id int, srcFile stateio.SourceFile, srcFR memmap.FileRange, srcMap []byte) {
 	if rw.ensureConnected() != nil {

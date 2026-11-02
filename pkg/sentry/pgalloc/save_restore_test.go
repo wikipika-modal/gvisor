@@ -154,9 +154,11 @@ func TestSaveToPreservesContents(t *testing.T) {
 
 type lazyReader struct {
 	stateio.AsyncReader
-	lazy     bool
-	prefetch []memmap.FileRange
-	bytes    atomic.Uint64
+	lazy      bool
+	prefetch  []memmap.FileRange
+	bytes     atomic.Uint64
+	last      uint64
+	readahead atomic.Uint64
 }
 
 func (r *lazyReader) Lazy() bool { return r.lazy }
@@ -164,14 +166,18 @@ func (r *lazyReader) Lazy() bool { return r.lazy }
 func (r *lazyReader) Prefetch() []memmap.FileRange { return r.prefetch }
 
 func (r *lazyReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
-	r.bytes.Add(uint64(len(dstMap)))
+	r.last = uint64(len(dstMap))
+	r.bytes.Add(r.last)
 	r.AsyncReader.AddRead(id, off, dstFile, dstFR, dstMap)
 }
 
 func (r *lazyReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.last = total
 	r.bytes.Add(total)
 	r.AsyncReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
 }
+
+func (r *lazyReader) MarkLastReadReadahead() { r.readahead.Add(r.last) }
 
 // saveToPagesFile saves f with its pages in a separate pages file.
 func saveToPagesFile(t *testing.T, f *MemoryFile, exclude bool) (metadata, pages *bytes.Buffer) {
@@ -383,9 +389,12 @@ func TestLazyLoadReadsAheadOfAdjacentAwaits(t *testing.T) {
 			}
 		}
 		// The two windows beyond the second one are loaded without being
-		// awaited.
+		// awaited, as readahead.
 		if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 			t.Errorf("reverse=%v: read %d bytes, want %d", reverse, got, 4*lazyMinBytes)
+		}
+		if got := r.readahead.Load(); got != 2*lazyMinBytes {
+			t.Errorf("reverse=%v: read %d bytes as readahead, want %d", reverse, got, 2*lazyMinBytes)
 		}
 		checkLoaded(t, restored, fr, want)
 	}

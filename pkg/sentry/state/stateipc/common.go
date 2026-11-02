@@ -188,6 +188,10 @@ type readSubmissionHeader struct {
 // the server may serve ahead of other reads.
 const readSubmissionFlagPriority = 1 << 0
 
+// readSubmissionFlagReadahead marks a read that loads pages lazily ahead of a
+// client that is expected to need them.
+const readSubmissionFlagReadahead = 1 << 1
+
 type writeRequestHeader struct {
 	// MinCompletions is the minimum number of completions that the server
 	// should accumulate before returning control to the client.
