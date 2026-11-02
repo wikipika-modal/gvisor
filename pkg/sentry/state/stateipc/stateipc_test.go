@@ -628,6 +628,68 @@ func TestClientWatchdogStalledRead(t *testing.T) {
 	}
 }
 
+func TestClientWatchdogFailsReadsInFlightOnDisconnect(t *testing.T) {
+	const testPath = "testfile"
+	const chunkSize = 4096
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestClientWatchdogFailsReadsInFlightOnDisconnect", chunkSize)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	release := make(chan struct{})
+	defer close(release)
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&blockingReadServer{
+		path:    testPath,
+		release: release,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	df, err := ar.RegisterDestinationFD(memfd, chunkSize, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, chunkSize}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := ar.Wait(nil, 1 /* minCompletions */)
+		waited <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// A server that dies leaves its read in flight forever.
+	if err := serverSock.Shutdown(); err != nil {
+		t.Fatalf("failed to shut down server socket: %v", err)
+	}
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Errorf("AsyncReader.Wait of a read in flight at disconnection got error nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("AsyncReader.Wait of a read in flight didn't return within 2s of disconnection")
+	}
+}
+
 func TestPromoteRead(t *testing.T) {
 	const testPath = "testfile"
 	const chunkSize = 4096
