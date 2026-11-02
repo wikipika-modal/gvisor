@@ -470,9 +470,10 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	if got := waitForReads(r, 4*lazyMinBytes); got != 4*lazyMinBytes {
 		t.Errorf("read %d bytes after awaiting in half of the windows, want %d", got, 4*lazyMinBytes)
 	}
-	// Windows 1 and 3 are only loaded because loading turned eager.
-	if got := r.eager.Load(); got < 2*lazyMinBytes {
-		t.Errorf("marked %d bytes eager after turning eager, want at least %d", got, 2*lazyMinBytes)
+	// Windows 1 and 3 are only loaded because loading turned eager; the rest
+	// of window 2 is readahead.
+	if got := r.eager.Load(); got != 2*lazyMinBytes {
+		t.Errorf("marked %d bytes eager after turning eager, want %d", got, 2*lazyMinBytes)
 	}
 	checkLoaded(t, restored, fr, want)
 }
