@@ -1905,23 +1905,6 @@ func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
 	return amfl.unloaded.IsEmptyRange(fr)
 }
 
-// IsStarted returns true if async page loading has loaded, or started
-// loading, every page in fr.
-func (f *MemoryFile) IsStarted(fr memmap.FileRange) bool {
-	amfl := f.asyncPageLoad.Load()
-	if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
-		return true
-	}
-	amfl.pf.mu.Lock()
-	defer amfl.pf.mu.Unlock()
-	for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; ulseg = ulseg.NextSegment() {
-		if !ulseg.ValuePtr().started {
-			return false
-		}
-	}
-	return true
-}
-
 // AwaitLoad blocks until async page loading has loaded every page in fr.
 //
 // Preconditions: At least one reference must be held on all pages in fr.
