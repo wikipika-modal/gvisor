@@ -2283,14 +2283,12 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			op.total = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
-			op.readahead = false
 			op.promoted = false
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
-		n := apfl.combine(amfl, fr, off, tempRef)
+		n := apfl.combine(amfl, fr, off, tempRef, readahead)
 		if n > 0 {
-			apfl.curOp.readahead = apfl.curOp.readahead || readahead
 			return n
 		}
 		// Flush the existing (conflicting) op and try again with a new one.
@@ -2307,7 +2305,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 // Preconditions:
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef, readahead bool) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
 		if op.end != off {
@@ -2328,6 +2326,10 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			// by making tempRef per-FileRange, but it's very unlikely that an
 			// awaited load (tempRef=false) will happen to be followed by an
 			// unawaited load (tempRef=true) at the correct offset.
+			return 0
+		}
+		if op.readahead != readahead {
+			// The reader is told whether a read is readahead.
 			return 0
 		}
 	}
@@ -2374,6 +2376,7 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	op.end += n
 	op.total += n
 	op.tempRef = tempRef
+	op.readahead = readahead
 	if len(op.frs) > 0 && op.frs[len(op.frs)-1].End == fr.Start {
 		op.frs[len(op.frs)-1].End = fr.End
 	} else {

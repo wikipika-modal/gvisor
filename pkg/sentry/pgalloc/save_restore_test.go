@@ -478,6 +478,25 @@ func TestLazyLoadTurnsEagerAfterAwaitingInHalfTheWindows(t *testing.T) {
 	checkLoaded(t, restored, fr, want)
 }
 
+func TestLazyLoadKeepsReadaheadAndEagerReadsApart(t *testing.T) {
+	f, fr, want := newLazyWindowsMemoryFile(t, 2)
+	metadata, pages := saveToPagesFile(t, f, false)
+	restored, r, _ := loadPagesFile(t, metadata, pages, fr, true)
+	// This reads the rest of window 0 ahead and turns loading eager, which
+	// loads window 1 right after it in the pages file.
+	if _, err := restored.MapInternal(testPage(fr, 5), hostarch.Read); err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	waitForReads(r, 2*lazyMinBytes)
+	if got, want := r.readahead.Load(), uint64(lazyMinBytes-hostarch.PageSize); got != want {
+		t.Errorf("marked %d bytes readahead, want %d", got, want)
+	}
+	if got := r.eager.Load(); got != lazyMinBytes {
+		t.Errorf("marked %d bytes eager, want %d", got, uint64(lazyMinBytes))
+	}
+	checkLoaded(t, restored, fr, want)
+}
+
 func TestLazyLoadCountsOnlyLazyPagesInTouchedWindows(t *testing.T) {
 	f := newSaveTestMemoryFile(t, false)
 	fr, err := f.Allocate(4*lazyMinBytes, AllocOpts{Mode: AllocateUncommitted})
