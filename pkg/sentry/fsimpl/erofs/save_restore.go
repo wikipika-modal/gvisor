@@ -70,6 +70,10 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 		log.Infof("erofs: mount %q kept %d inodes on an unchanged image in %v", fs.iopts.UniqueID, len(inodes), time.Since(start))
 		return nil
 	}
+	// Unreferenced dentries are only a cache, so they needn't match the new
+	// image.
+	fs.evictAllCachedDentries(ctx)
+	inodes = fs.savedInodes()
 	dentries, err := fs.reresolve(len(inodes))
 	if err != nil {
 		return vfs.ErrCorruption{Err: fmt.Errorf("erofs mount %q: %w", fs.iopts.UniqueID, err)}
