@@ -42,7 +42,7 @@ func (i *inode) getDirents() ([]vfs.Dirent, error) {
 		dirents = append(dirents, vfs.Dirent{
 			Name:    name,
 			Type:    linux.FileTypeToDirentType(typ),
-			Ino:     nid,
+			Ino:     i.fs.ino(nid),
 			NextOff: off,
 		})
 		off++

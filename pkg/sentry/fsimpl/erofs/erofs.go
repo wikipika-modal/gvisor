@@ -87,6 +87,13 @@ type filesystem struct {
 	// imageChanged is set on restore if the image's superblock changed.
 	imageChanged bool `state:"nosave"`
 
+	// restoredInos maps the nids of files re-resolved onto a changed image to
+	// the inode numbers they reported before. Other files report their nid
+	// plus inoOffset, which exceeds every restored inode number. Both are
+	// immutable after CompleteRestore.
+	restoredInos map[uint64]uint64
+	inoOffset    uint64
+
 	// mf implements memmap.File for this image.
 	mf imageMemmapFile
 
@@ -321,6 +328,14 @@ func (ib *inodeBucket) removeInodeLocked(nid uint64) {
 	delete(ib.inodeMap, nid)
 }
 
+// ino returns the inode number of the file at nid.
+func (fs *filesystem) ino(nid uint64) uint64 {
+	if ino, ok := fs.restoredInos[nid]; ok {
+		return ino
+	}
+	return nid + fs.inoOffset
+}
+
 func (fs *filesystem) inodeBucket(nid uint64) *inodeBucket {
 	bucket := nid % uint64(len(fs.inodeBuckets))
 	return &fs.inodeBuckets[bucket]
@@ -423,7 +438,7 @@ func (i *inode) statTo(stat *linux.Statx) {
 	stat.UID = i.UID()
 	stat.GID = i.GID()
 	stat.Mode = i.Mode()
-	stat.Ino = i.Nid()
+	stat.Ino = i.fs.ino(i.Nid())
 	stat.Size = i.Size()
 	stat.Blocks = (stat.Size + 511) / 512
 	stat.Mtime = linux.StatxTimestamp{

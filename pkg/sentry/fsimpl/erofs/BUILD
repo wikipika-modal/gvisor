@@ -85,10 +85,14 @@ go_library(
 go_test(
     name = "erofs_test",
     size = "small",
-    srcs = ["regular_file_test.go"],
+    srcs = [
+        "regular_file_test.go",
+        "save_restore_test.go",
+    ],
     embed = [":erofs"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/context",
         "//pkg/erofs",
         "//pkg/fspath",
         "//pkg/hostarch",

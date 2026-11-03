@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/erofs"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -58,23 +59,27 @@ func newTestImage(features uint32, file erofs.InodeCompact) []byte {
 	return data
 }
 
-// openTestFile mounts image and opens its file "file".
-func openTestFile(t *testing.T, image []byte) *regularFileFD {
+// imageFile returns a file holding image.
+func imageFile(t *testing.T, image []byte) *os.File {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "image")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { f.Close() })
 	if _, err := f.Write(image); err != nil {
-		f.Close()
 		t.Fatal(err)
 	}
-	imageFD, err := unix.Dup(int(f.Fd()))
-	f.Close()
+	return f
+}
+
+// mountTestImage mounts image and returns the VFS and its root.
+func mountTestImage(ctx context.Context, t *testing.T, image []byte) (*vfs.VirtualFilesystem, vfs.VirtualDentry) {
+	t.Helper()
+	imageFD, err := unix.Dup(int(imageFile(t, image).Fd()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := contexttest.Context(t)
 	mf := pgalloc.MemoryFileFromContext(ctx)
 	vfsObj := &vfs.VirtualFilesystem{}
 	if err := vfsObj.Init(ctx); err != nil {
@@ -86,11 +91,20 @@ func openTestFile(t *testing.T, image []byte) *regularFileFD {
 		t.Fatal(err)
 	}
 	rootVD := mntns.Root(ctx)
+	t.Cleanup(func() { rootVD.DecRef(ctx); mntns.DecRef(ctx); vfsObj.Release(ctx); mf.Destroy() })
+	return vfsObj, rootVD
+}
+
+// openTestFile mounts image and opens its file "file".
+func openTestFile(t *testing.T, image []byte) *regularFileFD {
+	t.Helper()
+	ctx := contexttest.Context(t)
+	vfsObj, rootVD := mountTestImage(ctx, t, image)
 	vfsfd, err := vfsObj.OpenAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{Root: rootVD, Start: rootVD, Path: fspath.Parse("file")}, &vfs.OpenOptions{Flags: linux.O_RDONLY})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { vfsfd.DecRef(ctx); rootVD.DecRef(ctx); mntns.DecRef(ctx); vfsObj.Release(ctx); mf.Destroy() })
+	t.Cleanup(func() { vfsfd.DecRef(ctx) })
 	return vfsfd.Impl().(*regularFileFD)
 }
 

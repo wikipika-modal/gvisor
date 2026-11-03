@@ -111,6 +111,8 @@ func (fs *filesystem) imageHas(inodes []*inode) bool {
 // number of dentries.
 func (fs *filesystem) reresolve(savedInodes int) (int, error) {
 	nids := make(map[*inode]uint64, savedInodes)
+	inos := make(map[uint64]uint64, savedInodes)
+	var maxIno uint64
 	dentries := 0
 	var walk func(d *dentry, nid uint64) error
 	walk = func(d *dentry, nid uint64) error {
@@ -127,6 +129,8 @@ func (fs *filesystem) reresolve(savedInodes int) (int, error) {
 			if err := checkSameFile(&d.inode.Inode, &ino); err != nil {
 				return fmt.Errorf("%q %w", genericDebugPathname(fs, d), err)
 			}
+			inos[nid] = fs.ino(d.inode.Nid())
+			maxIno = max(maxIno, inos[nid])
 			d.inode.Inode = ino
 			nids[d.inode] = nid
 		}
@@ -149,6 +153,8 @@ func (fs *filesystem) reresolve(savedInodes int) (int, error) {
 	if len(nids) != savedInodes {
 		return 0, fmt.Errorf("%d saved inodes, but %d are reachable by path", savedInodes, len(nids))
 	}
+	fs.restoredInos = inos
+	fs.inoOffset = maxIno + 1
 	for b := range fs.inodeBuckets {
 		fs.inodeBuckets[b].init()
 	}
