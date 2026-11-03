@@ -919,3 +919,21 @@ func TestTPUProxyEnabled(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreValidatesRootfsAnnotationsButSource(t *testing.T) {
+	before := map[string]string{
+		"dev.gvisor.spec.rootfs.source": "/task-1/image.erofs",
+		"dev.gvisor.spec.rootfs.type":   "erofs",
+	}
+	after := map[string]string{
+		"dev.gvisor.spec.rootfs.source": "/task-2/image.erofs",
+		"dev.gvisor.spec.rootfs.type":   "erofs",
+	}
+	if err := validateAnnotations("cont", before, after); err != nil {
+		t.Errorf("validateAnnotations with a new rootfs source: %v", err)
+	}
+	after["dev.gvisor.spec.rootfs.type"] = "tar"
+	if err := validateAnnotations("cont", before, after); err == nil {
+		t.Errorf("validateAnnotations accepted a new rootfs type")
+	}
+}

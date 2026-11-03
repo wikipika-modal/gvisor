@@ -156,6 +156,7 @@ func shouldValidateAnnotation(key string) bool {
 		gvisorPrefix   = "dev.gvisor."
 		internalPrefix = "dev.gvisor.internal."
 		mntPrefix      = "dev.gvisor.spec.mount."
+		rootfsSource   = "dev.gvisor.spec.rootfs.source"
 	)
 	// Only validate gVisor annotations.
 	if !strings.HasPrefix(key, gvisorPrefix) {
@@ -173,6 +174,11 @@ func shouldValidateAnnotation(key string) bool {
 	}
 	// The source of a mount can change during restore.
 	if strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source") {
+		return false
+	}
+	// So can the source of the rootfs image; the EROFS filesystem re-resolves
+	// saved files in the restored image.
+	if key == rootfsSource {
 		return false
 	}
 	// Flag annotations controlling debug logging can change. They don't impact
