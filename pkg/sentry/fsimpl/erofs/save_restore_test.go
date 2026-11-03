@@ -94,6 +94,18 @@ func TestReresolveKeepsInodeNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dir, err := vfsObj.OpenAt(ctx, creds, at(""), &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.DecRef(ctx)
+	direntInos := map[string]uint64{}
+	if err := dir.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(d vfs.Dirent) error {
+		direntInos[d.Name] = d.Ino
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
 	b, err := vfsObj.StatAt(ctx, creds, at("b"), &vfs.StatOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +115,9 @@ func TestReresolveKeepsInodeNumbers(t *testing.T) {
 	}
 	if b.Ino == before.Ino {
 		t.Errorf("b reports inode number %d, which the held file had before the restore", b.Ino)
+	}
+	if direntInos["a"] != after.Ino || direntInos["b"] != b.Ino {
+		t.Errorf("getdents reports inode numbers %v, but stat reports a=%d and b=%d", direntInos, after.Ino, b.Ino)
 	}
 	if after.Size != 10 || b.Size != 20 {
 		t.Errorf("sizes are %d and %d after the restore, want 10 and 20", after.Size, b.Size)

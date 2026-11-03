@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+// getDirents returns i's directory entries, with each entry's nid as its Ino.
 func (i *inode) getDirents() ([]vfs.Dirent, error) {
 	// Fast path.
 	i.dirMu.RLock()
@@ -42,7 +43,7 @@ func (i *inode) getDirents() ([]vfs.Dirent, error) {
 		dirents = append(dirents, vfs.Dirent{
 			Name:    name,
 			Type:    linux.FileTypeToDirentType(typ),
-			Ino:     i.fs.ino(nid),
+			Ino:     nid,
 			NextOff: off,
 		})
 		off++
@@ -159,7 +160,9 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	defer fd.mu.Unlock()
 
 	for fd.off < int64(len(dirents)) {
-		if err := cb.Handle(dirents[fd.off]); err != nil {
+		dirent := dirents[fd.off]
+		dirent.Ino = d.inode.fs.ino(dirent.Ino)
+		if err := cb.Handle(dirent); err != nil {
 			return err
 		}
 		fd.off++
