@@ -51,6 +51,23 @@ func (pseg pmaIterator) unsavedFileRange(ar hostarch.AddrRange) (*pgalloc.Memory
 	return mf, fr, mf.HasUnsaved(fr)
 }
 
+type unsavedFileRangeOf struct {
+	mf *pgalloc.MemoryFile
+	fr memmap.FileRange
+}
+
+// unsavedFileRanges returns the file ranges of pmas from pseg through ar.End
+// that a write must wait for an early-resume save to save.
+func unsavedFileRanges(pseg pmaIterator, ar hostarch.AddrRange) []unsavedFileRangeOf {
+	var unsaved []unsavedFileRangeOf
+	for ; pseg.Ok() && pseg.Start() < ar.End; pseg = pseg.NextSegment() {
+		if mf, fr, ok := pseg.unsavedFileRange(ar); ok {
+			unsaved = append(unsaved, unsavedFileRangeOf{mf, fr})
+		}
+	}
+	return unsaved
+}
+
 // mapPMAWriteProtectedLocked is equivalent to mapPMALocked, except that pages
 // that an early-resume save has not saved yet are mapped read-only.
 //

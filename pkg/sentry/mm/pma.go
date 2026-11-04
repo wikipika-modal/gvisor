@@ -763,6 +763,8 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 		}
 	}
 
+	origAR := ar
+
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
@@ -785,6 +787,18 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 			return nil, perr
 		}
 		ar.End = pendaddr
+	}
+
+	// Devices write pinned pages without faulting, so pinned pages must be
+	// saved before they are pinned.
+	if at.Write {
+		if unsaved := unsavedFileRanges(pseg, ar); len(unsaved) != 0 {
+			mm.activeMu.Unlock()
+			for _, u := range unsaved {
+				u.mf.AwaitSaved(u.fr)
+			}
+			return mm.Pin(ctx, origAR, at, ignorePermissions)
+		}
 	}
 
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)

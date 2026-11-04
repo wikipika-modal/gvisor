@@ -1301,3 +1301,82 @@ func TestIODuringEarlyResumeSave(t *testing.T) {
 		t.Errorf("saved page differs from the page when saving began")
 	}
 }
+
+// TestPinDuringEarlyResumeSave tests that pinning pages for writing waits until
+// an early-resume save has saved them, since devices write pinned pages
+// without faulting.
+func TestPinDuringEarlyResumeSave(t *testing.T) {
+	// Larger than a huge page, so that MMap doesn't populate the mapping.
+	const size = 2 * earlyResumeMapUnit
+	ctx := contexttest.Context(t)
+
+	mf := newTestMemoryFile(t)
+	fr, err := mf.Allocate(size, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate got err %v want nil", err)
+	}
+	want := bytes.Repeat([]byte{1}, size)
+	if _, err := unix.Pwrite(mf.FD(), want, int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite got err %v want nil", err)
+	}
+	mm := testMemoryManager(ctx, t)
+	mm.mf = mf // mm has no mappings yet.
+	defer mm.DecUsers(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   size,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + size}
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	w := stateiotest.NewHeldWriter(time.Hour)
+	saveDone := make(chan error, 1)
+	apfs, err := pgalloc.StartAsyncPagesFileSave(w, func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave got err %v want nil", err)
+	}
+	if err := apfs.EnableEarlyResume(); err != nil {
+		t.Fatalf("EnableEarlyResume got err %v want nil", err)
+	}
+	if err := mf.SaveTo(ctx, io.Discard, &pgalloc.SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo got err %v want nil", err)
+	}
+	apfs.MemoryFilesDone()
+	mm.PrepareEarlyResumeSave()
+
+	// The first pages are held in flight; the last page isn't sent yet.
+	last := addr + size - pageSizeAddr
+	prs, err := mm.Pin(ctx, hostarch.AddrRange{last, last + pageSizeAddr}, hostarch.ReadWrite, false /* ignorePermissions */)
+	if err != nil {
+		t.Fatalf("Pin got err %v want nil", err)
+	}
+	defer Unpin(prs)
+	// A device writes the pinned page without faulting.
+	for _, pr := range prs {
+		if _, err := unix.Pwrite(mf.FD(), bytes.Repeat([]byte{2}, int(pr.Source.Length())), int64(pr.Offset)); err != nil {
+			t.Fatalf("Pwrite got err %v want nil", err)
+		}
+	}
+	w.Release()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("early-resume save got err %v want nil", err)
+	}
+	if got := w.Saved(fr.End - pageSize); !bytes.Equal(got, want[:hostarch.PageSize]) {
+		t.Errorf("saved page differs from the page when saving began")
+	}
+}
