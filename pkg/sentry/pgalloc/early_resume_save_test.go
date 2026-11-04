@@ -51,6 +51,7 @@ type heldWriter struct {
 	finalized    bool
 
 	priorityBytes      uint64
+	copyBytes          uint64
 	pendingPriority    int
 	maxPendingPriority int
 }
@@ -141,6 +142,9 @@ func (w *heldWriter) AddWritevAt(id int, off uint64, flags stateio.WriteFlags, t
 	}
 	if flags&stateio.WriteRepeat != 0 {
 		w.repeats++
+	}
+	if flags&stateio.WriteCopy != 0 {
+		w.copyBytes += total
 	}
 	w.pending = append(w.pending, heldWrite{id, off, flags, append([]unix.Iovec(nil), srcs...)})
 	w.cond.Broadcast()
@@ -378,4 +382,55 @@ func TestEarlyResumeSaveLimitsHeldPriorityWrites(t *testing.T) {
 	}
 
 	finishEarlyResumeSave(t, f, w, want, done)
+}
+
+func TestEarlyResumeSaveNowCopiesBeforeReturning(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(true)
+	fr, want, done := startEarlyResumeSave(t, f, w)
+
+	saveNow := []memmap.FileRange{testPage(fr, 2), {testPage(fr, 9).Start, testPage(fr, 12).End}}
+	if got, want := f.SaveNow(saveNow), 5*uint64(hostarch.PageSize); got != want {
+		t.Errorf("SaveNow saved %d bytes, want %d", got, want)
+	}
+	for _, sfr := range saveNow {
+		if f.HasUnsaved(sfr) {
+			t.Fatalf("%v unsaved after SaveNow", sfr)
+		}
+	}
+	if !f.HasUnsaved(testPage(fr, 14)) {
+		t.Errorf("page 14 saved while writes are held")
+	}
+	if w.copyBytes < 5*uint64(hostarch.PageSize) {
+		t.Errorf("%d bytes of copy writes, want at least 5 pages", w.copyBytes)
+	}
+	// A device may write pages saved by SaveNow without waiting.
+	f.forEachMappingSlice(testPage(fr, 10), func(bs []byte) { clear(bs) })
+
+	finishEarlyResumeSave(t, f, w, want, done)
+}
+
+func TestSubtractRanges(t *testing.T) {
+	r := func(s, e uint64) memmap.FileRange { return memmap.FileRange{s, e} }
+	for _, tc := range []struct {
+		frs, old, want []memmap.FileRange
+	}{
+		{frs: []memmap.FileRange{r(0, 10)}, old: nil, want: []memmap.FileRange{r(0, 10)}},
+		{frs: []memmap.FileRange{r(0, 10)}, old: []memmap.FileRange{r(0, 10)}, want: nil},
+		{frs: []memmap.FileRange{r(0, 10)}, old: []memmap.FileRange{r(2, 4), r(6, 7)}, want: []memmap.FileRange{r(0, 2), r(4, 6), r(7, 10)}},
+		{frs: []memmap.FileRange{r(0, 4), r(8, 12)}, old: []memmap.FileRange{r(3, 9)}, want: []memmap.FileRange{r(0, 3), r(9, 12)}},
+		{frs: []memmap.FileRange{r(5, 6)}, old: []memmap.FileRange{r(0, 1), r(10, 11)}, want: []memmap.FileRange{r(5, 6)}},
+	} {
+		got := SubtractRanges(tc.frs, tc.old)
+		if len(got) != len(tc.want) {
+			t.Errorf("SubtractRanges(%v, %v) = %v, want %v", tc.frs, tc.old, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("SubtractRanges(%v, %v) = %v, want %v", tc.frs, tc.old, got, tc.want)
+				break
+			}
+		}
+	}
 }

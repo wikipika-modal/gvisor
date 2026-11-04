@@ -58,6 +58,10 @@ type SaveOpts struct {
 	// state.SaveOpts.EarlyResume.
 	EarlyResume bool `json:"early_resume"`
 
+	// EarlyResumeGPU lets EarlyResume apply with nvproxy. See
+	// state.SaveOpts.EarlyResumeGPU.
+	EarlyResumeGPU bool `json:"early_resume_gpu"`
+
 	// ExecOpts contains options for executing a binary during save/restore.
 	ExecOpts SaveRestoreExecOpts
 

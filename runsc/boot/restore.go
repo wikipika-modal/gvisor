@@ -877,14 +877,28 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	l.saveMu.Lock()
 	defer l.saveMu.Unlock()
 
-	if saveOpts.EarlyResume && (l.root.conf.NVProxy || l.root.conf.TPUProxy || l.root.conf.RDMAProxy) {
+	if saveOpts.EarlyResume && saveOpts.EarlyResumeGPU && l.root.conf.NVProxy && !l.root.conf.TPUProxy && !l.root.conf.RDMAProxy {
+		saveOpts.AfterResume = func() error {
+			err := control.PostResume(l.k, nil)
+			if err != nil {
+				log.Warningf("Killing the sandbox after post resume work failed: %v", err)
+				l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			}
+			return err
+		}
+	} else if saveOpts.EarlyResume && (l.root.conf.NVProxy || l.root.conf.TPUProxy || l.root.conf.RDMAProxy) {
 		log.Warningf("Saving pages before resuming: device proxies can write to memory without faulting")
 		saveOpts.EarlyResume = false
+	}
+	if !saveOpts.EarlyResume {
+		saveOpts.EarlyResumeGPU = false
 	}
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.
-		if err == nil && saveOpts.Resume {
+		if err == nil && saveOpts.Resume && saveOpts.AfterResume != nil {
+			l.k.OnCheckpointAttempt(nil)
+		} else if err == nil && saveOpts.Resume {
 			go l.postResume()
 		} else {
 			l.k.OnCheckpointAttempt(err)

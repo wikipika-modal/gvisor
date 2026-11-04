@@ -756,6 +756,11 @@ type AsyncPagesFileSave struct {
 	// completed.
 	prioInflight int
 
+	// saveNowActive is the number of MemoryFile.SaveNow calls in progress.
+	// While it is non-zero, writes in pages file order wait, and priority
+	// writes may use the whole queue.
+	saveNowActive int
+
 	// erFiles are the MemoryFiles being saved, in pages file order.
 	erFiles []*asyncMemoryFileSave
 

@@ -1889,6 +1889,7 @@ type CheckpointOpts struct {
 	Compression               statefile.CompressionLevel
 	Resume                    bool
 	EarlyResume               bool
+	EarlyResumeGPU            bool
 	Direct                    bool
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
@@ -1922,6 +1923,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
 		Resume:                         opts.Resume,
 		EarlyResume:                    opts.EarlyResume,
+		EarlyResumeGPU:                 opts.EarlyResumeGPU,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
 		SplitFSCheckpointPaths:         bundles,

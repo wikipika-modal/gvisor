@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -74,6 +75,22 @@ type SaveOpts struct {
 	// writes to unsaved pages wait for them to be saved. It requires Resume
 	// and PagesFile.
 	EarlyResume bool
+
+	// EarlyResumeGPU makes EarlyResume work with nvproxy, whose pinned memory
+	// devices write without faulting: pinned memory and the memory
+	// cuda-checkpoint allocated, which holds device state until CUDA state is
+	// restored, are saved before resuming (see SaveBeforeResume), and
+	// AfterResume restores CUDA state as soon as the kernel resumes.
+	EarlyResumeGPU bool
+
+	// SaveBeforeResume, if set, returns application MemoryFile ranges that
+	// an early-resume save saves before resuming.
+	SaveBeforeResume func() []memmap.FileRange
+
+	// AfterResume, if set, is called once an early-resume save resumes the
+	// kernel, concurrently with saving the remaining pages. Save returns its
+	// error if saving succeeds.
+	AfterResume func() error
 
 	// Autosave indicates if the statefile is used for autosave.
 	Autosave bool
@@ -188,7 +205,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.Destination = nil
 		// Save the kernel.
 		var waitPages func() error
-		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, appMFPrescan, opts.Resume, opts.EarlyResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, appMFPrescan, opts.Resume, opts.EarlyResume, opts.SaveBeforeResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
@@ -197,7 +214,16 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 			k.Unpause()
 			resumed = true
 			log.Infof("Tasks resumed after save, before saving pages.")
+			afterResume := make(chan error, 1)
+			if opts.AfterResume != nil {
+				go func() { afterResume <- opts.AfterResume() }()
+			} else {
+				afterResume <- nil
+			}
 			err = waitPages()
+			if arErr := <-afterResume; err == nil {
+				err = arErr
+			}
 			log.Infof("Pages saved after resuming.")
 		}
 	}

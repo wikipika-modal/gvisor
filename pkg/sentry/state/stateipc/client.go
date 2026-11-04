@@ -515,6 +515,9 @@ func (rw *asyncReadWriter) AddWritevAt(id int, off uint64, wflags stateio.WriteF
 	if wflags&stateio.WriteRepeat != 0 {
 		flags |= writeSubmissionFlagRepeat
 	}
+	if wflags&stateio.WriteCopy != 0 {
+		flags |= writeSubmissionFlagCopy
+	}
 	subHdr := rw.ioep.scanWriteSubmissionHeader()
 	numRanges := uint32(len(srcFRs))
 	*subHdr = writeSubmissionHeader{

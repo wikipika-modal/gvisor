@@ -15,9 +15,11 @@
 package pgalloc
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/gohacks"
@@ -60,6 +62,10 @@ type apsUnsavedInfo struct {
 	// prioritySent is true if a priority write of the segment has been
 	// enqueued.
 	prioritySent bool
+
+	// copy is true if the segment's priority write must be copied by the
+	// pages file before it completes; see MemoryFile.SaveNow.
+	copy bool
 }
 
 type apsUnsavedSetFunctions struct{}
@@ -76,7 +82,7 @@ func (apsUnsavedSetFunctions) ClearValue(*apsUnsavedInfo) {
 }
 
 func (apsUnsavedSetFunctions) Merge(fr1 memmap.FileRange, us1 apsUnsavedInfo, fr2 memmap.FileRange, us2 apsUnsavedInfo) (apsUnsavedInfo, bool) {
-	if us1.off+fr1.Length() != us2.off || us1.priority != us2.priority || us1.inflight != us2.inflight || us1.prioritySent != us2.prioritySent {
+	if us1.off+fr1.Length() != us2.off || us1.priority != us2.priority || us1.inflight != us2.inflight || us1.prioritySent != us2.prioritySent || us1.copy != us2.copy {
 		return apsUnsavedInfo{}, false
 	}
 	return us1, true
@@ -152,7 +158,11 @@ func (amfs *asyncMemoryFileSave) addUnsavedLocked(fr memmap.FileRange, off uint6
 //
 // Preconditions: apfs.mu must be locked.
 func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
-	for apfs.canEnqueue() && apfs.prioInflight < apfs.maxPrioInflight && !apfs.priority.Empty() {
+	maxPrioInflight := apfs.maxPrioInflight
+	if apfs.saveNowActive != 0 {
+		maxPrioInflight = math.MaxInt
+	}
+	for apfs.canEnqueue() && apfs.prioInflight < maxPrioInflight && !apfs.priority.Empty() {
 		pr := apfs.priority.PeekFrontPtr()
 		useg := pr.amfs.unsaved.LowerBoundSegment(pr.Start)
 		for useg.Ok() && useg.Start() < pr.End && (!useg.ValuePtr().priority || useg.ValuePtr().prioritySent) {
@@ -172,11 +182,14 @@ func (apfs *AsyncPagesFileSave) enqueueEarlyResumeLocked() {
 		if useg.ValuePtr().inflight {
 			flags |= stateio.WriteRepeat
 		}
+		if useg.ValuePtr().copy {
+			flags |= stateio.WriteCopy
+		}
 		n := apfs.enqueueUnsaved(pr.amfs, useg, useg.Range().Intersect(pr.FileRange), flags)
 		apfs.enqueueCurOp()
 		pr.Start = max(pr.Start, useg.Start()) + n
 	}
-	for apfs.qavail > apfs.prioReserve && apfs.erCursorFile < len(apfs.erFiles) {
+	for apfs.qavail > apfs.prioReserve && apfs.saveNowActive == 0 && apfs.erCursorFile < len(apfs.erFiles) {
 		amfs := apfs.erFiles[apfs.erCursorFile]
 		useg := amfs.unsaved.LowerBoundSegment(apfs.erCursor)
 		for useg.Ok() && (useg.ValuePtr().priority || useg.ValuePtr().inflight) {
@@ -343,6 +356,63 @@ func (f *MemoryFile) UnsavedRanges(fr memmap.FileRange, frs []memmap.FileRange) 
 	return frs
 }
 
+// SaveNow saves every unsaved page in frs ahead of other pages, with writes
+// that the pages file completes only once it holds its own copy of them, and
+// returns once all are saved. Callers save memory this way before resuming
+// when a device may write it without faulting, or it will be freed soon after
+// resuming. It returns the number of bytes it waited for.
+func (f *MemoryFile) SaveNow(frs []memmap.FileRange) uint64 {
+	amfs := f.earlyResumeSave.Load()
+	if amfs == nil {
+		return 0
+	}
+	apfs := amfs.pf
+	var total uint64
+	apfs.mu.Lock()
+	apfs.saveNowActive++
+	requested := false
+	for _, fr := range frs {
+		fr.Start = hostarch.PageRoundDown(fr.Start)
+		fr.End = hostarch.MustPageRoundUp(fr.End)
+		if apfs.erDone || amfs.unsaved.IsEmptyRange(fr) {
+			continue
+		}
+		amfs.unsaved.MutateRange(fr, func(useg apsUnsavedIterator) bool {
+			us := useg.ValuePtr()
+			total += useg.Range().Intersect(fr).Length()
+			if !us.priority && (!us.inflight || apfs.repeats) {
+				us.priority = true
+				us.copy = true
+				requested = true
+			}
+			return true
+		})
+		apfs.priority.PushBack(apsRange{amfs: amfs, FileRange: fr})
+	}
+	apfs.mu.Unlock()
+	if requested {
+		apfs.stStatus.Notify(apsSTPending)
+	}
+	timeStart := gohacks.Nanotime()
+	apfs.mu.Lock()
+	apfs.erWaits++
+	for _, fr := range frs {
+		fr.Start = hostarch.PageRoundDown(fr.Start)
+		fr.End = hostarch.MustPageRoundUp(fr.End)
+		for !apfs.erDone && !amfs.unsaved.IsEmptyRange(fr) {
+			savedCh := apfs.savedCh
+			apfs.mu.Unlock()
+			<-savedCh
+			apfs.mu.Lock()
+		}
+	}
+	apfs.erWaitDur += time.Duration(gohacks.Nanotime() - timeStart)
+	apfs.saveNowActive--
+	apfs.mu.Unlock()
+	apfs.stStatus.Notify(apsSTPending)
+	return total
+}
+
 func (amfs *asyncMemoryFileSave) awaitSaved(fr memmap.FileRange) {
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = hostarch.MustPageRoundUp(fr.End)
@@ -384,4 +454,42 @@ func (amfs *asyncMemoryFileSave) awaitSaved(fr memmap.FileRange) {
 	}
 	apfs.erWaitDur += time.Duration(gohacks.Nanotime() - timeStart)
 	apfs.mu.Unlock()
+}
+
+// AllocatedRanges returns the ranges of f whose pages are in use, in order.
+func (f *MemoryFile) AllocatedRanges() []memmap.FileRange {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var frs []memmap.FileRange
+	for _, unfree := range []*unfreeSet{&f.unfreeSmall, &f.unfreeHuge} {
+		for seg := unfree.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if seg.ValuePtr().refs != 0 {
+				frs = append(frs, seg.Range())
+			}
+		}
+	}
+	slices.SortFunc(frs, func(a, b memmap.FileRange) int { return cmp.Compare(a.Start, b.Start) })
+	return frs
+}
+
+// SubtractRanges returns the parts of frs, sorted and disjoint, that aren't
+// in old, sorted and disjoint.
+func SubtractRanges(frs, old []memmap.FileRange) []memmap.FileRange {
+	var out []memmap.FileRange
+	i := 0
+	for _, fr := range frs {
+		for i < len(old) && old[i].End <= fr.Start {
+			i++
+		}
+		for j := i; j < len(old) && old[j].Start < fr.End && fr.Length() != 0; j++ {
+			if old[j].Start > fr.Start {
+				out = append(out, memmap.FileRange{fr.Start, old[j].Start})
+			}
+			fr.Start = min(max(fr.Start, old[j].End), fr.End)
+		}
+		if fr.Length() != 0 {
+			out = append(out, fr)
+		}
+	}
+	return out
 }

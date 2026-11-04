@@ -71,6 +71,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -807,7 +808,10 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 //
 // If appMFPrescan is not nil, it is the result of
 // k.MemoryFile().PrescanZeroPages(appMFExcludeCommittedZeroPages).
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, fsOpts *FSSaveOpts) (func() error, error) {
+//
+// If earlyResume is true and saveBeforeResume is not nil, SaveTo saves the
+// application memory ranges it returns before returning.
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, saveBeforeResume func() []memmap.FileRange, fsOpts *FSSaveOpts) (func() error, error) {
 	stateFileCleanup := cleanup.Make(func() { stateFile.Close() })
 	defer stateFileCleanup.Clean()
 
@@ -839,7 +843,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	var waitPages func() error
 	err := k.quiescePausedAnd(ctx, resumeTime, func() error {
 		var err error
-		waitPages, err = k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, appMFPrescan, resume, earlyResume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		waitPages, err = k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, appMFPrescan, resume, earlyResume, saveBeforeResume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 		return err
 	})
 	return waitPages, err
@@ -848,7 +852,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (_ func() error, retErr error) {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, resume, earlyResume bool, saveBeforeResume func() []memmap.FileRange, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (_ func() error, retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
@@ -895,7 +899,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			mfSaveWait, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, earlyResume) // transfers ownership
+			mfSaveWait, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, earlyResume, saveBeforeResume) // transfers ownership
 		}()
 		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -965,7 +969,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return nil, mfSaveErr
 		}
 	} else {
-		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, false)
+		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, appMFPrescan, false, nil)
 		if mfSaveErr != nil {
 			return nil, mfSaveErr
 		}
@@ -995,8 +999,9 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // MemoryFile state will be saved to pagesMetadata and pagesFile.
 //
 // If earlyResume is true, saveMemoryFiles returns without waiting for page
-// saving, and returns a function that does.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, earlyResume bool) (func() error, error) {
+// saving, and returns a function that does, after saving the application
+// memory ranges that saveBeforeResume returns, if it is not nil.
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool, appMFPrescan *pgalloc.ZeroPagesPrescan, earlyResume bool, saveBeforeResume func() []memmap.FileRange) (func() error, error) {
 	memoryStart := time.Now()
 
 	pmw := w
@@ -1074,6 +1079,12 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	if earlyResume {
 		mfOpts.PagesFile.MemoryFilesDone()
 		log.Infof("Memory files metadata save took [%s]; saving pages after resuming.", time.Since(memoryStart))
+		if saveBeforeResume != nil {
+			start := time.Now()
+			frs := saveBeforeResume()
+			n := k.mf.SaveNow(frs)
+			log.Infof("Saved %d bytes in %d ranges before resuming in [%s].", n, len(frs), time.Since(start))
+		}
 		return waitPages, nil
 	}
 	return nil, waitPages()

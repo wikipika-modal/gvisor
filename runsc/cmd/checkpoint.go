@@ -38,6 +38,7 @@ type Checkpoint struct {
 	imagePath                 string
 	leaveRunning              bool
 	earlyResume               bool
+	earlyResumeGPU            bool
 	compression               CheckpointCompression
 	excludeCommittedZeroPages bool
 	cudaCheckpointPath        string
@@ -74,6 +75,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved container image")
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
 	f.BoolVar(&c.earlyResume, "early-resume", false, "with -leave-running, restart the container before memory pages are saved; writes to unsaved pages wait for them to be saved. Requires a checkpoint gofer that supports positioned writes, and is unsupported with GPUs")
+	f.BoolVar(&c.earlyResumeGPU, "early-resume-gpu", false, "with -early-resume and nvproxy, save pinned application memory and memory allocated by cuda-checkpoint before resuming, restore CUDA state as soon as the container resumes, and save the rest after. Requires a checkpoint gofer that supports copy writes")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
@@ -125,6 +127,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		Compression:                c.compression.Level(),
 		Resume:                     c.leaveRunning,
 		EarlyResume:                c.earlyResume,
+		EarlyResumeGPU:             c.earlyResumeGPU,
 		Direct:                     c.direct,
 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
 		CudaCheckpointPath:         c.cudaCheckpointPath,

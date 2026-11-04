@@ -247,6 +247,10 @@ const writeSubmissionFlagOffset = 1 << 1
 // incomplete earlier write; see stateio.WriteRepeat.
 const writeSubmissionFlagRepeat = 1 << 2
 
+// writeSubmissionFlagCopy marks a priority write that the server must copy
+// out of the client's memory before completing it; see stateio.WriteCopy.
+const writeSubmissionFlagCopy = 1 << 3
+
 type ioResponseHeader struct {
 	// If Errno is non-zero, it is a fatal unix.Errno.
 	Errno int32

@@ -218,6 +218,12 @@ const (
 	// PositionedWriter completes it once the earlier write no longer reads the
 	// range's source.
 	WriteRepeat
+
+	// WriteCopy marks a priority write whose source may be written by a
+	// device, or freed, as soon as it completes. The PositionedWriter must
+	// complete it only once it holds its own copy of the source, whatever its
+	// limits on such copies.
+	WriteCopy
 )
 
 // AsyncWriter represents a file supporting asynchronous sequential writes.
