@@ -210,6 +210,11 @@ type MemoryFile struct {
 	// pages of f.
 	earlyResumeSave atomic.Pointer[asyncMemoryFileSave]
 
+	// deferUnsavedRelease makes the releaser wait for freed pages to be
+	// saved in pages file order, rather than ahead of other pages, during an
+	// early-resume save.
+	deferUnsavedRelease atomicbitops.Bool
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -1374,6 +1379,11 @@ MainLoop:
 
 // Preconditions: f.mu must be locked; it may be unlocked and reacquired.
 func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
+	if f.deferUnsavedRelease.Load() {
+		f.mu.Unlock()
+		f.awaitSavedInOrder(fr)
+		f.mu.Lock()
+	}
 	defer func() {
 		maseg := f.memAcct.LowerBoundSegmentSplitBefore(fr.Start)
 		for maseg.Ok() && maseg.Start() < fr.End {

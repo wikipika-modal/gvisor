@@ -222,6 +222,14 @@ func (w *heldWriter) Finalize() error {
 func startEarlyResumeSave(t *testing.T, f *MemoryFile, w *heldWriter) (memmap.FileRange, []byte, chan error) {
 	t.Helper()
 	fr := allocateSaveTestPages(t, f)
+	want, done := startEarlyResumeSaveOf(t, f, w, fr)
+	return fr, want, done
+}
+
+// startEarlyResumeSaveOf is startEarlyResumeSave for 16 pages allocated by
+// the caller.
+func startEarlyResumeSaveOf(t *testing.T, f *MemoryFile, w *heldWriter, fr memmap.FileRange) ([]byte, chan error) {
+	t.Helper()
 	for i := 0; i < 16; i++ {
 		pwritePage(t, f, fr, i, byte(i+1))
 	}
@@ -244,7 +252,7 @@ func startEarlyResumeSave(t *testing.T, f *MemoryFile, w *heldWriter) (memmap.Fi
 	if !f.IsEarlyResumeSaving() {
 		t.Fatalf("IsEarlyResumeSaving: got false after SaveTo")
 	}
-	return fr, want, done
+	return want, done
 }
 
 // finishEarlyResumeSave releases w's writes, waits for saving to finish, and
@@ -406,6 +414,33 @@ func TestEarlyResumeSaveNowCopiesBeforeReturning(t *testing.T) {
 	}
 	// A device may write pages saved by SaveNow without waiting.
 	f.forEachMappingSlice(testPage(fr, 10), func(bs []byte) { clear(bs) })
+
+	finishEarlyResumeSave(t, f, w, want, done)
+}
+
+func TestEarlyResumeSaveDefersUnsavedRelease(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	w := newHeldWriter(true)
+	fr, err := f.Allocate(16*uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	t.Cleanup(func() {
+		f.DecRef(memmap.FileRange{fr.Start, testPage(fr, 12).Start})
+		f.DecRef(memmap.FileRange{testPage(fr, 13).Start, fr.End})
+	})
+	want, done := startEarlyResumeSaveOf(t, f, w, fr)
+	f.SetDeferUnsavedRelease(true)
+	defer f.SetDeferUnsavedRelease(false)
+
+	f.DecRef(testPage(fr, 12))
+	time.Sleep(50 * time.Millisecond)
+	if !f.HasUnsaved(testPage(fr, 12)) {
+		t.Errorf("freed page 12 saved while writes are held")
+	}
+	if bytes, _ := w.stats(); bytes != 0 {
+		t.Errorf("releasing a freed page made %d bytes of priority writes, want 0", bytes)
+	}
 
 	finishEarlyResumeSave(t, f, w, want, done)
 }

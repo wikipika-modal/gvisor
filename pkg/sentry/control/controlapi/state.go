@@ -62,6 +62,9 @@ type SaveOpts struct {
 	// state.SaveOpts.EarlyResumeGPU.
 	EarlyResumeGPU bool `json:"early_resume_gpu"`
 
+	// EarlyResumeGPUDeferStaged: see state.SaveOpts.EarlyResumeGPUDeferStaged.
+	EarlyResumeGPUDeferStaged bool `json:"early_resume_gpu_defer_staged"`
+
 	// ExecOpts contains options for executing a binary during save/restore.
 	ExecOpts SaveRestoreExecOpts
 

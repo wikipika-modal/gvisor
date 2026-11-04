@@ -1890,6 +1890,7 @@ type CheckpointOpts struct {
 	Resume                    bool
 	EarlyResume               bool
 	EarlyResumeGPU            bool
+	EarlyResumeGPUDeferStaged bool
 	Direct                    bool
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
@@ -1924,6 +1925,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Resume:                         opts.Resume,
 		EarlyResume:                    opts.EarlyResume,
 		EarlyResumeGPU:                 opts.EarlyResumeGPU,
+		EarlyResumeGPUDeferStaged:      opts.EarlyResumeGPUDeferStaged,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
 		SplitFSCheckpointPaths:         bundles,

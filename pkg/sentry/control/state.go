@@ -78,6 +78,7 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		EarlyResume:                    o.EarlyResume,
 		EarlyResumeGPU:                 o.EarlyResumeGPU,
+		EarlyResumeGPUDeferStaged:      o.EarlyResumeGPUDeferStaged,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
 	}
@@ -247,6 +248,7 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Save
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
+	defer s.Kernel.MemoryFile().SetDeferUnsavedRelease(false)
 	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
 }
 
@@ -286,10 +288,16 @@ func preSaveCudaEarlyResume(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	o.SaveBeforeResume = func() []memmap.FileRange {
 		staged := pgalloc.SubtractRanges(mf.AllocatedRanges(), before)
-		frs := staged
+		var frs []memmap.FileRange
 		var stagedBytes, pinnedBytes, otherBytes uint64
 		for _, fr := range staged {
 			stagedBytes += fr.Length()
+		}
+		if o.EarlyResumeGPUDeferStaged {
+			// Restoring CUDA state only reads the staged memory, then frees it.
+			mf.SetDeferUnsavedRelease(true)
+		} else {
+			frs = staged
 		}
 		for _, pr := range append(pinnedBefore, nvproxy.PinnedRanges()...) {
 			if pr.File != memmap.File(mf) {

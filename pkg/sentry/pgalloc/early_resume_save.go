@@ -456,6 +456,31 @@ func (amfs *asyncMemoryFileSave) awaitSaved(fr memmap.FileRange) {
 	apfs.mu.Unlock()
 }
 
+// SetDeferUnsavedRelease sets whether freed pages that an early-resume save
+// hasn't saved yet are released only once saved in pages file order, rather
+// than saved ahead of other pages so that they can be released at once.
+func (f *MemoryFile) SetDeferUnsavedRelease(deferRelease bool) {
+	f.deferUnsavedRelease.Store(deferRelease)
+}
+
+// awaitSavedInOrder blocks until all pages in fr are saved, without saving
+// them ahead of other pages.
+func (f *MemoryFile) awaitSavedInOrder(fr memmap.FileRange) {
+	amfs := f.earlyResumeSave.Load()
+	if amfs == nil {
+		return
+	}
+	apfs := amfs.pf
+	apfs.mu.Lock()
+	defer apfs.mu.Unlock()
+	for !apfs.erDone && !amfs.unsaved.IsEmptyRange(fr) {
+		savedCh := apfs.savedCh
+		apfs.mu.Unlock()
+		<-savedCh
+		apfs.mu.Lock()
+	}
+}
+
 // AllocatedRanges returns the ranges of f whose pages are in use, in order.
 func (f *MemoryFile) AllocatedRanges() []memmap.FileRange {
 	f.mu.Lock()

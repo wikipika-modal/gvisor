@@ -39,6 +39,7 @@ type Checkpoint struct {
 	leaveRunning              bool
 	earlyResume               bool
 	earlyResumeGPU            bool
+	earlyResumeGPUDeferStaged bool
 	compression               CheckpointCompression
 	excludeCommittedZeroPages bool
 	cudaCheckpointPath        string
@@ -76,6 +77,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
 	f.BoolVar(&c.earlyResume, "early-resume", false, "with -leave-running, restart the container before memory pages are saved; writes to unsaved pages wait for them to be saved. Requires a checkpoint gofer that supports positioned writes, and is unsupported with GPUs")
 	f.BoolVar(&c.earlyResumeGPU, "early-resume-gpu", false, "with -early-resume and nvproxy, save pinned application memory and memory allocated by cuda-checkpoint before resuming, restore CUDA state as soon as the container resumes, and save the rest after. Requires a checkpoint gofer that supports copy writes")
+	f.BoolVar(&c.earlyResumeGPUDeferStaged, "early-resume-gpu-defer-staged", false, "with -early-resume-gpu, leave the memory cuda-checkpoint allocated in place rather than saving it before resuming, and free it only once it is saved")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
@@ -128,6 +130,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		Resume:                     c.leaveRunning,
 		EarlyResume:                c.earlyResume,
 		EarlyResumeGPU:             c.earlyResumeGPU,
+		EarlyResumeGPUDeferStaged:  c.earlyResumeGPUDeferStaged,
 		Direct:                     c.direct,
 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
 		CudaCheckpointPath:         c.cudaCheckpointPath,

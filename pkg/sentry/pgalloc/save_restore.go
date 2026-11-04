@@ -1122,8 +1122,15 @@ func (apfs *AsyncPagesFileSave) main() {
 		}
 
 		if apfs.qavail == maxParallel {
-			// We are out of work to do.
-			ev := apfs.stStatus.Wait()
+			// We are out of work to do. While MemoryFile.SaveNow() holds back
+			// writes in pages file order, only it can give us more.
+			apfs.mu.Lock()
+			waitEvents := syncevent.AllEvents
+			if apfs.saveNowActive != 0 {
+				waitEvents = apsSTPending
+			}
+			apfs.mu.Unlock()
+			ev := apfs.stStatus.WaitFor(waitEvents)
 			if ev&apsSTPending != 0 {
 				// We may have raced with MemoryFile.SaveTo() inserting into
 				// apfs.unsaved.

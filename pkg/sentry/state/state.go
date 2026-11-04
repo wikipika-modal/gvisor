@@ -83,6 +83,12 @@ type SaveOpts struct {
 	// AfterResume restores CUDA state as soon as the kernel resumes.
 	EarlyResumeGPU bool
 
+	// EarlyResumeGPUDeferStaged makes EarlyResumeGPU leave the memory
+	// cuda-checkpoint allocated unsaved when resuming. It stays
+	// write-protected, and once freed it is released only after it is saved
+	// in pages file order.
+	EarlyResumeGPUDeferStaged bool
+
 	// SaveBeforeResume, if set, returns application MemoryFile ranges that
 	// an early-resume save saves before resuming.
 	SaveBeforeResume func() []memmap.FileRange
