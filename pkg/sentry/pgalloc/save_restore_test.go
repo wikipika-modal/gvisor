@@ -258,7 +258,7 @@ func TestDecommitDuringAsyncLoad(t *testing.T) {
 	defer release.Do(func() { close(gate) })
 	loaded := make(chan error, 1)
 	reader := &gatedPageReader{bytes.NewReader(pages.Bytes()), gate}
-	apfl, err := StartAsyncPagesFileLoad(stateio.NewIOReader(reader, 1<<20, 16, 4), func(err error) { loaded <- err }, nil)
+	apfl, err := StartAsyncPagesFileLoad(stateio.NewIOReader(reader, 1<<20, 16, 4), func(err error) { loaded <- err }, nil, AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

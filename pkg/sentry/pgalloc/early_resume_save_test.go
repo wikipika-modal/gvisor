@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -30,30 +31,33 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
-// heldWriter completes priority writes at once, and other writes only after
-// release(). It copies each write's source when completing it, as an external
-// server would.
+// heldWriter completes priority writes at once and other writes after a
+// short delay or release(). It copies sources at completion and obeys Wait
+// minCompletions, as the Modal disk writer does.
 type heldWriter struct {
 	stateio.NoRegisterClientFD
 
-	mu        sync.Mutex
-	cond      sync.Cond
-	released  bool
-	pending   []heldWrite
-	file      []byte
-	priority  int
-	finalized bool
+	mu            sync.Mutex
+	cond          sync.Cond
+	released      bool
+	pending       []heldWrite
+	file          []byte
+	priority      int
+	priorityBytes uint64
+	unit          uint64
+	finalized     bool
 }
 
 type heldWrite struct {
 	id       int
 	off      uint64
 	priority bool
+	added    time.Time
 	srcs     []unix.Iovec
 }
 
 func newHeldWriter() *heldWriter {
-	w := &heldWriter{}
+	w := &heldWriter{unit: hostarch.PageSize}
 	w.cond.L = &w.mu
 	return w
 }
@@ -70,7 +74,7 @@ func (w *heldWriter) MaxWriteBytes() uint64 { return uint64(hostarch.PageSize) }
 func (w *heldWriter) MaxRanges() int        { return 4 }
 func (w *heldWriter) MaxParallel() int      { return 8 }
 func (w *heldWriter) Reserve(uint64)        {}
-func (w *heldWriter) PriorityUnit() uint64  { return hostarch.PageSize }
+func (w *heldWriter) PriorityUnit() uint64  { return w.unit }
 
 func (w *heldWriter) AddWrite(int, stateio.SourceFile, memmap.FileRange, []byte) {
 	panic("appending write during early-resume save")
@@ -85,8 +89,9 @@ func (w *heldWriter) AddWritevAt(id int, off uint64, priority bool, total uint64
 	defer w.mu.Unlock()
 	if priority {
 		w.priority++
+		w.priorityBytes += total
 	}
-	w.pending = append(w.pending, heldWrite{id, off, priority, append([]unix.Iovec(nil), srcs...)})
+	w.pending = append(w.pending, heldWrite{id, off, priority, time.Now(), append([]unix.Iovec(nil), srcs...)})
 	w.cond.Broadcast()
 }
 
@@ -96,7 +101,7 @@ func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 	for {
 		var rest []heldWrite
 		for _, hw := range w.pending {
-			if !hw.priority && !w.released {
+			if !hw.priority && !w.released && time.Since(hw.added) < 200*time.Millisecond {
 				rest = append(rest, hw)
 				continue
 			}
@@ -116,7 +121,13 @@ func (w *heldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 		if minCompletions <= 0 {
 			return cs, nil
 		}
-		w.cond.Wait()
+		if len(rest) != 0 {
+			w.mu.Unlock()
+			time.Sleep(time.Millisecond)
+			w.mu.Lock()
+		} else {
+			w.cond.Wait()
+		}
 	}
 }
 
@@ -172,6 +183,12 @@ func TestEarlyResumeSaveWaitsForWrittenPages(t *testing.T) {
 	if f.HasUnsaved(page(12)) {
 		t.Fatalf("page 12 unsaved after MapInternal(Write)")
 	}
+	w.mu.Lock()
+	priorityBytes := w.priorityBytes
+	w.mu.Unlock()
+	if priorityBytes != hostarch.PageSize {
+		t.Errorf("priority wrote %d bytes, want advertised one-page unit", priorityBytes)
+	}
 	ims.Head().ToSlice()[17] = 0xff
 	f.Decommit(page(13))
 
@@ -209,5 +226,25 @@ func TestEarlyResumeRefusedWithoutPositionedWrites(t *testing.T) {
 	}
 	if apfs.earlyResume {
 		t.Fatalf("early resume enabled after refusal")
+	}
+}
+
+func TestEarlyResumeRejectsInvalidPriorityUnits(t *testing.T) {
+	for _, unit := range []uint64{1, hostarch.PageSize * 3, maxEarlyResumePriorityUnit * 2} {
+		t.Run(fmt.Sprint(unit), func(t *testing.T) {
+			w := newHeldWriter()
+			w.unit = unit
+			apfs, err := StartAsyncPagesFileSave(w, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer apfs.MemoryFilesDone()
+			if err := apfs.EnableEarlyResume(); err == nil {
+				t.Fatal("invalid priority unit accepted")
+			}
+			if apfs.earlyResume {
+				t.Fatal("early resume enabled after invalid priority unit")
+			}
+		})
 	}
 }

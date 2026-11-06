@@ -663,4 +663,3 @@ func TestClientWatchdogFailsReadsInFlightOnDisconnect(t *testing.T) {
 		t.Fatalf("AsyncReader.Wait of a read in flight didn't return within 2s of disconnection")
 	}
 }
-

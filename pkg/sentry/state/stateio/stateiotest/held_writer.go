@@ -139,10 +139,8 @@ func (w *HeldWriter) Wait(cs []stateio.Completion, minCompletions int) ([]statei
 		if len(cs) >= minLen {
 			return cs, nil
 		}
-		{
-			w.mu.Unlock()
-			time.Sleep(time.Millisecond)
-			w.mu.Lock()
-		}
+		w.mu.Unlock()
+		time.Sleep(time.Millisecond)
+		w.mu.Lock()
 	}
 }
