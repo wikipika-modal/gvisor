@@ -64,6 +64,9 @@ type OpenResponse struct {
 	// MaxParallel is the maximum number of parallel read/write requests.
 	MaxParallel uint32 `json:"max_parallel"`
 
+	// Lazy asks the client to read only what it waits for.
+	Lazy bool `json:"lazy"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload

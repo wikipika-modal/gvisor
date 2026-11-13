@@ -131,6 +131,12 @@ type ReadPrioritizer interface {
 	PrioritizeLastRead()
 }
 
+// LazyReader is implemented by AsyncReaders that can ask to load only pages
+// that someone waits for.
+type LazyReader interface {
+	Lazy() bool
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

@@ -156,6 +156,7 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		maxIOBytes:  resp.MaxIOBytes,
 		maxRanges:   resp.MaxRanges,
 		maxParallel: resp.MaxParallel,
+		lazy:        resp.Lazy,
 		handle:      resp.Handle,
 		isReader:    mode == OpenModeRead,
 	}
@@ -188,6 +189,7 @@ type asyncReadWriter struct {
 	maxIOBytes  uint32
 	maxRanges   uint32
 	maxParallel uint32
+	lazy        bool
 	handle      uint32
 	isReader    bool
 
@@ -343,6 +345,11 @@ func (rw *asyncReadWriter) AddReadv(id int, off int64, total uint64, dstFile sta
 	rw.lastReadSub = subHdr
 	copy(rw.ioep.scanFileRanges(numRanges), dstFRs)
 	rw.numSubmissions++
+}
+
+// Lazy implements stateio.LazyReader.Lazy.
+func (rw *asyncReadWriter) Lazy() bool {
+	return rw.lazy
 }
 
 // PrioritizeLastRead implements stateio.ReadPrioritizer.PrioritizeLastRead.

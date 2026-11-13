@@ -1363,6 +1363,9 @@ type AsyncPagesFileLoad struct {
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
 
+	// If lazy is true, only awaited pages are loaded. lazy is immutable.
+	lazy bool
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -1391,6 +1394,7 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	aplPriority
 )
 
 type aplFileRange struct {
@@ -1517,6 +1521,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		doneCallback:     doneCallback,
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		lazy:             isLazy(ar),
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1535,6 +1540,11 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+func isLazy(ar stateio.AsyncReader) bool {
+	lr, ok := ar.(stateio.LazyReader)
+	return ok && lr.Lazy()
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -1617,6 +1627,9 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.totalWaiters++
 	}
 	apfl.mu.Unlock()
+	if pending && apfl.lazy {
+		apfl.lfStatus.Notify(aplPriority)
+	}
 	if pending {
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
@@ -1628,6 +1641,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		}
 	}
 	return apfl.err()
+}
+
+func (apfl *AsyncPagesFileLoad) loading() bool {
+	apfl.amflsMu.Lock()
+	defer apfl.amflsMu.Unlock()
+	return !apfl.amfls.Empty()
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
@@ -1932,7 +1951,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		if apfl.canEnqueue() && !apfl.lazy {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1995,6 +2014,15 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
 				// asyncMemoryFileLoad.unloaded.
 				apfl.lfStatus.Ack(aplLFPending)
+				continue
+			}
+			if ev&aplPriority != 0 {
+				apfl.lfStatus.Ack(aplPriority)
+				continue
+			}
+			if ev&aplLFDone != 0 && apfl.lazy && apfl.loading() {
+				// Keep serving waiters until every page is loaded.
+				apfl.lfStatus.Ack(aplLFDone)
 				continue
 			}
 			if ev&aplLFDone != 0 {
