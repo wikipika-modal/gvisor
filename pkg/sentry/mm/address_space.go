@@ -87,6 +87,8 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
+	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsEarlyResumeSaving() {
+		setMapUnit(earlyResumeMapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
 		setMapUnit(asyncLoadMapUnit)
 	}
@@ -107,31 +109,43 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			perms.Write = false
 		}
 		if perms.Any() { // MapFile precondition
-			// If the length of the mapping exceeds singleMapThreshold, call
-			// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so
-			// we can check ctx.Killed() reasonably frequently.
-			const singleMapThreshold = 1 << 30
-			if pmaMapAR.Length() <= singleMapThreshold {
-				if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
-					return err
-				}
-				if ctx.Killed() {
-					return linuxerr.EINTR
-				}
-			} else {
-				for windowStart := pmaMapAR.Start &^ (singleMapThreshold - 1); windowStart < pmaMapAR.End; windowStart += singleMapThreshold {
-					windowAR := hostarch.AddrRange{windowStart, windowStart + singleMapThreshold}
-					thisMapAR := pmaMapAR.Intersect(windowAR)
-					if err := mm.as.MapFile(thisMapAR.Start, pma.file, pseg.fileRangeOf(thisMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
-						return err
-					}
-					if ctx.Killed() {
-						return linuxerr.EINTR
-					}
-				}
+			if err := mm.mapPMAWriteProtectedLocked(ctx, pseg, pmaMapAR, perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
+				return err
 			}
 		}
 		pseg = pseg.NextSegment()
+	}
+	return nil
+}
+
+// mapPMALocked maps ar, which must be within pseg, into mm.as with the given
+// permissions.
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) mapPMALocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, perms hostarch.AccessType, precommit bool) error {
+	pma := pseg.ValuePtr()
+	// If the length of the mapping exceeds singleMapThreshold, call
+	// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so we can
+	// check ctx.Killed() reasonably frequently.
+	const singleMapThreshold = 1 << 30
+	if ar.Length() <= singleMapThreshold {
+		if err := mm.as.MapFile(ar.Start, pma.file, pseg.fileRangeOf(ar), perms, precommit); err != nil {
+			return err
+		}
+		if ctx.Killed() {
+			return linuxerr.EINTR
+		}
+		return nil
+	}
+	for windowStart := ar.Start &^ (singleMapThreshold - 1); windowStart < ar.End; windowStart += singleMapThreshold {
+		windowAR := hostarch.AddrRange{windowStart, windowStart + singleMapThreshold}
+		thisMapAR := ar.Intersect(windowAR)
+		if err := mm.as.MapFile(thisMapAR.Start, pma.file, pseg.fileRangeOf(thisMapAR), perms, precommit); err != nil {
+			return err
+		}
+		if ctx.Killed() {
+			return linuxerr.EINTR
+		}
 	}
 	return nil
 }

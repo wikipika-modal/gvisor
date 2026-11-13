@@ -63,7 +63,7 @@ func (k *Kernel) FsMutationLog(ctx context.Context, opts *FsMutationLogOpts) err
 
 	k.Pause()
 	defer k.Unpause()
-	return k.quiescePausedAnd(ctx, func() error {
+	return k.quiescePausedAnd(ctx, true, func() error {
 		// Select the tmpfs upper layer mounted at opts.Path: its private disk-backed
 		// MemoryFile carries a ResourceID whose Path is the mount path. tmpfs mounts on
 		// the shared (memory-medium) MemoryFile have no ResourceID and are skipped.

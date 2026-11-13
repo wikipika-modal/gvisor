@@ -156,6 +156,11 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 		maxIOBytes:  resp.MaxIOBytes,
 		maxRanges:   resp.MaxRanges,
 		maxParallel: resp.MaxParallel,
+		lazy:        resp.Lazy,
+		prefetch:    resp.Prefetch,
+		retains:     resp.RetainsSources,
+		holds:       resp.HoldsWrites,
+		prioUnit:    resp.PriorityUnit,
 		handle:      resp.Handle,
 		isReader:    mode == OpenModeRead,
 	}
@@ -188,6 +193,11 @@ type asyncReadWriter struct {
 	maxIOBytes  uint32
 	maxRanges   uint32
 	maxParallel uint32
+	lazy        bool
+	prefetch    []memmap.FileRange
+	retains     bool
+	holds       bool
+	prioUnit    uint64
 	handle      uint32
 	isReader    bool
 
@@ -199,6 +209,10 @@ type asyncReadWriter struct {
 	// the next call to Wait().
 	numSubmissions uint32
 
+	// lastReadSub is the read submission most recently added since the last
+	// call to Wait, or nil.
+	lastReadSub *readSubmissionHeader
+
 	ioep ioEndpoint
 
 	connectOnce sync.Once
@@ -206,6 +220,10 @@ type asyncReadWriter struct {
 	connectorWG sync.WaitGroup
 
 	reserve uint64
+
+	// positioned is true if AddWritevAt has been called, allowing Wait to
+	// return fewer than minCompletions completions.
+	positioned bool
 }
 
 // Close implements stateio.AsyncReader.Close and stateio.AsyncWriter.Close.
@@ -318,6 +336,7 @@ func (rw *asyncReadWriter) AddRead(id int, off int64, dstFile stateio.Destinatio
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: 1,
 	}
+	rw.lastReadSub = subHdr
 	rw.ioep.scanFileRanges(1)[0] = dstFR
 	rw.numSubmissions++
 }
@@ -335,8 +354,41 @@ func (rw *asyncReadWriter) AddReadv(id int, off int64, total uint64, dstFile sta
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: numRanges,
 	}
+	rw.lastReadSub = subHdr
 	copy(rw.ioep.scanFileRanges(numRanges), dstFRs)
 	rw.numSubmissions++
+}
+
+// Lazy implements stateio.LazyReader.Lazy.
+func (rw *asyncReadWriter) Lazy() bool {
+	return rw.lazy
+}
+
+// Prefetch implements stateio.PrefetchReader.Prefetch.
+func (rw *asyncReadWriter) Prefetch() []memmap.FileRange {
+	return rw.prefetch
+}
+
+// HoldsWrites implements stateio.PositionedWriter.HoldsWrites.
+func (rw *asyncReadWriter) HoldsWrites() bool {
+	return rw.holds
+}
+
+// PriorityUnit implements stateio.PositionedWriter.PriorityUnit.
+func (rw *asyncReadWriter) PriorityUnit() uint64 {
+	return rw.prioUnit
+}
+
+// RetainsSources implements stateio.SourceRetainer.RetainsSources.
+func (rw *asyncReadWriter) RetainsSources() bool {
+	return rw.retains
+}
+
+// PrioritizeLastRead implements stateio.ReadPrioritizer.PrioritizeLastRead.
+func (rw *asyncReadWriter) PrioritizeLastRead() {
+	if rw.lastReadSub != nil {
+		rw.lastReadSub.Flags |= readSubmissionFlagPriority
+	}
 }
 
 // AddWrite implements stateio.AsyncWriter.AddWrite.
@@ -370,6 +422,32 @@ func (rw *asyncReadWriter) AddWritev(id int, total uint64, srcFile stateio.Sourc
 	rw.numSubmissions++
 }
 
+// AddWritevAt implements stateio.PositionedWriter.AddWritevAt.
+func (rw *asyncReadWriter) AddWritevAt(id int, off uint64, wflags stateio.WriteFlags, total uint64, srcFile stateio.SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec) {
+	if rw.ensureConnected() != nil {
+		return
+	}
+	flags := uint32(writeSubmissionFlagOffset)
+	if wflags&stateio.WritePriority != 0 {
+		flags |= writeSubmissionFlagPriority
+	}
+	if wflags&stateio.WriteRepeat != 0 {
+		flags |= writeSubmissionFlagRepeat
+	}
+	subHdr := rw.ioep.scanWriteSubmissionHeader()
+	numRanges := uint32(len(srcFRs))
+	*subHdr = writeSubmissionHeader{
+		ID:        uint32(id),
+		SrcHandle: uint32(srcFile.(clientFileHandle)),
+		NumRanges: numRanges,
+		Flags:     flags,
+	}
+	*rw.ioep.scanUint64() = off
+	copy(rw.ioep.scanFileRanges(numRanges), srcFRs)
+	rw.numSubmissions++
+	rw.positioned = true
+}
+
 // Wait implements stateio.AsyncReader.Wait and stateio.AsyncWriter.Wait.
 func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
 	if err := rw.ensureConnected(); err != nil {
@@ -400,6 +478,7 @@ func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]
 		})
 	}
 	rw.numSubmissions = 0
+	rw.lastReadSub = nil
 	if rw.isReader {
 		rw.ioep.resetForReadSubmissions()
 	} else {
@@ -408,7 +487,7 @@ func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]
 	if respErrno != 0 {
 		return cs, ioErrorFromErrno(respErrno, "I/O response")
 	}
-	if numCompletions < minCompletions32 {
+	if numCompletions < minCompletions32 && !rw.positioned {
 		return cs, fmt.Errorf("server returned %d completions (want %d)", numCompletions, minCompletions32)
 	}
 	return cs, nil

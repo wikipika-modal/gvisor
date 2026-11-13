@@ -422,6 +422,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	timer.Reached("created MemoryFile")
 
 	if o.HavePagesFile {
+		if lr, ok := pagesFile.(stateio.LazyReader); ok && lr.Lazy() && !o.Background {
+			return fmt.Errorf("lazy page loading requires a background restore")
+		}
 		// This immediately starts loading the main MemoryFile asynchronously.
 		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
 		pagesMetadata = nil
