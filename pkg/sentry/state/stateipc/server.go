@@ -602,6 +602,10 @@ func (f *writeFile) writerMain() {
 func (f *writeFile) handleWriteSubmission(cs []stateio.Completion) []stateio.Completion {
 	subHdr := f.ioep.scanWriteSubmissionHeader()
 	id := subHdr.ID
+	if subHdr.Flags&writeSubmissionFlagOffset != 0 {
+		log.Warningf("stateipc.writeFile(%s): positioned writes are unsupported", f.path)
+		return appendErrnoCompletion(cs, id, unix.EINVAL)
+	}
 	if id >= f.maxParallel {
 		log.Warningf("stateipc.writeFile(%s): invalid ID %d", f.path, id)
 		return appendErrnoCompletion(cs, id, unix.EINVAL)

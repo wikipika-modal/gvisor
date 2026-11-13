@@ -34,7 +34,20 @@ go_library(
 go_test(
     name = "iouringfs_test",
     size = "small",
-    srcs = ["iouringfs_test.go"],
+    srcs = [
+        "iouringfs_test.go",
+        "save_test.go",
+    ],
     embed = [":iouringfs"],
-    deps = ["//pkg/hostarch"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/hostarch",
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/kernel",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/state/stateio/stateiotest",
+        "//pkg/sentry/vfs",
+    ],
 )

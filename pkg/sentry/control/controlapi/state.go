@@ -54,6 +54,10 @@ type SaveOpts struct {
 	// after checkpointing.
 	Resume bool
 
+	// EarlyResume resumes the sandbox before page contents are saved. See
+	// state.SaveOpts.EarlyResume.
+	EarlyResume bool `json:"early_resume"`
+
 	// ExecOpts contains options for executing a binary during save/restore.
 	ExecOpts SaveRestoreExecOpts
 

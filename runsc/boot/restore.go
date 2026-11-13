@@ -865,6 +865,10 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	l.saveMu.Lock()
 	defer l.saveMu.Unlock()
 
+	if saveOpts.EarlyResume && (l.root.conf.NVProxy || l.root.conf.TPUProxy || l.root.conf.RDMAProxy) {
+		log.Warningf("Saving pages before resuming: device proxies can write to memory without faulting")
+		saveOpts.EarlyResume = false
+	}
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.

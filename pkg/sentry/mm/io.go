@@ -594,6 +594,13 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 		}
 		ar.End = pendaddr
 	}
+	if at.Write {
+		if mf, fr, ok := pseg.unsavedFileRange(ar); ok {
+			mm.activeMu.Unlock()
+			mf.AwaitSaved(fr)
+			return mm.handleASIOFault(ctx, addr, ioar, at)
+		}
+	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
@@ -628,7 +635,7 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	if pseg := mm.existingPMAsLocked(ar, at, ignorePermissions, true /* needInternalMappings */); pseg.Ok() {
 		// On failure, fall back to the slow path, which handles partial
 		// success.
-		if ims, err := mm.internalMappingsLocked(pseg, ar); err == nil {
+		if ims, err := mm.internalMappingsLocked(pseg, ar, at); err == nil {
 			defer mm.activeMu.RUnlock()
 			n, err := f(ims)
 			// Do not convert errors returned by f to EFAULT.
@@ -714,7 +721,7 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	if mm.existingVecPMAsLocked(ars, at, ignorePermissions, true /* needInternalMappings */) {
 		// On failure, fall back to the slow path, which handles partial
 		// success.
-		if ims, err := mm.vecInternalMappingsLocked(ars); err == nil {
+		if ims, err := mm.vecInternalMappingsLocked(ars, at); err == nil {
 			defer mm.activeMu.RUnlock()
 			n, err := f(ims)
 			// Do not convert errors returned by f to EFAULT.
@@ -796,7 +803,7 @@ func (mm *MemoryManager) getIOMappingsLocked(pseg pmaIterator, ar hostarch.AddrR
 	if ar.End <= pseg.End() {
 		// Since only one pma is involved, we can return its internal mappings
 		// directly, avoiding a slice allocation.
-		ims, err := pseg.getInternalMappingsLocked(ar)
+		ims, err := pseg.getInternalMappingsLocked(ar, at)
 		if err != nil {
 			if _, ok := err.(memmap.BufferedIOFallbackErr); ok {
 				goto slowPath
@@ -880,7 +887,7 @@ func (mm *MemoryManager) getVecIOMappingsLocked(ars hostarch.AddrRangeSeq, at ho
 func (mm *MemoryManager) getIOMappingsTrackedLocked(pseg pmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, ims []safemem.Block, t *ioBufTracker, unbufBytes uint64) ([]safemem.Block, *ioBufTracker, uint64, error) {
 	for {
 		pmaAR := ar.Intersect(pseg.Range())
-		if pims, err := pseg.getInternalMappingsLocked(pmaAR); err == nil {
+		if pims, err := pseg.getInternalMappingsLocked(pmaAR, at); err == nil {
 			// Append the internal mappings that correspond to pmaAR to ims.
 			for ; !pims.IsEmpty(); pims = pims.Tail() {
 				ims = append(ims, pims.Head())
