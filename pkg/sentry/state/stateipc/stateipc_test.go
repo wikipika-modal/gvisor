@@ -82,6 +82,61 @@ func (s *testWriteServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 	return nil, fs.ErrNotExist
 }
 
+// blockingReadServer implements AsyncFileServerImpl by serving a single file
+// whose reads block until release is closed.
+type blockingReadServer struct {
+	path    string
+	release chan struct{}
+}
+
+// Destroy implements AsyncFileServerImpl.Destroy.
+func (s *blockingReadServer) Destroy() {}
+
+// OpenRead implements AsyncFileServerImpl.OpenRead.
+func (s *blockingReadServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	if path == s.path {
+		return stateio.NewIOReader(s, 4096 /* maxReadBytes */, 2 /* maxRanges */, testParallel), nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+// OpenWrite implements AsyncFileServerImpl.OpenWrite.
+func (s *blockingReadServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// ReadAt implements io.ReaderAt.ReadAt.
+func (s *blockingReadServer) ReadAt(dst []byte, off int64) (int, error) {
+	<-s.release
+	return 0, io.ErrUnexpectedEOF
+}
+
+// promotingReadServer is a blockingReadServer whose reader sends the IDs of
+// reads it is asked to promote to promoted.
+type promotingReadServer struct {
+	blockingReadServer
+	promoted chan int
+}
+
+// OpenRead implements AsyncFileServerImpl.OpenRead.
+func (s *promotingReadServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	ar, err := s.blockingReadServer.OpenRead(path)
+	if err != nil {
+		return nil, err
+	}
+	return &promotingReader{ar, s.promoted}, nil
+}
+
+type promotingReader struct {
+	stateio.AsyncReader
+	promoted chan int
+}
+
+// PromoteRead implements stateio.ReadPromoter.PromoteRead.
+func (r *promotingReader) PromoteRead(id int) {
+	r.promoted <- id
+}
+
 func TestRead(t *testing.T) {
 	// Create random data.
 	const testPath = "testfile"
@@ -501,4 +556,214 @@ func TestClientWatchdog(t *testing.T) {
 		t.Errorf("AsyncReader.Wait after shutdown got error nil, completions: %+v", cs)
 	}
 	t.Logf("AsyncReader.Wait after shutdown got error: %v", err)
+}
+
+func TestClientWatchdogStalledRead(t *testing.T) {
+	defer func(tick time.Duration, ticks int) {
+		watchdogTick, readStallTicks = tick, ticks
+	}(watchdogTick, readStallTicks)
+	watchdogTick, readStallTicks = 10*time.Millisecond, 3
+
+	const testPath = "testfile"
+	const chunkSize = 4096
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestClientWatchdogStalledRead", chunkSize)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	release := make(chan struct{})
+	defer close(release)
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&blockingReadServer{
+		path:    testPath,
+		release: release,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	df, err := ar.RegisterDestinationFD(memfd, chunkSize, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, chunkSize}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := ar.Wait(nil, 1 /* minCompletions */)
+		waited <- err
+	}()
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Errorf("AsyncReader.Wait of a stalled read got error nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AsyncReader.Wait of a stalled read didn't return")
+	}
+	closed := make(chan error, 1)
+	go func() {
+		closed <- ar.Close()
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AsyncReader.Close after a stalled read didn't return")
+	}
+}
+
+func TestClientWatchdogFailsReadsInFlightOnDisconnect(t *testing.T) {
+	const testPath = "testfile"
+	const chunkSize = 4096
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestClientWatchdogFailsReadsInFlightOnDisconnect", chunkSize)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	release := make(chan struct{})
+	defer close(release)
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&blockingReadServer{
+		path:    testPath,
+		release: release,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	df, err := ar.RegisterDestinationFD(memfd, chunkSize, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, chunkSize}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := ar.Wait(nil, 1 /* minCompletions */)
+		waited <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// A server that dies leaves its read in flight forever.
+	if err := serverSock.Shutdown(); err != nil {
+		t.Fatalf("failed to shut down server socket: %v", err)
+	}
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Errorf("AsyncReader.Wait of a read in flight at disconnection got error nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("AsyncReader.Wait of a read in flight didn't return within 2s of disconnection")
+	}
+}
+
+func TestPromoteRead(t *testing.T) {
+	const testPath = "testfile"
+	const chunkSize = 4096
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestPromoteRead", 2*chunkSize)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	release := make(chan struct{})
+	promoted := make(chan int, testParallel)
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&promotingReadServer{
+		blockingReadServer: blockingReadServer{
+			path:    testPath,
+			release: release,
+		},
+		promoted: promoted,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	df, err := ar.RegisterDestinationFD(memfd, 2*chunkSize, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, chunkSize}, buf[:chunkSize])
+	ar.AddRead(1 /* id */, chunkSize /* off */, df, memmap.FileRange{chunkSize, 2 * chunkSize}, buf[chunkSize:])
+	cs, err := ar.Wait(nil, 0 /* minCompletions */)
+	if err != nil || len(cs) != 0 {
+		t.Fatalf("AsyncReader.Wait: got %d completions, error %v; want none", len(cs), err)
+	}
+	// Promoting a read that isn't inflight does nothing.
+	ar.(stateio.ReadPromoter).PromoteRead(1)
+	ar.(stateio.ReadPromoter).PromoteRead(2)
+	cs, err = ar.Wait(cs, 0 /* minCompletions */)
+	if err != nil || len(cs) != 0 {
+		t.Fatalf("AsyncReader.Wait after promoting: got %d completions, error %v; want none", len(cs), err)
+	}
+	close(release)
+	released = true
+	if cs, err = ar.Wait(cs, 2 /* minCompletions */); err != nil || len(cs) != 2 {
+		t.Fatalf("AsyncReader.Wait after release: got %d completions, error %v; want 2", len(cs), err)
+	}
+	close(promoted)
+	var got []int
+	for id := range promoted {
+		got = append(got, id)
+	}
+	if len(got) != 1 || got[0] != 1 {
+		t.Errorf("promoted reads %v, want [1]", got)
+	}
 }

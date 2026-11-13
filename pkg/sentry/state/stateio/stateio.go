@@ -123,6 +123,103 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// ReadPrioritizer is implemented by AsyncReaders that can serve some reads
+// ahead of others.
+type ReadPrioritizer interface {
+	// PrioritizeLastRead marks the read most recently enqueued by AddRead or
+	// AddReadv as one that a caller is blocked on.
+	PrioritizeLastRead()
+}
+
+// ReadaheadMarker is implemented by AsyncReaders that track which reads a
+// lazy load needed.
+type ReadaheadMarker interface {
+	// MarkLastReadReadahead marks the read most recently enqueued by AddRead
+	// or AddReadv as loading pages lazily ahead of callers that are expected
+	// to need them.
+	MarkLastReadReadahead()
+}
+
+// ReadPromoter is implemented by AsyncReaders that can serve a read they have
+// already started ahead of others.
+type ReadPromoter interface {
+	// PromoteRead marks the inflight read with the given ID as one that a
+	// caller is blocked on. It takes effect at the next call to Wait.
+	PromoteRead(id int)
+}
+
+// EagerMarker is implemented by AsyncReaders that can serve a lazy load
+// differently once it loads all remaining pages.
+type EagerMarker interface {
+	// MarkLastReadEager marks the read most recently enqueued by AddRead or
+	// AddReadv as one of the reads, in file order, of the remaining pages of a
+	// lazy load that now loads everything.
+	MarkLastReadEager()
+}
+
+// LazyReader is implemented by AsyncReaders that can ask to load only pages
+// that someone waits for.
+type LazyReader interface {
+	Lazy() bool
+}
+
+// PrefetchReader is implemented by lazy AsyncReaders that know which ranges
+// of their source are likely to be awaited soon, e.g. from a profile of an
+// earlier restore.
+type PrefetchReader interface {
+	// Prefetch returns ranges of the source, in source offsets, to load
+	// without waiting for anyone to await them.
+	Prefetch() []memmap.FileRange
+}
+
+// SourceRetainer is implemented by AsyncWriters that may still read a write's
+// source after completing it. Their sources must not change after the write
+// completes, even if the sandbox exits.
+type SourceRetainer interface {
+	RetainsSources() bool
+}
+
+// PositionedWriter is implemented by AsyncWriters that can write at explicit
+// offsets, so that writes can complete out of order.
+//
+// Once AddWritevAt has been called, AsyncWriter.Wait may return fewer than
+// minCompletions completions, so that a caller isn't kept from adding a write
+// that it's blocked on while the AsyncWriter holds other writes.
+type PositionedWriter interface {
+	// AddWritevAt is like AsyncWriter.AddWritev, but writes at offset off
+	// rather than appending, as qualified by flags.
+	//
+	// Preconditions: As for AsyncWriter.AddWritev, and len(srcFRs) <
+	// AsyncWriter.MaxRanges(). If flags includes WriteRepeat, HoldsWrites()
+	// returns true.
+	AddWritevAt(id int, off uint64, flags WriteFlags, total uint64, srcFile SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec)
+
+	// HoldsWrites returns true if the PositionedWriter may keep reading a
+	// write's source long after the write is added, in which case a caller
+	// blocked on an incomplete write may repeat it with WriteRepeat.
+	HoldsWrites() bool
+
+	// PriorityUnit returns the alignment, a power of two no smaller than a
+	// page, to which a caller should expand a range it is blocked on before
+	// writing it with WritePriority, or 0 for the caller's choice.
+	PriorityUnit() uint64
+}
+
+// WriteFlags qualifies a write added by PositionedWriter.AddWritevAt.
+type WriteFlags uint32
+
+const (
+	// WritePriority marks a write that a caller is blocked on, which the
+	// PositionedWriter may complete ahead of other writes.
+	WritePriority WriteFlags = 1 << iota
+
+	// WriteRepeat marks a priority write of a range that an incomplete earlier
+	// write also covers, at the same offsets and with the same contents. The
+	// PositionedWriter completes it once the earlier write no longer reads the
+	// range's source.
+	WriteRepeat
+)
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

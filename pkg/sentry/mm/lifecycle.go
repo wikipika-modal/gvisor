@@ -383,7 +383,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 // +checklocks:mm2.activeMu
 func (mm *MemoryManager) forkCopyPMALocked(mm2 *MemoryManager, srcpseg pmaIterator, dstpgap pmaGapIterator, memCgID uint32) (pmaGapIterator, error) {
 	copyAR := srcpseg.Range()
-	ims, err := srcpseg.getInternalMappingsLocked(copyAR)
+	ims, err := srcpseg.getInternalMappingsLocked(copyAR, hostarch.Read)
 	if err != nil {
 		return dstpgap, err
 	}

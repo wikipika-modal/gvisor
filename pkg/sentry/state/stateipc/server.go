@@ -148,6 +148,7 @@ func (s *AsyncFileServer) Open(req *OpenRequest, resp *OpenResponse) error {
 	resp.MaxIOBytes = f.maxIOBytes
 	resp.MaxRanges = f.maxRanges
 	resp.MaxParallel = f.maxParallel
+	resp.PromotesReads = req.Mode == OpenModeRead
 
 	// Initialize the Flipcall connection.
 	pwd, err := s.pwa.Allocate(flipcall.PacketWindowLengthForDataCap(getDataSize(f.maxRanges, f.maxParallel, req.Mode)))
@@ -394,6 +395,12 @@ func (f *readFile) readerMain() {
 func (f *readFile) handleReadSubmission(cs []stateio.Completion) []stateio.Completion {
 	subHdr := f.ioep.scanReadSubmissionHeader()
 	id := subHdr.ID
+	if subHdr.Flags&readSubmissionFlagPromote != 0 {
+		if p, ok := f.ar.(stateio.ReadPromoter); ok && id < f.maxParallel && f.ids.isSet(id) {
+			p.PromoteRead(int(id))
+		}
+		return cs
+	}
 	if id >= f.maxParallel {
 		log.Warningf("stateipc.readFile(%s): invalid ID %d", f.path, id)
 		return appendErrnoCompletion(cs, id, unix.EINVAL)
@@ -602,6 +609,10 @@ func (f *writeFile) writerMain() {
 func (f *writeFile) handleWriteSubmission(cs []stateio.Completion) []stateio.Completion {
 	subHdr := f.ioep.scanWriteSubmissionHeader()
 	id := subHdr.ID
+	if subHdr.Flags&writeSubmissionFlagOffset != 0 {
+		log.Warningf("stateipc.writeFile(%s): positioned writes are unsupported", f.path)
+		return appendErrnoCompletion(cs, id, unix.EINVAL)
+	}
 	if id >= f.maxParallel {
 		log.Warningf("stateipc.writeFile(%s): invalid ID %d", f.path, id)
 		return appendErrnoCompletion(cs, id, unix.EINVAL)
