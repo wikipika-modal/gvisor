@@ -21,12 +21,14 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
 func newSaveTestMemoryFile(t *testing.T, diskBacked bool) *MemoryFile {
@@ -147,4 +149,92 @@ func TestSaveToPreservesContents(t *testing.T) {
 			})
 		})
 	}
+}
+
+type lazyReader struct {
+	stateio.AsyncReader
+	bytes atomic.Uint64
+}
+
+func (r *lazyReader) Lazy() bool { return true }
+
+func (r *lazyReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.bytes.Add(uint64(len(dstMap)))
+	r.AsyncReader.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+func (r *lazyReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.bytes.Add(total)
+	r.AsyncReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+func TestLazyLoadReadsOnlyAwaitedPages(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	fr := allocateSaveTestPages(t, f)
+	pwritePage(t, f, fr, 2, 1)
+	pwritePage(t, f, fr, 13, 2)
+
+	var metadata, pages bytes.Buffer
+	saved := make(chan error, 1)
+	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 1<<20, 16, 4), func(err error) { saved <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave: %v", err)
+	}
+	if err := f.SaveTo(context.Background(), &metadata, &SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saved; err != nil {
+		t.Fatalf("async page save: %v", err)
+	}
+
+	r := &lazyReader{AsyncReader: stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 1<<20, 16, 4)}
+	loaded := make(chan error, 1)
+	apfl, err := StartAsyncPagesFileLoad(r, func(err error) { loaded <- err }, nil)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	restored := newSaveTestMemoryFile(t, false)
+	if err := restored.LoadFrom(context.Background(), &metadata, &LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+	t.Cleanup(func() { restored.DecRef(fr) })
+
+	page := func(i uint64) memmap.FileRange {
+		start := fr.Start + i*hostarch.PageSize
+		return memmap.FileRange{start, start + hostarch.PageSize}
+	}
+	bs, err := restored.MapInternal(page(2), hostarch.Read)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if got := bs.Head().ToSlice()[17]; got != 1 {
+		t.Errorf("page 2: got %d, want 1", got)
+	}
+	if got := r.bytes.Load(); got != hostarch.PageSize {
+		t.Errorf("read %d bytes after awaiting one page, want %d", got, hostarch.PageSize)
+	}
+	if !restored.IsAsyncLoading() {
+		t.Fatal("page 13 was loaded without being awaited")
+	}
+
+	// Saving awaits every remaining page.
+	if err := restored.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	if err := <-loaded; err != nil {
+		t.Fatalf("async page load: %v", err)
+	}
+	if got := r.bytes.Load(); got != 2*hostarch.PageSize {
+		t.Errorf("read %d bytes in total, want %d", got, 2*hostarch.PageSize)
+	}
+	want := make([]byte, fr.Length())
+	want[2*hostarch.PageSize+17] = 1
+	want[13*hostarch.PageSize+17] = 2
+	restored.forEachMappingSlice(fr, func(bs []byte) {
+		if !bytes.Equal(bs, want) {
+			t.Error("restored contents differ from saved contents")
+		}
+	})
 }

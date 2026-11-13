@@ -186,6 +186,9 @@ type SaveOpts struct {
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if f.IsEarlyResumeSaving() {
+		return fmt.Errorf("a previous save is still saving pages")
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -222,6 +225,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			pf: opts.PagesFile,
 			sf: sf,
 		}
+		if amfs.pf.earlyResume {
+			if err := amfs.registerEarlyResume(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// We only want to explicitly include pages containing non-zero bytes in
@@ -252,10 +260,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
 			amfs.pf.mu.Lock()
-			amfs.pf.unsaved.PushBack(apsRange{
-				amfs:      amfs,
-				FileRange: fr,
-			})
+			if amfs.pf.earlyResume {
+				amfs.addUnsavedLocked(fr, amfs.pf.saveOff)
+			} else {
+				amfs.pf.unsaved.PushBack(apsRange{
+					amfs:      amfs,
+					FileRange: fr,
+				})
+			}
 			amfs.pf.saveOff += amount
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
@@ -685,6 +697,35 @@ type AsyncPagesFileSave struct {
 	// AsyncPagesFileSave.err is never returned to application syscalls and
 	// hence is not constrained to being an errno.
 	err error
+
+	// The following fields are used only by early-resume saving; see
+	// EnableEarlyResume. earlyResume, pw and prioReserve are immutable after
+	// EnableEarlyResume; the remaining fields are protected by mu.
+	earlyResume bool
+	pw          stateio.PositionedWriter
+	prioReserve int
+
+	// erFiles are the MemoryFiles being saved, in pages file order.
+	erFiles []*asyncMemoryFileSave
+
+	// erCursorFile and erCursor are the index into erFiles and MemoryFile
+	// offset before which all pages are saved, inflight or prioritized.
+	erCursorFile int
+	erCursor     uint64
+
+	// priority holds ranges awaited by writers.
+	priority ringdeque.Deque[apsRange]
+
+	// savedCh is closed and replaced whenever writes complete.
+	savedCh chan struct{}
+
+	// erDone is true once saving has ended.
+	erDone bool
+
+	prioOps   uint64
+	prioBytes uint64
+	erWaits   uint64
+	erWaitDur time.Duration
 }
 
 // Possible events in AsyncPagesFileSave.stStatus:
@@ -700,6 +741,10 @@ type asyncMemoryFileSave struct {
 	f  *MemoryFile
 	pf *AsyncPagesFileSave
 	sf stateio.SourceFile
+
+	// unsaved tracks pages that have not been saved, during early-resume
+	// saving. unsaved is protected by pf.mu.
+	unsaved apsUnsavedSet
 }
 
 type apsRange struct {
@@ -721,6 +766,11 @@ type apsOp struct {
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// For early-resume saving, off is the pages file offset of the write, and
+	// priority is true if a writer is waiting for it.
+	off      uint64
+	priority bool
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
@@ -790,7 +840,9 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 
 	apfs.qavail--
 	apfs.curOp = nil
-	if len(op.frs) == 1 && len(op.iovecs) == 1 {
+	if apfs.earlyResume {
+		apfs.enqueueEarlyResumeOp(op)
+	} else if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized write to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncWriter implementation.
 		apfs.aw.AddWrite(int(apfs.curOpID), op.amfs.sf, op.frs[0], stateio.SliceFromIovec(op.iovecs[0]))
@@ -902,6 +954,9 @@ func (apfs *AsyncPagesFileSave) main() {
 		if apfs.err != nil {
 			log.Warningf("Async page saving failed: %v", apfs.err)
 		}
+		if apfs.earlyResume {
+			apfs.endEarlyResume()
+		}
 		if err := apfs.aw.Close(); err != nil {
 			// Saving success is independent of err, so log it rather than
 			// propagating it.
@@ -969,12 +1024,16 @@ func (apfs *AsyncPagesFileSave) main() {
 
 	prevFull := false
 	for {
-		// Enqueue as many writes as possible.
-		if !apfs.canEnqueue() {
+		// Enqueue as many writes as possible. A PositionedWriter's Wait may
+		// return without completions.
+		if !apfs.canEnqueue() && !apfs.earlyResume {
 			panic("main loop invariant failed")
 		}
 		apfs.mu.Lock()
 		apfs.aw.Reserve(apfs.saveOff)
+		if apfs.earlyResume {
+			apfs.enqueueEarlyResumeLocked()
+		}
 		for !apfs.unsaved.Empty() {
 			mfr := apfs.unsaved.PeekFrontPtr()
 			n := apfs.enqueueRange(*mfr)
@@ -1073,6 +1132,12 @@ func (apfs *AsyncPagesFileSave) main() {
 			if full {
 				apfs.bytesFull += op.total
 			}
+			if apfs.earlyResume {
+				apfs.savedLocked(op)
+			}
+		}
+		if apfs.earlyResume {
+			apfs.wakeSaveWaitersLocked()
 		}
 		apfs.mu.Unlock()
 	}
@@ -1220,14 +1285,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				// empty (async page loading for this MemoryFile finished
 				// before we got here, possibly because the MemoryFile was
 				// empty), we have to do so instead.
-				amfl.minUnloaded.Store(math.MaxUint64)
-				amfl.pf.amfls.Remove(amfl)
-				amfl.f.asyncPageLoad.Store(nil)
-				amfl.timeline.End()
-				if amfl.doneCallback != nil {
-					amfl.doneCallback(nil)
-					amfl.doneCallback = nil
-				}
+				amfl.loadedLocked()
 			}
 		}()
 	}
@@ -1363,6 +1421,9 @@ type AsyncPagesFileLoad struct {
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
 
+	// If lazy is true, only awaited pages are loaded. lazy is immutable.
+	lazy bool
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -1391,6 +1452,9 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	// aplLazyWake is only used when lazy loading: a new waiter needs pages, or
+	// a MemoryFile has no unloaded pages left.
+	aplLazyWake
 )
 
 type aplFileRange struct {
@@ -1517,6 +1581,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		doneCallback:     doneCallback,
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		lazy:             isLazy(ar),
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1535,6 +1600,11 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+func isLazy(ar stateio.AsyncReader) bool {
+	lr, ok := ar.(stateio.LazyReader)
+	return ok && lr.Lazy()
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -1617,6 +1687,9 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.totalWaiters++
 	}
 	apfl.mu.Unlock()
+	if pending && apfl.lazy {
+		apfl.lfStatus.Notify(aplLazyWake)
+	}
 	if pending {
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
@@ -1628,6 +1701,35 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		}
 	}
 	return apfl.err()
+}
+
+// reapLoaded marks MemoryFiles whose unloaded pages all became waste as
+// loaded, and returns true if any MemoryFile still has unloaded pages.
+func (apfl *AsyncPagesFileLoad) reapLoaded() bool {
+	apfl.amflsMu.Lock()
+	defer apfl.amflsMu.Unlock()
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	for amfl := apfl.amfls.Front(); amfl != nil; {
+		next := amfl.Next()
+		if amfl.lfDone && amfl.unloaded.IsEmpty() {
+			amfl.loadedLocked()
+		}
+		amfl = next
+	}
+	return !apfl.amfls.Empty()
+}
+
+// Preconditions: apfl.amflsMu and apfl.mu must be locked.
+func (amfl *asyncMemoryFileLoad) loadedLocked() {
+	amfl.minUnloaded.Store(math.MaxUint64)
+	amfl.pf.amfls.Remove(amfl)
+	amfl.f.asyncPageLoad.Store(nil)
+	amfl.timeline.End()
+	if amfl.doneCallback != nil {
+		amfl.doneCallback(nil)
+		amfl.doneCallback = nil
+	}
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
@@ -1655,6 +1757,12 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 		apfl.ar.AddRead(int(apfl.curOpID), op.off(), op.amfl.df, op.frs[0], stateio.SliceFromIovec(op.iovecs[0]))
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
+	}
+	if !op.tempRef {
+		// Awaited reads (tempRef == false) have waiters blocked on them.
+		if p, ok := apfl.ar.(stateio.ReadPrioritizer); ok {
+			p.PrioritizeLastRead()
+		}
 	}
 	if logAwaitedLoads && !op.tempRef {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
@@ -1926,7 +2034,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		if apfl.canEnqueue() && !apfl.lazy {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1989,6 +2097,15 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
 				// asyncMemoryFileLoad.unloaded.
 				apfl.lfStatus.Ack(aplLFPending)
+				continue
+			}
+			if ev&aplLazyWake != 0 {
+				apfl.lfStatus.Ack(aplLazyWake)
+				continue
+			}
+			if ev&aplLFDone != 0 && apfl.lazy && apfl.reapLoaded() {
+				// Pages remain unloaded until something waits for them.
+				apfl.lfStatus.WaitFor(aplLazyWake)
 				continue
 			}
 			if ev&aplLFDone != 0 {
@@ -2080,14 +2197,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// accurately if insertions into amfl.unloaded are complete.
 			if amfl.lfDone {
 				if amfl.unloaded.IsEmpty() {
-					amfl.minUnloaded.Store(math.MaxUint64)
-					apfl.amfls.Remove(amfl)
-					amfl.f.asyncPageLoad.Store(nil)
-					amfl.timeline.End()
-					if amfl.doneCallback != nil {
-						amfl.doneCallback(nil)
-						amfl.doneCallback = nil
-					}
+					amfl.loadedLocked()
 				} else {
 					amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
 				}
@@ -2127,6 +2237,9 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
 		}
 	})
+	if amfl.pf.lazy && amfl.unloaded.IsEmpty() {
+		amfl.pf.lfStatus.Notify(aplLazyWake)
+	}
 }
 
 type aplUnloadedSetFunctions struct{}

@@ -123,6 +123,43 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// ReadPrioritizer is implemented by AsyncReaders that can serve some reads
+// ahead of others.
+type ReadPrioritizer interface {
+	// PrioritizeLastRead marks the read most recently enqueued by AddRead or
+	// AddReadv as one that a caller is blocked on.
+	PrioritizeLastRead()
+}
+
+// LazyReader is implemented by AsyncReaders that can ask to load only pages
+// that someone waits for.
+type LazyReader interface {
+	Lazy() bool
+}
+
+// SourceRetainer is implemented by AsyncWriters that may still read a write's
+// source after completing it. Their sources must not change after the write
+// completes, even if the sandbox exits.
+type SourceRetainer interface {
+	RetainsSources() bool
+}
+
+// PositionedWriter is implemented by AsyncWriters that can write at explicit
+// offsets, so that writes can complete out of order.
+//
+// Once AddWritevAt has been called, AsyncWriter.Wait may return fewer than
+// minCompletions completions, so that a caller isn't kept from adding a write
+// that it's blocked on while the AsyncWriter holds other writes.
+type PositionedWriter interface {
+	// AddWritevAt is like AsyncWriter.AddWritev, but writes at offset off
+	// rather than appending. If priority is true, a caller is blocked on the
+	// write, and the AsyncWriter may complete it ahead of other writes.
+	//
+	// Preconditions: As for AsyncWriter.AddWritev, and len(srcFRs) <
+	// AsyncWriter.MaxRanges().
+	AddWritevAt(id int, off uint64, priority bool, total uint64, srcFile SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec)
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

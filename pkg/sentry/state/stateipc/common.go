@@ -64,6 +64,13 @@ type OpenResponse struct {
 	// MaxParallel is the maximum number of parallel read/write requests.
 	MaxParallel uint32 `json:"max_parallel"`
 
+	// Lazy asks the client to read only what it waits for.
+	Lazy bool `json:"lazy"`
+
+	// RetainsSources tells the client that the server may read a write's
+	// source after completing it.
+	RetainsSources bool `json:"retains_sources"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload
@@ -146,8 +153,9 @@ type readSubmissionHeader struct {
 	// ID is the id passed to AsyncReader.StartRead/Readv.
 	ID uint32
 
-	// Padding is unused, but aligns the following field to 8 bytes.
-	Padding uint32
+	// Flags is a bitmask of readSubmissionFlag*. Servers ignore unknown
+	// flags; older clients always send 0.
+	Flags uint32
 
 	// Offset is the offset into the file being read at which the read begins.
 	Offset int64
@@ -160,6 +168,10 @@ type readSubmissionHeader struct {
 	// destination.
 	NumRanges uint32
 }
+
+// readSubmissionFlagPriority marks a read that the client is blocked on, which
+// the server may serve ahead of other reads.
+const readSubmissionFlagPriority = 1 << 0
 
 type writeRequestHeader struct {
 	// MinCompletions is the minimum number of completions that the server
@@ -186,9 +198,18 @@ type writeSubmissionHeader struct {
 	// NumRanges is the number of FileRanges that make up the write's source.
 	NumRanges uint32
 
-	// Padding is unused, but aligns following FileRanges to 8 bytes.
-	Padding uint32
+	// Flags is a bitmask of writeSubmissionFlag*. Older clients always send 0.
+	Flags uint32
 }
+
+// writeSubmissionFlagPriority marks a write that the client is blocked on,
+// which the server may complete ahead of other writes.
+const writeSubmissionFlagPriority = 1 << 0
+
+// writeSubmissionFlagOffset indicates that the writeSubmissionHeader is
+// followed by a uint64 file offset at which the write begins, rather than
+// appending, and then by at most MaxRanges-1 FileRanges.
+const writeSubmissionFlagOffset = 1 << 1
 
 type ioResponseHeader struct {
 	// If Errno is non-zero, it is a fatal unix.Errno.

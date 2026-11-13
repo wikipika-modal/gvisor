@@ -839,6 +839,12 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 	}
 
+	if l.StoppedForRetainedSave() {
+		// The pages file server still reads the saved memory, which releasing
+		// the kernel would write to and free.
+		l.StopAfterRetainedSave()
+		return subcommands.ExitSuccess
+	}
 	l.Destroy()
 	return subcommands.ExitSuccess
 }

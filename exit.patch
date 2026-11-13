@@ -1,0 +1,163 @@
+diff --git a/pkg/sentry/kernel/kernel.go b/pkg/sentry/kernel/kernel.go
+index 1f6fe046d..df6c92488 100644
+--- a/pkg/sentry/kernel/kernel.go
++++ b/pkg/sentry/kernel/kernel.go
+@@ -323,6 +323,11 @@ type Kernel struct {
+ 	// +checklocks:extMu
+ 	saveStatus error `state:"nosave"`
+ 
++	// retainedSaveStopped is closed by StopForRetainedSave.
++	retainedSaveStopped     chan struct{} `state:"nosave"`
++	retainedSaveStoppedInit sync.Once     `state:"nosave"`
++	retainedSaveStop        sync.Once     `state:"nosave"`
++
+ 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
+ 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
+ 
+@@ -733,7 +738,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
+ }
+ 
+ // quiescePausedAnd runs f with kernel timers and CPU-clock updates paused,
+-// and resumes them afterwards if resumeTime is true. f runs synchronously with k.extMu held and must not release or reacquire it.
++// and resumes them afterwards if resumeTime is true. f runs synchronously
++// with k.extMu held and must not release or reacquire it.
+ //
+ // Preconditions: The kernel must be paused throughout the call.
+ //
+@@ -2274,6 +2280,29 @@ func (k *Kernel) SetSaveError(err error) {
+ 	}
+ }
+ 
++// StopForRetainedSave stops every task for good after a save whose pages file
++// server keeps reading saved memory. The sandbox must then exit without
++// running or releasing anything that writes to or frees that memory.
++func (k *Kernel) StopForRetainedSave() {
++	k.retainedSaveStop.Do(func() {
++		k.Pause()
++		close(k.retainedSaveChan())
++	})
++}
++
++// RetainedSaveStopped returns a channel that is closed once
++// StopForRetainedSave has stopped every task.
++func (k *Kernel) RetainedSaveStopped() <-chan struct{} {
++	return k.retainedSaveChan()
++}
++
++func (k *Kernel) retainedSaveChan() chan struct{} {
++	k.retainedSaveStoppedInit.Do(func() {
++		k.retainedSaveStopped = make(chan struct{})
++	})
++	return k.retainedSaveStopped
++}
++
+ // SetMemoryFile sets Kernel.mf. SetMemoryFile must be called before Init or
+ // LoadFrom.
+ func (k *Kernel) SetMemoryFile(mf *pgalloc.MemoryFile) {
+diff --git a/pkg/sentry/state/state.go b/pkg/sentry/state/state.go
+index dd6d0b4b2..acc261198 100644
+--- a/pkg/sentry/state/state.go
++++ b/pkg/sentry/state/state.go
+@@ -209,10 +209,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
+ 		k.BeforeResume(ctx)
+ 	} else if err == nil && retainsPages {
+ 		// Exiting tasks would write to and free memory that the pages file
+-		// server still reads, so leave every task stopped. The caller destroys
+-		// the sandbox.
+-		log.Infof("Pages file server retains sources: leaving tasks stopped")
+-		k.Pause()
++		// server still reads, so stop them for good; the sandbox exits without
++		// releasing the kernel.
++		log.Infof("Pages file server retains sources: exiting with tasks stopped")
++		k.StopForRetainedSave()
+ 	} else {
+ 		// Kill the sandbox.
+ 		k.Kill(linux.WaitStatusExit(0))
+diff --git a/runsc/boot/loader.go b/runsc/boot/loader.go
+index 6ea537394..dac6f3463 100644
+--- a/runsc/boot/loader.go
++++ b/runsc/boot/loader.go
+@@ -2097,8 +2097,17 @@ func (l *Loader) waitPID(tgid kernel.ThreadID, cid string, waitStatus *uint32) e
+ // wait waits for the process with TGID 'tgid' in a container's PID namespace
+ // to exit.
+ func (l *Loader) wait(tg *kernel.ThreadGroup) uint32 {
+-	tg.WaitExited()
+-	return uint32(tg.ExitStatus())
++	exited := make(chan struct{})
++	go func() {
++		tg.WaitExited()
++		close(exited)
++	}()
++	select {
++	case <-exited:
++		return uint32(tg.ExitStatus())
++	case <-l.k.RetainedSaveStopped():
++		return uint32(linux.WaitStatusExit(0))
++	}
+ }
+ 
+ // WaitForStartSignal waits for a start signal from the control server.
+@@ -2107,8 +2116,45 @@ func (l *Loader) WaitForStartSignal() {
+ }
+ 
+ // WaitExit waits for the sandbox to finish and returns the root container's
+-// exit status, or zero if there is no root container.
++// exit status, or zero if there is no root container. A save that stopped the
++// sandbox for good (see StoppedForRetainedSave) finishes it with status zero,
++// as killing it after the save would.
+ func (l *Loader) WaitExit() linux.WaitStatus {
++	exited := make(chan linux.WaitStatus, 1)
++	go func() {
++		exited <- l.waitKernelExit()
++	}()
++	select {
++	case ws := <-exited:
++		return ws
++	case <-l.k.RetainedSaveStopped():
++		return linux.WaitStatusExit(0)
++	}
++}
++
++// StoppedForRetainedSave returns whether a save stopped every task for good,
++// see kernel.Kernel.StopForRetainedSave. The sandbox must then exit through
++// StopAfterRetainedSave instead of Destroy.
++func (l *Loader) StoppedForRetainedSave() bool {
++	select {
++	case <-l.k.RetainedSaveStopped():
++		return true
++	default:
++		return false
++	}
++}
++
++// StopAfterRetainedSave answers every pending RPC, including the save's own,
++// and stops the control server, without releasing the kernel.
++func (l *Loader) StopAfterRetainedSave() {
++	l.watchdog.Stop()
++	err := fmt.Errorf("sandbox stopped after save")
++	l.k.SignalAllCheckpointWaiters(err)
++	l.k.SignalAllFSSaveWaiters(err)
++	l.ctrl.stop()
++}
++
++func (l *Loader) waitKernelExit() linux.WaitStatus {
+ 	if l.noRootContainer.enabled {
+ 		// Not k.WaitExited(): it returns as soon as nothing is running and
+ 		// blocks new tasks, so the sandbox could never take another container.
+diff --git a/runsc/cmd/sentry/sentrycmd/boot.go b/runsc/cmd/sentry/sentrycmd/boot.go
+index 17762a366..05563ee15 100644
+--- a/runsc/cmd/sentry/sentrycmd/boot.go
++++ b/runsc/cmd/sentry/sentrycmd/boot.go
+@@ -839,6 +839,12 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
+ 		}
+ 	}
+ 
++	if l.StoppedForRetainedSave() {
++		// The pages file server still reads the saved memory, which releasing
++		// the kernel would write to and free.
++		l.StopAfterRetainedSave()
++		return subcommands.ExitSuccess
++	}
+ 	l.Destroy()
+ 	return subcommands.ExitSuccess
+ }
