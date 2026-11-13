@@ -63,6 +63,26 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		mm.activeMu.Unlock()
 		return err
 	}
+	if at.Write {
+		if mf, fr, ok := pseg.unsavedFileRange(ar); ok {
+			mm.activeMu.Unlock()
+			mf.AwaitSaved(fr)
+			return mm.HandleUserFault(ctx, addr, at, sp)
+		}
+	}
+
+	if mf, fr, ok := mm.unloadedMapRangeLocked(pseg, ar); ok {
+		// Wait for async page loading without holding activeMu, so that other
+		// faults and syscalls don't wait for it.
+		mf.IncRef(fr, 0)
+		mm.activeMu.Unlock()
+		err := mf.AwaitLoad(fr)
+		mf.DecRef(fr)
+		if err != nil {
+			return err
+		}
+		return mm.HandleUserFault(ctx, addr, at, sp)
+	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.

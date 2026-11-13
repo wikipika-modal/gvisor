@@ -1888,6 +1888,9 @@ func (s *Sandbox) SignalProcessGroup(cid string, pgid int32, sig unix.Signal) er
 type CheckpointOpts struct {
 	Compression               statefile.CompressionLevel
 	Resume                    bool
+	EarlyResume               bool
+	EarlyResumeGPU            bool
+	EarlyResumeGPUDeferStaged bool
 	Direct                    bool
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
@@ -1920,6 +1923,9 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Metadata:                       opts.Compression.ToMetadata(),
 		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
 		Resume:                         opts.Resume,
+		EarlyResume:                    opts.EarlyResume,
+		EarlyResumeGPU:                 opts.EarlyResumeGPU,
+		EarlyResumeGPUDeferStaged:      opts.EarlyResumeGPUDeferStaged,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
 		SplitFSCheckpointPaths:         bundles,

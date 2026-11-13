@@ -25,6 +25,8 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -67,6 +69,34 @@ type SaveOpts struct {
 
 	// Resume indicates if the statefile is used for save-resume.
 	Resume bool
+
+	// EarlyResume resumes the kernel as soon as all state other than page
+	// contents has been saved, while pages are saved in the background and
+	// writes to unsaved pages wait for them to be saved. It requires Resume
+	// and PagesFile.
+	EarlyResume bool
+
+	// EarlyResumeGPU makes EarlyResume work with nvproxy, whose pinned memory
+	// devices write without faulting: pinned memory and the memory
+	// cuda-checkpoint allocated, which holds device state until CUDA state is
+	// restored, are saved before resuming (see SaveBeforeResume), and
+	// AfterResume restores CUDA state as soon as the kernel resumes.
+	EarlyResumeGPU bool
+
+	// EarlyResumeGPUDeferStaged makes EarlyResumeGPU leave the memory
+	// cuda-checkpoint allocated unsaved when resuming. It stays
+	// write-protected, and once freed it is released only after it is saved
+	// in pages file order.
+	EarlyResumeGPUDeferStaged bool
+
+	// SaveBeforeResume, if set, returns application MemoryFile ranges that
+	// an early-resume save saves before resuming.
+	SaveBeforeResume func() []memmap.FileRange
+
+	// AfterResume, if set, is called once an early-resume save resumes the
+	// kernel, concurrently with saving the remaining pages. Save returns its
+	// error if saving succeeds.
+	AfterResume func() error
 
 	// Autosave indicates if the statefile is used for autosave.
 	Autosave bool
@@ -125,12 +155,22 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Infof("Before save wall time: %s", wt.String())
 	}
 
+	// Checking application memory for zero pages before pausing leaves only
+	// the pages found zero, or allocated since, to check while paused.
+	var appMFPrescan *pgalloc.ZeroPagesPrescan
+	if opts.EarlyResume {
+		appMFPrescan = k.MemoryFile().PrescanZeroPages(opts.AppMFExcludeCommittedZeroPages)
+	}
+
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
 	k.ReceiveTaskStates()
+	resumed := false
 	defer func() {
-		k.Unpause()
-		log.Infof("Tasks resumed after save.")
+		if !resumed {
+			k.Unpause()
+			log.Infof("Tasks resumed after save.")
+		}
 	}()
 
 	w.Stop()
@@ -160,6 +200,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	}
 	addSaveMetadata(opts.Metadata)
 
+	sr, ok := opts.PagesFile.(stateio.SourceRetainer)
+	retainsPages := ok && sr.RetainsSources()
+
 	// Open the statefile.
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
 	if err != nil {
@@ -167,10 +210,28 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		var waitPages func() error
+		waitPages, err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, appMFPrescan, opts.Resume, opts.EarlyResume, opts.SaveBeforeResume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
+		if err == nil && waitPages != nil {
+			k.BeforeResume(ctx)
+			k.Unpause()
+			resumed = true
+			log.Infof("Tasks resumed after save, before saving pages.")
+			afterResume := make(chan error, 1)
+			if opts.AfterResume != nil {
+				go func() { afterResume <- opts.AfterResume() }()
+			} else {
+				afterResume <- nil
+			}
+			err = waitPages()
+			if arErr := <-afterResume; err == nil {
+				err = arErr
+			}
+			log.Infof("Pages saved after resuming.")
+		}
 	}
 
 	t1, _ := CPUTime()
@@ -182,8 +243,16 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Warningf("Save failed: exiting... %v", err)
 		k.SetSaveError(err)
 	}
-	if opts.Resume {
+	if resumed {
+		// k.BeforeResume() was called before resuming.
+	} else if opts.Resume {
 		k.BeforeResume(ctx)
+	} else if err == nil && retainsPages {
+		// Exiting tasks would write to and free memory that the pages file
+		// server still reads, so stop them for good; the sandbox exits without
+		// releasing the kernel.
+		log.Infof("Pages file server retains sources: exiting with tasks stopped")
+		k.StopForRetainedSave()
 	} else {
 		// Kill the sandbox.
 		k.Kill(linux.WaitStatusExit(0))

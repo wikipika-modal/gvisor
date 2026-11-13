@@ -18,6 +18,8 @@ go_library(
         "//pkg/context",
         "//pkg/log",
         "//pkg/sentry/kernel",
+        "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
         "//pkg/sentry/watchdog",

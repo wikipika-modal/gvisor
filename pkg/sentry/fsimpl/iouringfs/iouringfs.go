@@ -403,6 +403,10 @@ func (fd *FileDescription) ProcessSubmissions(t *kernel.Task, toSubmit uint32, m
 		// Dispatch request from unmarshalled entry.
 		cqe := fd.ProcessSubmission(t, &sqe, flags)
 
+		// The ring is written below through a cached internal mapping, which
+		// doesn't wait for an early-resume save of its pages.
+		fd.mf.AwaitSaved(fd.rbmf.fr)
+
 		// Advance sq head.
 		sqHeadPtr.Add(1)
 

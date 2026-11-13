@@ -30,6 +30,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
@@ -74,6 +76,9 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		Metadata:                       o.Metadata,
 		AppMFExcludeCommittedZeroPages: o.AppMFExcludeCommittedZeroPages,
 		Resume:                         o.Resume,
+		EarlyResume:                    o.EarlyResume,
+		EarlyResumeGPU:                 o.EarlyResumeGPU,
+		EarlyResumeGPUDeferStaged:      o.EarlyResumeGPUDeferStaged,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
 	}
@@ -243,6 +248,7 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Save
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
+	defer s.Kernel.MemoryFile().SetDeferUnsavedRelease(false)
 	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
 }
 
@@ -261,7 +267,50 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
 	}
+	if o.EarlyResume && o.EarlyResumeGPU {
+		return preSaveCudaEarlyResume(k, o)
+	}
 	return preSaveCuda(k, o)
+}
+
+// preSaveCudaEarlyResume runs preSaveCuda and sets o.SaveBeforeResume to
+// return, once the kernel is paused, the application memory that
+// cuda-checkpoint allocated, which holds device state until CUDA state is
+// restored and is then freed, and the application memory that nvproxy pinned
+// before or since cuda-checkpoint, which devices may write without faulting.
+// cuda-checkpoint unpins memory and restoring CUDA state pins it again.
+func preSaveCudaEarlyResume(k *kernel.Kernel, o *state.SaveOpts) error {
+	mf := k.MemoryFile()
+	before := mf.AllocatedRanges()
+	pinnedBefore := nvproxy.PinnedRanges()
+	if err := preSaveCuda(k, o); err != nil {
+		return err
+	}
+	o.SaveBeforeResume = func() []memmap.FileRange {
+		staged := pgalloc.SubtractRanges(mf.AllocatedRanges(), before)
+		var frs []memmap.FileRange
+		var stagedBytes, pinnedBytes, otherBytes uint64
+		for _, fr := range staged {
+			stagedBytes += fr.Length()
+		}
+		if o.EarlyResumeGPUDeferStaged {
+			// Restoring CUDA state only reads the staged memory, then frees it.
+			mf.SetDeferUnsavedRelease(true)
+		} else {
+			frs = staged
+		}
+		for _, pr := range append(pinnedBefore, nvproxy.PinnedRanges()...) {
+			if pr.File != memmap.File(mf) {
+				otherBytes += pr.FileRange().Length()
+				continue
+			}
+			frs = append(frs, pr.FileRange())
+			pinnedBytes += pr.FileRange().Length()
+		}
+		log.Infof("Saving before resuming: %d bytes allocated by cuda-checkpoint, %d bytes pinned by nvproxy (%d more pinned outside application memory)", stagedBytes, pinnedBytes, otherBytes)
+		return frs
+	}
+	return nil
 }
 
 // PostResume is called after resuming the kernel.

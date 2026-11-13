@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -706,6 +707,9 @@ var madvPopulateDisabled atomicbitops.Bool
 type appMirror struct {
 	pinnedRanges []mm.PinnedRange
 
+	// id is am's key in pinnedMirrors.
+	id uint64
+
 	// If m is non-zero, it is the start address of a mapping of length len
 	// that is unmapped when the appMirror is released. The host driver only
 	// needs the mapping while it pins the pages, but unmapping can be very
@@ -715,7 +719,32 @@ type appMirror struct {
 	len uintptr
 }
 
+// pinnedMirrors holds the pinned ranges of every live appMirror, by
+// appMirror.id.
+var pinnedMirrors struct {
+	mu     sync.Mutex
+	nextID uint64
+	ranges map[uint64][]mm.PinnedRange
+}
+
+// PinnedRanges returns the application memory that nvproxy has pinned for
+// the host driver, which devices may write without faulting.
+func PinnedRanges() []mm.PinnedRange {
+	pinnedMirrors.mu.Lock()
+	defer pinnedMirrors.mu.Unlock()
+	var prs []mm.PinnedRange
+	for _, r := range pinnedMirrors.ranges {
+		prs = append(prs, r...)
+	}
+	return prs
+}
+
 func (am *appMirror) release(ctx context.Context) {
+	if am.id != 0 {
+		pinnedMirrors.mu.Lock()
+		delete(pinnedMirrors.ranges, am.id)
+		pinnedMirrors.mu.Unlock()
+	}
 	if am.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, am.m, am.len, 0); errno != 0 {
 			ctx.Warningf("nvproxy: failed to unmap %#x-%#x: %v", am.m, am.m+am.len, errno)
@@ -820,6 +849,14 @@ func mirrorAppRange(ctx context.Context, t *kernel.Task, ar hostarch.AddrRange, 
 			}
 		}
 	}
+	pinnedMirrors.mu.Lock()
+	pinnedMirrors.nextID++
+	am.id = pinnedMirrors.nextID
+	if pinnedMirrors.ranges == nil {
+		pinnedMirrors.ranges = make(map[uint64][]mm.PinnedRange)
+	}
+	pinnedMirrors.ranges[am.id] = prs
+	pinnedMirrors.mu.Unlock()
 	releaseMirror.Release()
 	return am, m, nil
 }
