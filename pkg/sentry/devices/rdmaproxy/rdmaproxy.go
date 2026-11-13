@@ -240,7 +240,6 @@ type uverbsFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 	memmap.MappableNoTrackMappings
-	memmap.MappableNoHugepages
 
 	hostFD     int32
 	queue      waiter.Queue

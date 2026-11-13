@@ -36,7 +36,6 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -47,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
+	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
@@ -69,8 +69,6 @@ import (
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
-
-	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 )
 
 const (
@@ -85,12 +83,6 @@ const (
 	// checkpointGCSOptsFileName is a file that may exist in an image-path
 	// directory that specifies options for storing checkpoint files in GCS.
 	checkpointGCSOptsFileName = "gcs_opts.json"
-
-	// checkpointGoferEndpointFileName is a file that may exist in an
-	// image-path directory that specifies the endpoint of an externally
-	// managed checkpoint gofer. It is mutually exclusive with
-	// checkpointGCSOptsFileName.
-	checkpointGoferEndpointFileName = "checkpoint_gofer.json"
 )
 
 func controlSocketName(id string) string {
@@ -185,6 +177,9 @@ type Sandbox struct {
 	// CgroupJSON contains the cgroup configuration that the sandbox is part of
 	// and allow serialization of the configuration into json
 	CgroupJSON cgroup.CgroupJSON `json:"cgroup"`
+
+	// CPULimits, if set, are the CPU limits of the cgroup in CgroupJSON.
+	CPULimits *CPULimits `json:"cpuLimits,omitempty"`
 
 	// OriginalOOMScoreAdj stores the value of oom_score_adj when the sandbox
 	// started, before it may be modified.
@@ -321,6 +316,10 @@ type Args struct {
 	// Gcgroup is the cgroup that the sandbox is part of.
 	Cgroup cgroup.Cgroup
 
+	// CPULimits, if set, are the CPU limits of `Cgroup`, which currently has
+	// the lifecycle limit.
+	CPULimits *CPULimits
+
 	// CloneIntoCgroupFD, when non-nil, is an FD to `Cgroup`'s directory. The
 	// sandbox process is created inside the cgroup via `CLONE_INTO_CGROUP`.
 	CloneIntoCgroupFD *os.File
@@ -362,6 +361,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		CgroupJSON: cgroup.CgroupJSON{
 			Cgroup: args.Cgroup,
 		},
+		CPULimits:           args.CPULimits,
 		UID:                 -1, // prevent usage before it's set.
 		GID:                 -1, // prevent usage before it's set.
 		MetricMetadata:      conf.MetricMetadata(),
@@ -508,8 +508,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	if err := conn.Call(sentryapi.ContMgrRootContainerStart, &s.ID, nil); err != nil {
 		return fmt.Errorf("starting root container: %w", err)
 	}
-
-	return nil
+	return s.applyAppCPULimit(cpuPhaseCreation)
 }
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
@@ -575,6 +574,12 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
+	// TODO(fvoznika): Once `runsc create --for-restore` exists, this should
+	// become a no-op and no longer be needed:
+	if err := s.switchCPULimit(cpuPhaseCreation, cpuPhaseLifecycle); err != nil {
+		log.Warningf("[Lifecycle CPU] Restore will run under the creation CPU limit: %v. This affects gVisor restore speed.", err)
+	}
+
 	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
 		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
@@ -628,16 +633,20 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	// Restore the container and start the root container.
-	if err := conn.Call(sentryapi.ContMgrRestore, &opt, nil); err != nil {
+	var reply sentryapi.RestoreReply
+	if err := conn.Call(sentryapi.ContMgrRestore, &opt, &reply); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := getCheckpointGoferTarget(imagePath); target != "" {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
 			}
 		}
 		return fmt.Errorf("restoring container %q: %w", cid, err)
 	}
 	s.Restored = true
-	return nil
+	if !reply.KernelStarted {
+		return nil
+	}
+	return s.applyAppCPULimit(cpuPhaseLifecycle)
 }
 
 func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct bool, opt *sentryapi.RestoreOpts) error {
@@ -772,10 +781,14 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		GoferMountConfs:      goferMountConf,
 		FilePayload:          payload,
 	}
-	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, nil); err != nil {
+	var reply sentryapi.RestoreReply
+	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, &reply); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
-	return nil
+	if !reply.KernelStarted {
+		return nil
+	}
+	return s.applyAppCPULimit(cpuPhaseLifecycle)
 }
 
 // Processes retrieves the list of processes and associated metadata for a
@@ -1165,16 +1178,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", rootfsTarPath, rootfsUpperTarFlags(rootfsTarPath), lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
-	// Donate the persistent mutation-log file so the root overlay upper adopts it at mount
-	// creation (see tmpfs.FilesystemOpts.MutationLogFD). The caller sets the path only for a
-	// fresh sandbox; leaving it empty on restore keeps the restored mount inert.
-	if conf.FSMutationLog && conf.FSMutationLogPath != "" {
-		mutLogFile, err := os.OpenFile(conf.FSMutationLogPath, os.O_CREATE|os.O_RDWR, 0644)
-		if err != nil {
-			return fmt.Errorf("opening fsmutationlog file %q: %w", conf.FSMutationLogPath, err)
-		}
-		donations.DonateAndClose("fsmutationlog-fd", mutLogFile)
-	}
 
 	// Pass gofer mount configs.
 	if len(args.GoferMountConfs) > 0 {
@@ -1490,7 +1493,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	mem := totalSysMem
 	if s.CgroupJSON.Cgroup != nil {
-		cpuNum, cpuQuota, cpuPeriod, err := calculateCPUNum(s.CgroupJSON.Cgroup, conf.CPUNumFromQuota)
+		cpuNum, cpuQuota, cpuPeriod, err := calculateCPUNum(s.CgroupJSON.Cgroup, s.CPULimits, conf.CPUNumFromQuota)
 		if err != nil {
 			return err
 		}
@@ -1629,19 +1632,24 @@ func spawnFDParking(ring *os.File, pid int) error {
 
 // calculateCPUNum calculates the number of CPUs to configure for the sandbox,
 // along with the cgroup CPU quota and period.
-func calculateCPUNum(cg cgroup.Cgroup, cpuNumFromQuota bool) (int, int64, int64, error) {
+// `limits`, if set, holds the application CPU limit, which `cg` does not have
+// yet.
+func calculateCPUNum(cg cgroup.Cgroup, limits *CPULimits, cpuNumFromQuota bool) (int, int64, int64, error) {
 	cpuNum, err := cg.NumCPU()
 	if err != nil {
 		log.Warningf("Failed to get cpu count from cgroups: %v. Falling back to runtime.NumCPU()", err)
 		cpuNum = runtime.NumCPU()
 	}
-	cpuQuota, err := cg.CPUQuota()
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
-	}
-	cpuPeriod, err := cg.CPUPeriod()
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("getting raw cpu period from cgroups: %v", err)
+	var cpuQuota, cpuPeriod int64
+	if limits != nil {
+		cpuQuota, cpuPeriod = *limits.App.Quota, int64(*limits.App.Period)
+	} else {
+		if cpuQuota, err = cg.CPUQuota(); err != nil {
+			return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
+		}
+		if cpuPeriod, err = cg.CPUPeriod(); err != nil {
+			return 0, 0, 0, fmt.Errorf("getting raw cpu period from cgroups: %v", err)
+		}
 	}
 	if cpuNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
 		// Dropping below 2 CPUs can trigger application to disable
@@ -1712,6 +1720,9 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 		conn.Close()
 		if err == nil {
 			if s.IsRootContainer(cid) {
+				if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
+					log.Warningf("[Lifecycle CPU] Sandbox teardown after root container exit will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+				}
 				if err := s.waitForStopped(); err != nil {
 					return unix.WaitStatus(0), err
 				}
@@ -1810,6 +1821,11 @@ func (s *Sandbox) destroy() error {
 	}
 	pid := s.Pid.Load()
 	if pid != 0 {
+		if running, _ := s.IsRunning(); running {
+			if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
+				log.Warningf("[Lifecycle CPU] Sandbox destruction will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+			}
+		}
 		log.Debugf("Killing sandbox %q", s.ID)
 		if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
 			return fmt.Errorf("killing sandbox %q PID %d: %w", s.ID, pid, err)
@@ -1827,6 +1843,12 @@ func (s *Sandbox) destroy() error {
 // returning.
 func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
+	if sig == unix.SIGKILL && s.IsRootContainer(cid) {
+		// This stops the application.
+		if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
+			log.Warningf("[Lifecycle CPU] Sandbox teardown after SIGKILL of the root container will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+		}
+	}
 	mode := sentryapi.DeliverToProcess
 	if all {
 		mode = sentryapi.DeliverToAllProcesses
@@ -1911,7 +1933,8 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 	if len(bundles) > 0 {
 		// Verify we are not using GCS/gofer.
-		if hasCheckpointGoferOpts(imagePath) {
+		gcsOptsPath := filepath.Join(imagePath, checkpointGCSOptsFileName)
+		if _, err := os.Stat(gcsOptsPath); err == nil {
 			return fmt.Errorf("split filesystem checkpoint is not supported with GCS/gofer")
 		}
 	}
@@ -1934,15 +1957,25 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		return err
 	}
 
+	if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
+		log.Warningf("[Lifecycle CPU] Checkpoint will run under the application CPU limit: %v. This slows down gVisor checkpointing speed.", err)
+	}
 	if err := s.call(sentryapi.ContMgrCheckpoint, &opt, nil); err != nil {
+		// The application may still be running.
+		if err := s.applyAppCPULimit(cpuPhaseLifecycle); err != nil {
+			log.Warningf("[Lifecycle CPU] Cannot restore the application CPU limit after failed checkpoint: %v", err)
+		}
 		if opt.UseCheckpointGofer {
-			if target := getCheckpointGoferTarget(imagePath); target != "" {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
 			}
 		}
 		return fmt.Errorf("checkpointing container %q: %w", cid, err)
 	}
 	s.Checkpointed = true
+	if opts.Resume {
+		return s.applyAppCPULimit(cpuPhaseLifecycle)
+	}
 	return nil
 }
 
@@ -2076,15 +2109,9 @@ func discoverFSCheckpointPrefixes(dir string) ([]string, error) {
 	return prefixes, nil
 }
 
-// hasCheckpointGoferOpts returns true if imagePath contains a file that
-// configures a checkpoint gofer.
-func hasCheckpointGoferOpts(imagePath string) bool {
-	for _, name := range []string{checkpointGCSOptsFileName, checkpointGoferEndpointFileName} {
-		if _, err := os.Stat(filepath.Join(imagePath, name)); err == nil {
-			return true
-		}
-	}
-	return false
+func hasGCSOpts(imagePath string) bool {
+	_, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName))
+	return err == nil
 }
 
 // isGCSRestorePath checks whether p refers to a GCS checkpoint directory
@@ -2094,7 +2121,7 @@ func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
 	p = filepath.Clean(p)
 	fi, err := os.Stat(p)
 	if err == nil && fi.IsDir() {
-		return hasCheckpointGoferOpts(p), false
+		return hasGCSOpts(p), false
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return false, false
@@ -2106,7 +2133,7 @@ func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
 	for {
 		fi, err := os.Stat(dir)
 		if err == nil {
-			return fi.IsDir() && hasCheckpointGoferOpts(dir), true
+			return fi.IsDir() && hasGCSOpts(dir), true
 		}
 		parent := filepath.Dir(dir)
 		if !errors.Is(err, fs.ErrNotExist) || parent == dir {
@@ -2253,7 +2280,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	if err := s.call(sentryapi.ContMgrFSSave, &args, nil); err != nil {
 		if args.UseCheckpointGofer {
-			if target := getCheckpointGoferTarget(imagePath); target != "" {
+			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2264,7 +2291,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, bundles []fscheckpoint.Bundle, args *sentryapi.FSSaveArgs) error {
 	// TODO(b/541219576): Support multi-bundle or prefixed filesystem checkpoint with GCS/gofer.
-	if fscheckpoint.HasPrefixes(bundles) && hasCheckpointGoferOpts(imagePath) {
+	if fscheckpoint.HasPrefixes(bundles) && hasGCSOpts(imagePath) {
 		return fmt.Errorf("multi-bundle or prefixed filesystem checkpoint is not supported with GCS/gofer")
 	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-writes")
@@ -2403,16 +2430,6 @@ func openFSCheckpointLocalFiles(dirFD int, imagePath, prefix string, openFlags i
 	return files[:], nil
 }
 
-// getCheckpointGoferTarget returns a human-readable name for the checkpoint
-// gofer target configured under imagePath, for use in error messages, or
-// empty string if not applicable.
-func getCheckpointGoferTarget(imagePath string) string {
-	if opts, err := readCheckpointGoferEndpointOpts(imagePath); err == nil && opts != nil {
-		return opts.target()
-	}
-	return getGCSURIFromImagePath(imagePath)
-}
-
 // getGCSURIFromImagePath returns the GCS URI (e.g. "gs://bucket" or "gs://bucket/prefix")
 // specified in gcs_opts.json under imagePath, or empty string if not applicable.
 func getGCSURIFromImagePath(imagePath string) string {
@@ -2434,76 +2451,11 @@ func getGCSURIFromImagePath(imagePath string) string {
 	return fmt.Sprintf("gs://%s", opts.Bucket)
 }
 
-// checkpointGoferEndpointOpts is the contents of checkpoint_gofer.json.
-type checkpointGoferEndpointOpts struct {
-	// Endpoint is the path of a Unix domain stream socket on which an
-	// externally managed checkpoint gofer accepts connections.
-	Endpoint string `json:"endpoint"`
-
-	// Target is an optional human-readable name for the checkpoint, used
-	// only in error messages.
-	Target string `json:"target"`
-}
-
-func (o *checkpointGoferEndpointOpts) target() string {
-	if o.Target != "" {
-		return o.Target
-	}
-	return o.Endpoint
-}
-
-// readCheckpointGoferEndpointOpts returns the options in checkpoint_gofer.json
-// under imagePath, or nil if the file does not exist.
-func readCheckpointGoferEndpointOpts(imagePath string) (*checkpointGoferEndpointOpts, error) {
-	optsPath := filepath.Join(imagePath, checkpointGoferEndpointFileName)
-	data, err := os.ReadFile(optsPath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading %q: %w", optsPath, err)
-	}
-	var opts checkpointGoferEndpointOpts
-	if err := json.Unmarshal(data, &opts); err != nil {
-		return nil, fmt.Errorf("parsing %q: %w", optsPath, err)
-	}
-	if opts.Endpoint == "" {
-		return nil, fmt.Errorf("%q: endpoint must be set", optsPath)
-	}
-	if _, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName)); err == nil {
-		return nil, fmt.Errorf("%q and %q are mutually exclusive", optsPath, checkpointGCSOptsFileName)
-	}
-	return &opts, nil
-}
-
-// dialCheckpointGofer returns a socket connected to the externally managed
-// checkpoint gofer described by opts.
-func dialCheckpointGofer(opts *checkpointGoferEndpointOpts) (*os.File, error) {
-	sockFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("creating checkpoint gofer socket for %s: %w", opts.target(), err)
-	}
-	if err := unix.Connect(sockFD, &unix.SockaddrUnix{Name: opts.Endpoint}); err != nil {
-		unix.Close(sockFD)
-		return nil, fmt.Errorf("connecting to checkpoint gofer at %q for %s: %w", opts.Endpoint, opts.target(), err)
-	}
-	return os.NewFile(uintptr(sockFD), "checkpointgofer-socket"), nil
-}
-
 // maybeStartCheckpointGoferAndGetSocket checks if use of a checkpoint gofer is
-// specified by configuration files in imagePath. If checkpoint_gofer.json
-// exists, it connects to the externally managed checkpoint gofer at the
-// specified endpoint. If gcs_opts.json exists, it starts the checkpoint gofer.
-// In either case, it returns an os.File representing a socket connected to the
-// checkpoint gofer. Otherwise, it returns nil.
+// specified by configuration files in imagePath. If so, it starts the
+// checkpoint gofer and returns an os.File representing a socket connected to
+// it. Otherwise, it returns nil.
 func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg cgroup.Cgroup, imagePath string, extraFlags ...string) (*os.File, error) {
-	endpointOpts, err := readCheckpointGoferEndpointOpts(imagePath)
-	if err != nil {
-		return nil, err
-	}
-	if endpointOpts != nil {
-		return dialCheckpointGofer(endpointOpts)
-	}
 	gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
 	gcsOptsFile, err := os.Open(gcsOptsPath)
 	if err != nil {
@@ -2636,7 +2588,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 		bundles = []fscheckpoint.Bundle{{}}
 	}
 	// TODO(b/541219576): Support multi-bundle or prefixed filesystem checkpoint with GCS/gofer.
-	if fscheckpoint.HasPrefixes(bundles) && hasCheckpointGoferOpts(path) {
+	if fscheckpoint.HasPrefixes(bundles) && hasGCSOpts(path) {
 		return fmt.Errorf("multi-bundle or prefixed filesystem checkpoint is not supported with GCS/gofer")
 	}
 
@@ -2766,31 +2718,7 @@ func (s *Sandbox) ExportMetrics(opts controlapi.MetricsExportOpts) (*prometheus.
 
 // IsRunning returns true if the sandbox process is running (and not a zombie).
 func (s *Sandbox) IsRunning() (bool, error) {
-	pid := s.Pid.Load()
-	if pid <= 0 {
-		return false, nil
-	}
-	pidfd, err := unix.PidfdOpen(pid, 0)
-	if err != nil {
-		if err == unix.ESRCH || err == unix.EINVAL {
-			return false, nil
-		}
-		return false, fmt.Errorf("pidfd_open(%d): %w", pid, err)
-	}
-	defer unix.Close(pidfd)
-
-	pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
-	for {
-		n, err := unix.Poll(pfds, 0)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return false, fmt.Errorf("polling pidfd for process %d: %w", pid, err)
-		}
-		// A pidfd becomes readable (POLLIN) when the process exits (including when it is a zombie).
-		return n == 0, nil
-	}
+	return specutils.IsProcessRunning(s.Pid.Load())
 }
 
 // Stacks collects and returns all stacks for the sandbox.
@@ -3188,13 +3116,6 @@ func SetUserMappings(spec *specs.Spec, pid int) error {
 	return nil
 }
 
-// DrainDentryCache drains unused dentries in the filesystem selected by path in
-// the container's init process view. It does not disable caching or pause tasks.
-func (s *Sandbox) DrainDentryCache(cid, path string) error {
-	args := sentryapi.DrainDentryCacheArgs{ContainerID: cid, Path: path}
-	return s.call(sentryapi.ContMgrDrainDentryCache, &args, nil)
-}
-
 // Mount mounts a filesystem in a container.
 func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 	var files []*os.File
@@ -3244,39 +3165,6 @@ func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error 
 		return fmt.Errorf("serializing rootfs upper layer to tar: %w", err)
 	}
 	return nil
-}
-
-// FsMutationLog drains a mutation-log segment of the overlay upper layer into the persistent
-// host log file adopted at boot. See Container.FsMutationLog and kernel.FsMutationLog. length
-// is the size of the written segment; the caller reflinks the log file and reads [0, length).
-func (s *Sandbox) FsMutationLog(path string, sinceGen uint64) (generation uint64, length uint64, err error) {
-	log.Debugf("FsMutationLog, sandbox: %q, path: %q", s.ID, path)
-	args := sentryapi.FsMutationLogArgs{
-		Path:     path,
-		SinceGen: sinceGen,
-	}
-	var res sentryapi.FsMutationLogResult
-	if err := s.call(sentryapi.ContMgrFsMutationLog, &args, &res); err != nil {
-		return 0, 0, fmt.Errorf("collecting fs mutation log: %w", err)
-	}
-	return res.Generation, res.Length, nil
-}
-
-// FsMutationLogDump writes a FULL mutation-log segment of the overlay upper layer to out,
-// restarting the journal after it if resync. length is the size of the FULL segment.
-func (s *Sandbox) FsMutationLogDump(path string, out *os.File, resync bool) (generation uint64, length uint64, err error) {
-	log.Debugf("FsMutationLogDump, sandbox: %q, path: %q, resync: %t", s.ID, path, resync)
-	args := sentryapi.FsMutationLogArgs{
-		Path:        path,
-		Dump:        true,
-		Resync:      resync,
-		FilePayload: urpc.FilePayload{Files: []*os.File{out}},
-	}
-	var res sentryapi.FsMutationLogResult
-	if err := s.call(sentryapi.ContMgrFsMutationLog, &args, &res); err != nil {
-		return 0, 0, fmt.Errorf("dumping fs mutation log: %w", err)
-	}
-	return res.Generation, res.Length, nil
 }
 
 // ReadFile reads a file of the sandbox from the given container (or root container if containerID is empty) up to the specified size from the specified offset.

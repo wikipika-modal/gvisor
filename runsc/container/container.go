@@ -31,7 +31,6 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
@@ -140,10 +139,6 @@ type Container struct {
 	// overlaid (with tmpfs or overlayfs). The first entry is for rootfs and the
 	// following entries are for bind mounts in Spec.Mounts (in the same order).
 	GoferMountConfs specutils.GoferMountConfFlags `json:"goferMountConfs"`
-
-	// FSMutationLogFilestore is the journal-owned root filestore left for the
-	// caller to capture and remove. Other filestores use ordinary cleanup.
-	FSMutationLogFilestore string `json:"fsMutationLogFilestore,omitempty"`
 
 	//
 	// Fields below this line are not saved in the state file and will not
@@ -392,14 +387,28 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		args.Spec.Linux.CgroupsPath = "/" + args.ID
 	}
 	var subCgroup, parentCgroup, containerCgroup cgroup.Cgroup
+	var cpuLimits *sandbox.CPULimits
 	if !conf.IgnoreCgroups {
 		var err error
 
+		cpuLimits = newCPULimits(conf, args.Spec.Linux.Resources, willRestoreSandbox(args))
+		if parentPath, inPod := args.Spec.Annotations[cgroupParentAnnotation]; inPod && cpuLimits != nil {
+			logCPUPoliciesNotApplied(conf, fmt.Sprintf("the orchestrator owns the pod cgroup %q. Note that this means gVisor sandbox lifecycle operations are being capped by the pod CPU limit, and could go faster otherwise", parentPath))
+			cpuLimits = nil
+		}
+
 		// Create and join cgroup before processes are created to ensure they are
 		// part of the cgroup from the start (and all their children processes).
-		parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec)
+		parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec, cpuLimits)
 		if err != nil {
 			return nil, fmt.Errorf("cannot set up cgroup for root: %w", err)
+		}
+		if cpuLimits != nil && parentCgroup == nil {
+			cpuLimits = nil
+		}
+		if cpuLimits != nil && !cgroup.OwnsCPULimit(parentCgroup) {
+			logCPUPoliciesNotApplied(conf, "runsc did not create the sandbox cgroup. Note that this means gVisor sandbox lifecycle operations are being capped by the CPU limit you set in that cgroup, and could go faster otherwise")
+			cpuLimits = nil
 		}
 		// Join the child cgroup when using cgroupfs. Joining non leaf-node
 		// cgroups is illegal in cgroupsv2 and will return EBUSY.
@@ -418,24 +427,6 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return parentCgroup, err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
-		// The device filter is attached while the sandbox processes start.
-		// They only open whitelisted devices, and the container does not run
-		// before it is started.
-		devicesDone := make(chan error, 1)
-		go func() {
-			if containerCgroup == nil {
-				devicesDone <- nil
-				return
-			}
-			rules, err := sandboxDeviceRules(conf, args.Spec)
-			if err == nil {
-				if err = containerCgroup.AllowDevices(rules); err != nil {
-					err = handleCgroupInstallErr(conf, "device cgroup", err)
-				}
-			}
-			devicesDone <- err
-		}()
-
 		// No rootfs and no mounts, so nothing for a gofer to serve.
 		// Subcontainers get their own.
 		var (
@@ -464,6 +455,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
 			Cgroup:              containerCgroup,
+			CPULimits:           cpuLimits,
 			CloneIntoCgroupFD:   cloneIntoCgroupFD,
 			Attached:            args.Attached,
 			GoferFilestoreFiles: goferFilestores,
@@ -476,17 +468,10 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			NoRootContainer:     args.NoRootContainer,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
-		devicesErr := <-devicesDone
 		if err != nil {
 			return fmt.Errorf("cannot create sandbox: %w", err)
 		}
-		if devicesErr != nil {
-			return devicesErr
-		}
 		c.Sandbox = sand
-		if conf.FSMutationLog && conf.FSMutationLogPath != "" && len(args.FSRestoreImagePaths) == 0 && c.GoferMountConfs[0].IsSelfBacked() {
-			c.FSMutationLogFilestore = sentryapi.SelfFilestorePath(c.Spec.Root.Path, c.sandboxID())
-		}
 		return nil
 
 	}); err != nil {
@@ -564,10 +549,6 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		if err := cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
-			if err := c.allowSandboxDevices(conf); err != nil {
-				return err
-			}
-
 			// Create the gofer process.
 			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD)
 			if err != nil {
@@ -669,7 +650,7 @@ func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 }
 
 // Update sets the resources of a running container as configured.
-func (c *Container) Update(res *specs.LinuxResources) error {
+func (c *Container) Update(conf *config.Config, res *specs.LinuxResources) error {
 	log.Debugf("Set resources for container, cid: %s", c.ID)
 	if err := c.requireStatus("set resources for", Created, Running); err != nil {
 		return err
@@ -684,9 +665,14 @@ func (c *Container) Update(res *specs.LinuxResources) error {
 		if cg == nil {
 			return fmt.Errorf("cgroup cannot be nil")
 		}
-		if err := cg.Update(res); err != nil {
+		oldCPULimits := c.Sandbox.CPULimits
+		if _, inPod := c.Spec.Annotations[cgroupParentAnnotation]; !inPod && cgroup.OwnsCPULimit(cg) {
+			c.Sandbox.CPULimits = newCPULimits(conf, res, oldCPULimits != nil && oldCPULimits.WillRestore)
+		}
+		if err := cg.Update(c.cgroupResources(res)); err != nil {
 			// set back to original
-			if err2 := cg.Update(c.Spec.Linux.Resources); err2 != nil {
+			c.Sandbox.CPULimits = oldCPULimits
+			if err2 := cg.Update(c.cgroupResources(c.Spec.Linux.Resources)); err2 != nil {
 				return fmt.Errorf("setting back cgroup configs failed due to error: %v, your state file and actual configs might be inconsistent", err2)
 			}
 			return err
@@ -852,30 +838,6 @@ func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
 		return err
 	}
 	return c.Sandbox.TarRootfsUpperLayer(c.ID, outFD)
-}
-
-// FsMutationLog drains a mutation-log segment of the overlay upper layer into the persistent
-// host log file adopted at boot (see kernel.FsMutationLog). It does not clone the filestore;
-// the caller reflinks the filestore's and the log's physical backing files while the container
-// is paused. length is the size of the written segment; the caller reads [0, length).
-func (c *Container) FsMutationLog(path string, sinceGen uint64) (generation uint64, length uint64, err error) {
-	log.Debugf("FsMutationLog, cid: %s, path: %q", c.ID, path)
-	if err := c.CheckSandboxRunning(); err != nil {
-		return 0, 0, err
-	}
-	return c.Sandbox.FsMutationLog(path, sinceGen)
-}
-
-// FsMutationLogDump writes a FULL mutation-log segment of the overlay upper layer to out,
-// restarting the journal after it if resync (see kernel.FsMutationLog). A caller that
-// pairs it with the filestore keeps the container paused across this call and the
-// filestore's reflink.
-func (c *Container) FsMutationLogDump(path string, out *os.File, resync bool) (generation uint64, length uint64, err error) {
-	log.Debugf("FsMutationLogDump, cid: %s, path: %q, resync: %t", c.ID, path, resync)
-	if err := c.CheckSandboxRunning(); err != nil {
-		return 0, 0, err
-	}
-	return c.Sandbox.FsMutationLogDump(path, out, resync)
 }
 
 // SignalContainer sends the signal to the container. If all is true and signal
@@ -1118,10 +1080,6 @@ func (c *Container) Destroy() error {
 			}
 		}
 		filestorePath := sentryapi.SelfFilestorePath(mountSrc, c.sandboxID())
-		if filestorePath == c.FSMutationLogFilestore {
-			log.Infof("Skipping deletion of filestore %q because fsmutationlog is enabled", filestorePath)
-			return
-		}
 		if err := os.Remove(filestorePath); err != nil {
 			err = fmt.Errorf("failed to delete filestore file %q: %v", filestorePath, err)
 			log.Warningf("%v", err)
@@ -1138,10 +1096,6 @@ func (c *Container) Destroy() error {
 			// Assume this is a self-backed shared mount and try to delete the
 			// filestore. Subsequently ignore the ENOENT if the assumption is wrong.
 			filestorePath := sentryapi.SelfFilestorePath(hint.Mount.Source, c.sandboxID())
-			if filestorePath == c.FSMutationLogFilestore {
-				log.Infof("Skipping deletion of filestore %q because fsmutationlog is enabled", filestorePath)
-				continue
-			}
 			if err := os.Remove(filestorePath); err != nil && !os.IsNotExist(err) {
 				err = fmt.Errorf("failed to delete shared filestore file %q: %v", filestorePath, err)
 				log.Warningf("%v", err)
@@ -1806,6 +1760,13 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *sentryap
 			specutils.SetUIDGIDMappings(cmd, c.Spec)
 			// We need to set UID and GID to have capabilities in a new user namespace.
 			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+			if conf.GetHostUDS().AllowOpen() && len(cmd.SysProcAttr.GidMappings) > 0 && specutils.SetgroupsAllowed() {
+				// Connecting to a host socket applies the application's supplementary
+				// groups, which setgroups(2) refuses in a user namespace that denies
+				// it. Allowing it also makes os/exec start the gofer with no
+				// supplementary groups.
+				cmd.SysProcAttr.GidMappingsEnableSetgroups = true
+			}
 		}
 	} else {
 		userNS, ok := specutils.GetNS(specs.UserNamespace, c.Spec)
@@ -2134,6 +2095,15 @@ func setOOMScoreAdj(pid int, scoreAdj int) error {
 			log.Warningf("Process (%d) not found setting oom_score_adj", pid)
 			return nil
 		}
+		// An exited process without an mm has root-owned proc files. For a
+		// nonroot caller, opening oom_score_adj can fail before reaching the
+		// write that would otherwise report ESRCH.
+		if errors.Is(err, unix.EACCES) {
+			if running, err := specutils.IsProcessRunning(pid); err == nil && !running {
+				log.Warningf("Process (%d) exited while setting oom_score_adj", pid)
+				return nil
+			}
+		}
 		return err
 	}
 	defer f.Close()
@@ -2230,10 +2200,57 @@ func (c *Container) createParentCgroup(parentPath string, conf *config.Config) (
 	return parentCgroup, nil
 }
 
+// logCPUPoliciesNotApplied logs that the sandbox CPU policies do not apply,
+// because of `reason`.
+// Only warns if either policy was set explicitly.
+func logCPUPoliciesNotApplied(conf *config.Config, reason string) {
+	logf := log.Infof
+	if !conf.SandboxCreationCPUPolicy.Implicit() || !conf.SandboxLifecycleCPUPolicy.Implicit() {
+		logf = log.Warningf
+	}
+	logf("[Lifecycle CPU] Not applying --sandbox-creation-cpu-policy=%v and --sandbox-lifecycle-cpu-policy=%v: %s.", conf.SandboxCreationCPUPolicy, conf.SandboxLifecycleCPUPolicy, reason)
+}
+
+// cgroupResources returns `res` as the sandbox cgroup should have it now:
+// with the creation CPU limit until the application starts.
+func (c *Container) cgroupResources(res *specs.LinuxResources) *specs.LinuxResources {
+	if c.Status == Created && c.Sandbox.CPULimits != nil {
+		return c.Sandbox.CPULimits.CreationResources(res)
+	}
+	return res
+}
+
+// newCPULimits returns the CPU limits of the sandbox with resources `res`.
+// `willRestore` is whether creating it restores application data (see
+// `willRestoreSandbox`).
+func newCPULimits(conf *config.Config, res *specs.LinuxResources, willRestore bool) *sandbox.CPULimits {
+	limits := sandbox.NewCPULimits(conf.SandboxCreationCPUPolicy, conf.SandboxLifecycleCPUPolicy, res)
+	if limits != nil && willRestore {
+		limits.WillRestore = true
+		limits.Creation = limits.Lifecycle
+	}
+	return limits
+}
+
+// willRestoreSandbox returns whether creating the sandbox for `args` already
+// restores application data. Its CPU cost scales with that data, so it runs
+// under the lifecycle CPU limit rather than the creation one.
+func willRestoreSandbox(args Args) bool {
+	// TODO(fvoznika): Also return true when `runsc create --for-restore=true`
+	// is specified, when such a flag exists.
+	for _, p := range args.FSRestoreImagePaths {
+		if p != "" {
+			return true
+		}
+	}
+	return specutils.RootfsTarUpperPath(args.Spec) != ""
+}
+
 // setupCgroupForRoot configures and returns cgroup for the sandbox and the
 // root container. If `cgroupParentAnnotation` is set, use that path as the
 // sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
-func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, cgroup.Cgroup, error) {
+// `cpuLimits`, if set, gives the sandbox cgroup its creation CPU limit.
+func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec, cpuLimits *sandbox.CPULimits) (cgroup.Cgroup, cgroup.Cgroup, error) {
 	var parentCgroup cgroup.Cgroup
 	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
 		var err error
@@ -2252,8 +2269,12 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 		}
 	}
 
+	res := spec.Linux.Resources
+	if cpuLimits != nil {
+		res = cpuLimits.CreationResources(res)
+	}
 	var err error
-	parentCgroup, err = cgroupInstall(conf, parentCgroup, spec.Linux.Resources)
+	parentCgroup, err = cgroupInstall(conf, parentCgroup, res)
 	if parentCgroup == nil || err != nil {
 		return nil, nil, err
 	}
@@ -2298,11 +2319,11 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 }
 
 // handleCgroupInstallErr maps an error from a cgroup install operation. In
-// rootless mode, permission errors and EROFS mean we lack permission to
-// configure cgroups, which is non-fatal: it logs and returns nil so the caller
-// proceeds without a cgroup. All other errors are wrapped with what.
+// rootless mode, EACCES/EROFS mean we lack permission to configure cgroups,
+// which is non-fatal: it logs and returns nil so the caller proceeds without a
+// cgroup. All other errors are wrapped with what.
 func handleCgroupInstallErr(conf *config.Config, what string, err error) error {
-	if (errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS)) && conf.Rootless {
+	if (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless {
 		log.Warningf("Skipping %s configuration in rootless mode: %v", what, err)
 		return nil
 	}
@@ -2536,7 +2557,7 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		"--load-kmods",
 		"configure",
 		fmt.Sprintf("--ldconfig=@%s", ldconfigPath),
-		"--no-cgroups", // runsc configures the sandbox's device cgroup itself.
+		"--no-cgroups", // runsc doesn't configure device cgroups yet
 		fmt.Sprintf("--pid=%d", goferPid),
 		fmt.Sprintf("--device=%s", devices),
 	}

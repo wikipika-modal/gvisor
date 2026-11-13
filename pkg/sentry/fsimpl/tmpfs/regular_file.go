@@ -120,7 +120,6 @@ func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.
 	file := &regularFile{
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
-		huge:            fs.huge,
 	}
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
@@ -299,14 +298,6 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 	return nil
 }
 
-// hasWritableMapping reports whether rf currently has at least one writable
-// shared memory mapping, i.e. one through which the file can be changed in place.
-func (rf *regularFile) hasWritableMapping() bool {
-	rf.mapsMu.Lock()
-	defer rf.mapsMu.Unlock()
-	return rf.writableMappingPages > 0
-}
-
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
 func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
 	rf.mapsMu.Lock()
@@ -336,26 +327,11 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	mayHuge := rf.huge && rf.inode.fs.mf.HugepagesEnabled()
 
-	// Constrain allocation to required, rounded to the nearest
-	// faultAroundAlignment.
-	faultAroundAlignment := uint64(64 << 10) // 64 KB, matches Linux's default fault_around_pages
-	if mayHuge {
-		faultAroundAlignment = hostarch.HugePageSize
-	}
-	faultAroundMask := faultAroundAlignment - 1
-	fillRange := memmap.MappableRange{
-		Start: required.Start &^ faultAroundMask,
-		End:   required.End,
-	}
-	if fillEnd := (required.End + faultAroundMask) &^ faultAroundMask; fillRange.End < fillEnd { // no overflow
-		fillRange.End = fillEnd
-	}
-
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
 
-	// Constrain both allocation and translation to f.attr.Size (rounded up) to
-	// avoid pages that may be concurrently truncated.
+	// Constrain translations to f.attr.Size (rounded up) to prevent
+	// translation to pages that may be concurrently truncated.
 	pgend := offsetPageEnd(int64(rf.size.RacyLoad()))
 	var beyondEOF bool
 	if required.End > pgend {
@@ -365,13 +341,17 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		beyondEOF = true
 		required.End = pgend
 	}
-	if fillRange.End > pgend {
-		fillRange.End = pgend
-	}
 	if optional.End > pgend {
 		optional.End = pgend
 	}
 
+	// fillRange bounds how far Translate allocates ("fills") ahead of the
+	// faulting page. It is kept small to bound speculative allocation against
+	// tmpfs size limits (see filesystem.accountPages): a fault that touches a
+	// hole must not commit an unbounded number of pages and prematurely exhaust
+	// the mount's size limit. This matches gofer.maxFillRange().
+	const maxFillBytes = 64 << 10 // 64 KiB
+	fillRange := maxOptionalRange(required, optional, maxFillBytes)
 	pagesToFill := rf.data.PagesToFill(required, fillRange)
 	if !rf.inode.fs.accountPages(pagesToFill) {
 		// If we can not accommodate pagesToFill pages, then retry with just
@@ -383,18 +363,9 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		}
 		fillRange = required
 	}
-	// The first access to any page of a huge page commits all of it, so when
-	// the fill is whole huge pages that each contain part of required, the
-	// application commits every page of the fill as soon as it touches it.
-	// Existing pages in the range make Fill() allocate small pages instead.
-	allocMode := pgalloc.AllocateUncommitted
-	if mayHuge && hostarch.IsHugePageAligned(fillRange.Start) && hostarch.IsHugePageAligned(fillRange.End) && pagesToFill<<hostarch.PageShift == fillRange.Length() {
-		allocMode = pgalloc.AllocateCallerIndirectCommit
-	}
 	pagesAlloced, cerr := rf.data.Fill(ctx, required, fillRange, rf.size.RacyLoad(), rf.inode.fs.mf, pgalloc.AllocOpts{
 		Kind:    rf.memoryUsageKind,
 		MemCgID: memCgID,
-		Mode:    allocMode,
 		Huge:    mayHuge,
 	}, nil)
 	// rf.data.Fill() may fail mid-way. We still want to account any pages that
@@ -458,11 +429,6 @@ func maxOptionalRange(required, optional memmap.MappableRange, maxBytes uint64) 
 	return optional
 }
 
-// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
-func (rf *regularFile) MayUseHugepages() bool {
-	return rf.huge && rf.inode.fs.mf.HugepagesEnabled()
-}
-
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (*regularFile) InvalidateUnsavable(context.Context) error {
 	return nil
@@ -480,10 +446,7 @@ type regularFileFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *regularFileFD) Release(context.Context) {
-	if fd.vfsfd.IsWritable() {
-		d := fd.dentry()
-		d.inode.fs.logCloseForWrite(d.inode)
-	}
+	// noop
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -526,9 +489,6 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		curPgStart = curPgEnd
 	}
 	f.inode.touchCMtimeLocked()
-
-	// Content mutations on a writable file description are journaled at close (or at
-	// the drain while it is open); see logOpenForWrite.
 	return nil
 }
 
@@ -720,14 +680,6 @@ func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpt
 	opts.SentryOwnedContent = true
 	if file.initiallyUnlinked {
 		opts.NameMut = memmap.NameMutAnonShmem
-	}
-	// A writable shared mapping can let applications mutate the file without any
-	// syscalls. We record the mmap event so the mutation log re-emits this file as dirty.
-	// Note that writes to a file via a private mapping aren't supposed to get propagated
-	// to the underlying file, so we don't record private mappings.
-	if opts.MaxPerms.Write && !opts.Private {
-		d := fd.dentry()
-		d.inode.fs.logMmapWritable(d.inode)
 	}
 	return vfs.GenericConfigureMMap(&fd.vfsfd, file, opts)
 }

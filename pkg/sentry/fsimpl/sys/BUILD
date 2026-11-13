@@ -29,6 +29,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/abi/tpu",
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/coverage",
@@ -63,7 +64,6 @@ go_test(
     deps = [
         ":sys",
         "//pkg/abi/linux",
-        "//pkg/errors/linuxerr",
         "//pkg/rdma",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel",

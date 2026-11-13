@@ -19,14 +19,11 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"runtime"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -100,82 +97,6 @@ func TestReadCPUFile(t *testing.T) {
 		if diff := cmp.Diff(expected, content); diff != "" {
 			t.Fatalf("Read returned unexpected data:\n--- want\n+++ got\n%v", diff)
 		}
-	}
-}
-
-func TestNUMATopology(t *testing.T) {
-	s := newTestSystemWithInternalData(t, &sys.InternalData{EnableNUMATopology: true})
-	defer s.Destroy()
-
-	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/devices/system/node")), map[string]testutil.DirentType{
-		"has_cpu":           linux.DT_REG,
-		"has_memory":        linux.DT_REG,
-		"has_normal_memory": linux.DT_REG,
-		"online":            linux.DT_REG,
-		"possible":          linux.DT_REG,
-		"node0":             linux.DT_DIR,
-	})
-	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/devices/system/node/node0")), map[string]testutil.DirentType{
-		"cpumap":   linux.DT_REG,
-		"cpulist":  linux.DT_REG,
-		"distance": linux.DT_REG,
-	})
-
-	for p, want := range map[string]string{
-		"/devices/system/node/online":            "0\n",
-		"/devices/system/node/possible":          "0\n",
-		"/devices/system/node/has_cpu":           "0\n",
-		"/devices/system/node/has_memory":        "0\n",
-		"/devices/system/node/has_normal_memory": "0\n",
-		"/devices/system/node/node0/distance":    "10\n",
-	} {
-		got, err := readTestFile(s, p)
-		if err != nil {
-			t.Fatalf("reading %q: %v", p, err)
-		}
-		if got != want {
-			t.Errorf("%q contains %q, want %q", p, got, want)
-		}
-	}
-}
-
-func TestNUMATopologyCPUFormats(t *testing.T) {
-	for _, tc := range []struct {
-		cores       int
-		wantCPUList string
-		wantCPUMap  string
-	}{
-		{cores: 1, wantCPUList: "0\n", wantCPUMap: "1\n"},
-		{cores: 64, wantCPUList: "0-63\n", wantCPUMap: "ffffffff,ffffffff\n"},
-	} {
-		t.Run(fmt.Sprintf("%d cores", tc.cores), func(t *testing.T) {
-			previous := runtime.GOMAXPROCS(tc.cores)
-			defer runtime.GOMAXPROCS(previous)
-
-			s := newTestSystemWithInternalData(t, &sys.InternalData{EnableNUMATopology: true})
-			defer s.Destroy()
-			for p, want := range map[string]string{
-				"/devices/system/node/node0/cpulist": tc.wantCPUList,
-				"/devices/system/node/node0/cpumap":  tc.wantCPUMap,
-			} {
-				got, err := readTestFile(s, p)
-				if err != nil {
-					t.Fatalf("reading %q: %v", p, err)
-				}
-				if got != want {
-					t.Errorf("%q contains %q, want %q", p, got, want)
-				}
-			}
-		})
-	}
-}
-
-func TestNUMATopologyDisabled(t *testing.T) {
-	s := newTestSystemWithInternalData(t, &sys.InternalData{})
-	defer s.Destroy()
-
-	if _, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot("/devices/system/node"), &vfs.StatOptions{Mask: linux.STATX_TYPE}); !linuxerr.Equals(linuxerr.ENOENT, err) {
-		t.Fatalf("StatAt(/devices/system/node) returned %v, want ENOENT", err)
 	}
 }
 
@@ -308,7 +229,7 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	if err := os.MkdirAll(pciPath0, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
-	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0000:10")
+	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0007:10")
 	if err := os.MkdirAll(pciPath1, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
@@ -339,14 +260,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		{
 			group:             "2",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0",
+			pciAddress:        "0007:10:05.0",
 			name:              "vfio2",
 			nestedDeviceIndex: 3,
 		},
 		{
 			group:             "3",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0/0000:03:00.1",
+			pciAddress:        "0007:10:05.0/0007:03:00.1",
 			name:              "vfio3",
 			nestedDeviceIndex: -1,
 		},
@@ -375,6 +296,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		if err := os.Symlink(path.Join("..", "..", "..", "kernel", "iommu_groups", device.group), path.Join(device.pciPath, device.pciAddress, "iommu_group")); err != nil {
 			t.Fatalf("Failed to symlink iommu_groups directory: %v", err)
 		}
+	}
+	// Non-PCI platform devices in IOMMU groups (e.g. on ARM64 hosts) must be ignored.
+	nonPCIIOMMUPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", "4", "devices")
+	if err := os.MkdirAll(nonPCIIOMMUPath, 0755); err != nil {
+		t.Fatalf("Failed to create non-PCI iommu_groups directory: %v", err)
+	}
+	if err := os.Symlink("../../../../devices/platform/arm-smmu-v3.0.auto", path.Join(nonPCIIOMMUPath, "arm-smmu-v3.0.auto")); err != nil {
+		t.Fatalf("Failed to symlink non-PCI iommu_group device: %v", err)
 	}
 	s := newTestSystem(t, sysfsTestDir)
 	defer s.Destroy()
@@ -483,6 +412,58 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	}
 }
 
+// Check that the DMI entries exist after mount and after CompleteRestore
+// rebuilds /sys/class and /sys/devices.
+func TestProductNameCompleteRestore(t *testing.T) {
+	sysfsTestDir := t.TempDir()
+	for _, dir := range []string{
+		path.Join(sysfsTestDir, "sys", "devices"),
+		path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create %q: %v", dir, err)
+		}
+	}
+	const productName = "Test Product"
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		ProductName:         productName,
+		EnableTPUProxyPaths: true,
+		TestSysfsPathPrefix: sysfsTestDir,
+	})
+	defer s.Destroy()
+
+	checkDMI := func(stage string) {
+		t.Helper()
+		pop := s.PathOpAtRoot("devices/virtual/dmi/id/product_name")
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("%s: OpenAt(product_name) failed: %v", stage, err)
+		}
+		defer fd.DecRef(s.Ctx)
+		content, err := s.ReadToEnd(fd)
+		if err != nil {
+			t.Fatalf("%s: Read(product_name) failed: %v", stage, err)
+		}
+		if want := productName + "\n"; content != want {
+			t.Errorf("%s: product_name = %q, want %q", stage, content, want)
+		}
+		pop = s.PathOpAtRoot("class/dmi/id")
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("%s: ReadlinkAt(class/dmi/id) failed: %v", stage, err)
+		}
+		if want := "../../devices/virtual/dmi/id"; got != want {
+			t.Errorf("%s: ReadlinkAt(class/dmi/id) = %q, want %q", stage, got, want)
+		}
+	}
+
+	checkDMI("before CompleteRestore")
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+	checkDMI("after CompleteRestore")
+}
+
 // rdmaTestPCIConfig is a fake raw PCI config space blob; deliberately not
 // valid UTF-8 to check binary-faithful mirroring.
 var rdmaTestPCIConfig = []byte{0x86, 0x80, 0x0d, 0x02, 0x00, 0x00, 0x10, 0x00}
@@ -534,6 +515,11 @@ func newRDMATestSnapshot() *rdma.Snapshot {
 				ErrAttrs: map[string]int32{"speed": int32(unix.EINVAL)},
 			}},
 		}},
+		NUMA: &rdma.NUMA{
+			// Two-node host (aggregate ranges "0-1"): the sandbox must
+			// advertise a single node covering the sandbox's CPUs.
+			Aggregate: map[string]string{"online": "0-1\n", "possible": "0-1\n"},
+		},
 	}
 }
 
@@ -548,10 +534,7 @@ func readTestFile(s *testutil.System, p string) (string, error) {
 }
 
 func TestRDMASysfs(t *testing.T) {
-	s := newTestSystemWithInternalData(t, &sys.InternalData{
-		EnableNUMATopology: true,
-		RDMASysfs:          newRDMATestSnapshot(),
-	})
+	s := newTestSystemWithInternalData(t, &sys.InternalData{RDMASysfs: newRDMATestSnapshot()})
 	defer s.Destroy()
 
 	const nicLeaf = "/devices/pci0000:07/0000:07:01.0/0000:0c:00.0"
@@ -626,15 +609,8 @@ func TestRDMASysfs(t *testing.T) {
 		},
 		"/bus/pci/drivers":           {"mlx5_core": linux.DT_DIR},
 		"/bus/pci/drivers/mlx5_core": {"0000:0c:00.0": linux.DT_LNK},
-		// The virtual NUMA topology coexists with the RDMA sysfs tree.
-		"/devices/system/node": {
-			"online":            linux.DT_REG,
-			"possible":          linux.DT_REG,
-			"has_cpu":           linux.DT_REG,
-			"has_memory":        linux.DT_REG,
-			"has_normal_memory": linux.DT_REG,
-			"node0":             linux.DT_DIR,
-		},
+		// The two host nodes collapse into a single sandbox node.
+		"/devices/system/node": {"online": linux.DT_REG, "possible": linux.DT_REG, "node0": linux.DT_DIR},
 		"/devices/system/node/node0": {
 			"cpumap":   linux.DT_REG,
 			"cpulist":  linux.DT_REG,

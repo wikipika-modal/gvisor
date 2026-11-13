@@ -55,7 +55,6 @@ const (
 // +stateify savable
 type Endpoint struct {
 	memmap.MappableNoTrackMappings
-	memmap.MappableNoHugepages
 
 	// mu protects specific fields within ringBuffer in addition to those marked
 	// with checklocks annotations in Endpoint. See the ringBuffer type for more

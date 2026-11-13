@@ -35,7 +35,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-spec/specs-go/features"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -184,6 +183,11 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {
 		if err := validateRootfsPropagation(spec.Linux.RootfsPropagation); err != nil {
 			return err
+		}
+	}
+	if IsRootContainer(spec) {
+		if utsns, ok := GetNS(specs.UTSNamespace, spec); ok && utsns.Path != "" {
+			return fmt.Errorf("joining UTS namespace %q is not supported", utsns.Path)
 		}
 	}
 	for _, m := range spec.Mounts {
@@ -636,6 +640,35 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 		return fmt.Errorf("process %d not running yet", pid)
 	}
 	return backoff.Retry(op, b)
+}
+
+// IsProcessRunning returns true if pid identifies a running process, rather than
+// a zombie. Nonpositive PIDs and processes that no longer exist return false.
+func IsProcessRunning(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		if err == unix.ESRCH || err == unix.EINVAL {
+			return false, nil
+		}
+		return false, fmt.Errorf("pidfd_open(%d): %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+
+	pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfds, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("polling pidfd for process %d: %w", pid, err)
+		}
+		// A pidfd becomes readable (POLLIN) when the process exits (including when it is a zombie).
+		return n == 0, nil
+	}
 }
 
 // WaitForNonChildExit waits for the given process to exit, up to `timeout`.

@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
@@ -61,12 +60,10 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
-	// EnableNUMATopology exposes one virtual NUMA node containing every
-	// application CPU.
-	EnableNUMATopology bool
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
-	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices) is constructed.
+	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
+	// /sys/devices/system/node) is constructed.
 	RDMASysfs *rdma.Snapshot
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
@@ -81,9 +78,11 @@ type filesystem struct {
 
 	devMinor            uint32
 	enableTPUProxyPaths bool
-	enableNUMATopology  bool
 	testSysfsPathPrefix string
-	root                *dir
+	// productName is the value of devices/virtual/dmi/id/product_name. If
+	// empty, the DMI directories are not created.
+	productName string
+	root        *dir
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -138,14 +137,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"cpu": cpuDir(ctx, fs, creds),
 	}
 
-	productName := ""
 	busSub := make(map[string]kernfs.Inode)     // /sys/bus
 	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
 	pciDrivers := make(map[string]kernfs.Inode) // /sys/bus/pci/drivers
 	kernelSub := kernelDir(ctx, fs, creds)      // /sys/kernel
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
-		productName = idata.ProductName
+		fs.productName = idata.ProductName
 		if idata.EnableTPUProxyPaths {
 			fs.enableTPUProxyPaths = true
 			fs.testSysfsPathPrefix = idata.TestSysfsPathPrefix
@@ -212,10 +210,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for name, sub := range rdmaDirs.busPCIDrivers {
 				pciDrivers[name] = sub
 			}
-		}
-		fs.enableNUMATopology = idata.EnableNUMATopology
-		if fs.enableNUMATopology {
-			systemSub["node"] = fs.buildNUMATopology(ctx, creds, k.ApplicationCores())
+			if rdmaDirs.node != nil {
+				systemSub["node"] = rdmaDirs.node
+			}
 		}
 	}
 	if len(pciDevices) > 0 || len(pciDrivers) > 0 {
@@ -230,19 +227,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	devicesSub["system"] = fs.newDir(ctx, creds, defaultSysDirMode, systemSub)
 
-	if len(productName) > 0 {
-		log.Debugf("Setting product_name: %q", productName)
-		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
-		})
-		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
-				}),
-			}),
-		})
-	}
+	fs.addDMIDirs(ctx, creds, classSub, devicesSub)
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"bus":   fs.newDir(ctx, creds, defaultSysDirMode, busSub),
@@ -262,6 +247,25 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	var rootD kernfs.Dentry
 	rootD.InitRoot(&fs.Filesystem, root)
 	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
+}
+
+// addDMIDirs adds the DMI entries to classSub (/sys/class) and devicesSub
+// (/sys/devices) if fs.productName is set.
+func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, classSub, devicesSub map[string]kernfs.Inode) {
+	if len(fs.productName) == 0 {
+		return
+	}
+	log.Debugf("Setting product_name: %q", fs.productName)
+	classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
+	})
+	devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fs.productName+"\n"),
+			}),
+		}),
+	})
 }
 
 func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
@@ -342,33 +346,6 @@ func oneCPUMask(i, cores uint) string {
 	return b.String()
 }
 
-// buildNUMATopology synthesizes the /sys/devices/system/node subtree. gVisor's
-// memory model has a single NUMA node containing every application CPU.
-func (fs *filesystem) buildNUMATopology(ctx context.Context, creds *auth.Credentials, cores uint) kernfs.Inode {
-	entries := map[string]kernfs.Inode{}
-	// The aggregate files (online, possible, has_cpu, ...) are all
-	// node-range lists; the single node 0 covers them all.
-	for _, name := range []string{"online", "possible", "has_cpu", "has_memory", "has_normal_memory"} {
-		entries[name] = fs.newStaticFile(ctx, creds, defaultSysMode, "0\n")
-	}
-	entries["node0"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-		"cpumap":  fs.newStaticFile(ctx, creds, defaultSysMode, fullCPUMask(cores)+"\n"),
-		"cpulist": fs.newStaticFile(ctx, creds, defaultSysMode, cpuListString(cores)),
-		// The only node's distance to itself (LOCAL_DISTANCE).
-		"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
-	})
-	return fs.newDir(ctx, creds, defaultSysDirMode, entries)
-}
-
-// cpuListString formats CPUs 0..cores-1 in the kernel's cpulist format
-// (lib/bitmap.c:bitmap_print_to_pagebuf(list=true)).
-func cpuListString(cores uint) string {
-	if cores == 1 {
-		return "0\n"
-	}
-	return fmt.Sprintf("0-%d\n", cores-1)
-}
-
 func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) map[string]kernfs.Inode {
 	// Set up /sys/kernel/debug/kcov. Technically, debugfs should be
 	// mounted at debug/, but for our purposes, it is sufficient to keep it
@@ -412,7 +389,12 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 			subs[dent] = fs.newHostFile(ctx, creds, defaultSysMode, absPath)
 		case unix.S_IFLNK:
 			if pciDeviceRegex.MatchString(dent) {
-				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", pciInfos[dent].path))
+				info, ok := pciInfos[dent]
+				if !ok {
+					log.Infof("Skipping IOMMU group link %q: not a known PCI device", absPath)
+					continue
+				}
+				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", info.path))
 			}
 		}
 	}

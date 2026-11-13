@@ -44,7 +44,6 @@ type pciDeviceFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoHugepages
 
 	hostFD        int32
 	deviceAddress string

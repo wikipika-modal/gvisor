@@ -175,7 +175,7 @@ type MemoryFile struct {
 	knownCommittedBytes uint64
 	commitSeq           uint64
 	nextCommitScan      time.Time
-	ongoingCommitScan   atomic.Bool
+	ongoingCommitScan   atomicbitops.Bool
 	isSaving            bool
 
 	// evictable maps EvictableMemoryUsers to eviction state.
@@ -190,8 +190,8 @@ type MemoryFile struct {
 	opts MemoryFileOpts
 
 	// savable is true if this MemoryFile will be saved via SaveTo() during
-	// the kernel's SaveTo operation. savable is protected by mu.
-	savable bool
+	// the kernel's SaveTo operation.
+	savable atomicbitops.Bool
 
 	// destroyed is set by Destroy to instruct the releaser goroutine to
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
@@ -756,9 +756,24 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 		// Try to recycle waste pages, since this avoids the overhead of
 		// decommitting and then committing them again.
 		var uwgap unwasteGapIterator
-		uwgap, fr = findRecyclable(unwaste, alloc)
+		if alloc.opts.Dir == BottomUp {
+			uwgap = unwaste.FirstLargeEnoughGap(alloc.length)
+		} else {
+			uwgap = unwaste.LastLargeEnoughGap(alloc.length)
+		}
 		if uwgap.Ok() {
 			alloc.recycled = true
+			if alloc.opts.Dir == BottomUp {
+				fr = memmap.FileRange{
+					Start: uwgap.Start(),
+					End:   uwgap.Start() + alloc.length,
+				}
+			} else {
+				fr = memmap.FileRange{
+					Start: uwgap.End() - alloc.length,
+					End:   uwgap.End(),
+				}
+			}
 			unwaste.Insert(uwgap, fr, unwasteInfo{})
 			// Update reference count for these pages from 0 to 1.
 			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
@@ -840,65 +855,6 @@ retryFree:
 		commitSeq:      f.commitSeq,
 	})
 	return
-}
-
-// findRecyclable returns a gap in unwaste that is large enough for alloc, and
-// the range within it that alloc should recycle. Huge allocations must be
-// hugepage-aligned to be backed by huge pages, but waste is only page-aligned,
-// so if the first large enough gap can't fit an aligned range, a gap large
-// enough to contain one is used instead.
-func findRecyclable(unwaste *unwasteSet, alloc *allocState) (unwasteGapIterator, memmap.FileRange) {
-	uwgap := largeEnoughGap(unwaste, alloc, alloc.length)
-	if !uwgap.Ok() {
-		return uwgap, memmap.FileRange{}
-	}
-	fr, ok := recycleRange(uwgap, alloc)
-	if !ok && alloc.huge {
-		// A gap this large always contains a hugepage-aligned range of
-		// alloc.length bytes.
-		minSize := alloc.length + uint64(hostarch.HugePageSize) - uint64(hostarch.PageSize)
-		if minSize < alloc.length { // overflow
-			return unwasteGapIterator{}, memmap.FileRange{}
-		}
-		if uwgap = largeEnoughGap(unwaste, alloc, minSize); !uwgap.Ok() {
-			return uwgap, memmap.FileRange{}
-		}
-		fr, ok = recycleRange(uwgap, alloc)
-	}
-	if !ok {
-		return unwasteGapIterator{}, memmap.FileRange{}
-	}
-	return uwgap, fr
-}
-
-func largeEnoughGap(unwaste *unwasteSet, alloc *allocState, minSize uint64) unwasteGapIterator {
-	if alloc.opts.Dir == BottomUp {
-		return unwaste.FirstLargeEnoughGap(minSize)
-	}
-	return unwaste.LastLargeEnoughGap(minSize)
-}
-
-// recycleRange returns the range in uwgap that alloc should recycle, and
-// whether uwgap can fit it.
-func recycleRange(uwgap unwasteGapIterator, alloc *allocState) (memmap.FileRange, bool) {
-	var fr memmap.FileRange
-	if alloc.opts.Dir == BottomUp {
-		fr.Start = uwgap.Start()
-		if alloc.huge {
-			var ok bool
-			if fr.Start, ok = hostarch.HugePageRoundUp(fr.Start); !ok {
-				return fr, false
-			}
-		}
-		fr.End = fr.Start + alloc.length
-	} else {
-		fr.End = uwgap.End()
-		if alloc.huge {
-			fr.End = hostarch.HugePageRoundDown(fr.End)
-		}
-		fr.Start = fr.End - alloc.length
-	}
-	return fr, uwgap.Range().IsSupersetOf(fr)
 }
 
 // Preconditions: f.mu must be locked.
@@ -1099,6 +1055,13 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
+	// Pages that async page loading hasn't loaded yet would otherwise be
+	// loaded after being zeroed.
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		if err := amfl.awaitLoad(fr); err != nil {
+			log.Warningf("Decommit(%v): async page loading failed: %v", fr, err)
+		}
+	}
 	f.decommitOrManuallyZero(fr)
 
 	f.mu.Lock()
@@ -1686,11 +1649,10 @@ func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 // Precondition: f.mu must be held; it may be unlocked and reacquired.
 // +checklocks:f.mu
 func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
-	// Track if anything changed to elide the merge. f.SaveTo() holds an
-	// iterator into f.memAcct across f.mu unlocks, so don't merge while saving.
+	// Track if anything changed to elide the merge.
 	changedAny := false
 	defer func() {
-		if changedAny && !f.isSaving {
+		if changedAny {
 			f.memAcct.MergeAll()
 		}
 	}()
@@ -1875,16 +1837,6 @@ func (f *MemoryFile) FD() int {
 // IsDiskBacked returns true if f is backed by a file on disk.
 func (f *MemoryFile) IsDiskBacked() bool {
 	return f.opts.DiskBackedFile
-}
-
-// SyncBackingFile flushes the backing file's dirty page cache to disk. It is a
-// no-op if f is not disk-backed. It is used so that a host-side reflink of the
-// backing file observes all committed data.
-func (f *MemoryFile) SyncBackingFile() error {
-	if !f.IsDiskBacked() {
-		return nil
-	}
-	return unix.Fsync(f.FD())
 }
 
 // HugepagesEnabled returns true if the MemoryFile expects to back allocations

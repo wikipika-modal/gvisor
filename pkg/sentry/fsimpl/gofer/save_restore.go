@@ -53,7 +53,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
 	fs.renameMu.Lock()
-	fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
+	fs.evictAllCachedDentriesLocked(ctx)
 	fs.renameMu.Unlock()
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
 

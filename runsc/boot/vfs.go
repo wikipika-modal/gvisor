@@ -72,7 +72,7 @@ import (
 )
 
 // tmpfs has some extra supported options that we must pass through.
-var tmpfsAllowedData = []string{"mode", "size", "uid", "gid", "huge"}
+var tmpfsAllowedData = []string{"mode", "size", "uid", "gid"}
 
 func cgroupfsCPUDefaults(rawQuota, rawPeriod int64) map[string]int64 {
 	const defaultPeriod int64 = 100000
@@ -499,10 +499,6 @@ type containerMounter struct {
 	// rootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
-
-	// fsMutationLogFD is the persistent mutation-log file the root overlay upper adopts at
-	// mount creation. nil unless donated for this (root) container.
-	fsMutationLogFD *fd.FD
 }
 
 // +checklocks:l.mu
@@ -519,7 +515,6 @@ func (l *Loader) newContainerMounter(info *containerInfo) *containerMounter {
 		containerID:       info.cid,
 		containerName:     info.containerName,
 		rootfsUpperTarFD:  info.rootfsUpperTarFD,
-		fsMutationLogFD:   info.fsMutationLogFD,
 	}
 }
 
@@ -652,7 +647,7 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		if rootfsConf.IsFilestorePresent() {
 			filestoreFD = c.goferFilestoreFDs.removeAsFD()
 		}
-		opts, cleanup, err = c.configureOverlay(ctx, conf, creds, opts, fsName, filestoreFD, rootfsConf, "/", c.rootfsUpperTarFD, c.fsMutationLogFD)
+		opts, cleanup, err = c.configureOverlay(ctx, conf, creds, opts, fsName, filestoreFD, rootfsConf, "/", c.rootfsUpperTarFD)
 		if err != nil {
 			return nil, fmt.Errorf("mounting root with overlay: %w", err)
 		}
@@ -697,7 +692,7 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 // layer using tmpfs, and return overlay mount options. "cleanup" must be called
 // after the options have been used to mount the overlay, to release refs on
 // lower and upper mounts.
-func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Config, creds *auth.Credentials, lowerOpts *vfs.MountOptions, lowerFSName string, filestoreFD *fd.FD, mountConf specutils.GoferMountConf, dst string, rootfsUpperTarFD *fd.FD, mutationLogFD *fd.FD) (*vfs.MountOptions, func(), error) {
+func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Config, creds *auth.Credentials, lowerOpts *vfs.MountOptions, lowerFSName string, filestoreFD *fd.FD, mountConf specutils.GoferMountConf, dst string, rootfsUpperTarFD *fd.FD) (*vfs.MountOptions, func(), error) {
 	// First copy options from lower layer to upper layer and overlay. Clear
 	// filesystem specific options.
 	upperOpts := *lowerOpts
@@ -747,12 +742,6 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		DisableDefaultSizeLimit: true,
 	}
 	if filestoreFD != nil {
-		// The disk-backed overlay upper is the only FSMutationLog target; enable mutation-log
-		// tracking on it, and adopt the donated log file, when the sandbox was started with
-		// --fsmutationlog and a log FD was donated for this mount (only the root, and not on
-		// restore). Ordinary tmpfs mounts and restored mounts stay disabled.
-		tmpfsOpts.EnableMutationLog = conf.FSMutationLog && mutationLogFD != nil
-		tmpfsOpts.MutationLogFD = mutationLogFD
 		// Create memory file for disk-backed overlays.
 		resourceID := checkpoint.ResourceID{ContainerName: c.containerName, Path: dst}
 		mf, _, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), resourceID, c.containerID, c.l.fsRestore)
@@ -760,7 +749,6 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 			return nil, nil, fmt.Errorf("failed to create memory file for overlay: %v", err)
 		}
 		tmpfsOpts.MemoryFile = mf
-
 		sourceTar, err := c.l.fsRestore.tmpfsSourceTar(resourceID, c.containerID)
 		if err != nil {
 			mf.Destroy()
@@ -1005,7 +993,7 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 	if submount.goferMountConf.ShouldUseOverlayfs() {
 		log.Infof("Adding overlay on top of mount %q", submount.mount.Destination)
 		var cleanup func()
-		opts, cleanup, err = c.configureOverlay(ctx, conf, creds, opts, fsName, submount.filestoreFD, submount.goferMountConf, submount.mount.Destination, nil, nil)
+		opts, cleanup, err = c.configureOverlay(ctx, conf, creds, opts, fsName, submount.filestoreFD, submount.goferMountConf, submount.mount.Destination, nil)
 		if err != nil {
 			return nil, fmt.Errorf("mounting volume with overlay at %q: %w", submount.mount.Destination, err)
 		}
@@ -1078,12 +1066,11 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		fsName = sys.Name
 
 	case proc.Name:
-		internalData = newProcInternalData(conf, spec, containerName)
+		internalData = newProcInternalData(conf, spec)
 
 	case sys.Name:
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
-			EnableNUMATopology:  specutils.RDMAEnabled(spec, conf) || specutils.NVProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
 		}
 		if len(productName) > 0 {
@@ -1235,9 +1222,6 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 		DiskBackedFile: true,
 		// Disk backed files need to be decommited on destroy to release disk space.
 		DecommitOnDestroy: true,
-		// Pages of a disk backed file are host page cache for that file, which
-		// the host may drop at any time, not memory held by the sandbox.
-		DisableMemoryAccounting: true,
 		// sentry's seccomp filters don't allow the mmap(2) syscalls that
 		// hostmm.IMAWorkAroundForMemFile() uses. Users of private memory files
 		// are expected to have performed the work around outside the sandbox.

@@ -61,7 +61,6 @@ type tpuFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 	memmap.MappableNoTrackMappings
-	memmap.MappableNoHugepages
 
 	hostFD        int32
 	containerName string

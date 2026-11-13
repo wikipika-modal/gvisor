@@ -6,7 +6,6 @@ platforms = {
     "kvm": [],
     "slimvm": ["manual", "requires-slimvm"],
     "systrap": [],
-    "xemu": ["manual", "requires-xemu"],
 }
 
 # Capabilities that platforms may or may not support.
@@ -46,13 +45,6 @@ platform_capabilities = {
         _CAPABILITY_ALIGNMENT_CHECK: True,
         _CAPABILITY_MULTIPROCESS: True,
         _CAPABILITY_INT3: False,
-        _CAPABILITY_VSYSCALL: True,
-    },
-    "xemu": {
-        _CAPABILITY_32BIT: False,
-        _CAPABILITY_ALIGNMENT_CHECK: True,
-        _CAPABILITY_MULTIPROCESS: True,
-        _CAPABILITY_INT3: True,
         _CAPABILITY_VSYSCALL: True,
     },
 }

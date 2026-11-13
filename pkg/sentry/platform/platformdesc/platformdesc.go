@@ -63,9 +63,6 @@ var descs = map[string]Desc{
 			FrequentHostThreadWakeups: true,
 		},
 	},
-	"xemu": {
-		Device: "/dev/xemu",
-	},
 }
 
 // List lists available platforms.

@@ -23,5 +23,4 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/systrap"
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/xemu"
 )

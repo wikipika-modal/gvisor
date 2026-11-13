@@ -539,7 +539,6 @@ func (fd *FileDescription) updateCq(cqes *safemem.BlockSeq, cqe *linux.IOUringCq
 // +stateify savable
 type sqEntriesFile struct {
 	memmap.MappableNoTrackMappings
-	memmap.MappableNoHugepages
 
 	fr memmap.FileRange
 }
@@ -569,7 +568,6 @@ func (sqemf *sqEntriesFile) Translate(ctx context.Context, required, optional me
 // +stateify savable
 type ringsBufferFile struct {
 	memmap.MappableNoTrackMappings
-	memmap.MappableNoHugepages
 
 	fr memmap.FileRange
 }

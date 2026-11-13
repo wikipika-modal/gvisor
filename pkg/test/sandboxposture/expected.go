@@ -46,9 +46,6 @@ type Reference struct {
 	// TMPDIR is the value of the reference process's `TMPDIR` environment
 	// variable, or empty if it is unset.
 	TMPDIR string
-
-	// DeviceCgroup is the reference process's `Attrs.DeviceCgroup`.
-	DeviceCgroup string
 }
 
 // SelfReference builds a `Reference` from the calling process.
@@ -87,17 +84,12 @@ func ReferenceOf(pid int, procRoot string) (Reference, error) {
 	if err != nil {
 		return Reference{}, fmt.Errorf("reading environment of %d: %w", pid, err)
 	}
-	deviceCgroup, err := deviceCgroupOf(p)
-	if err != nil {
-		return Reference{}, fmt.Errorf("device cgroup of %d: %w", pid, err)
-	}
 	return Reference{
 		Umask:         umask,
 		PermittedCaps: perm,
 		Limits:        limits,
 		StdioFDs:      stdioClasses(p),
 		TMPDIR:        tmpDir,
-		DeviceCgroup:  deviceCgroup,
 	}, nil
 }
 
@@ -409,13 +401,6 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		memlock = LimitUnlimited
 	}
 
-	// runsc confines the cgroup it creates; a sandbox it leaves in the
-	// reference process's cgroup inherits its device access.
-	deviceCgroup := opts.Ref.DeviceCgroup
-	if opts.Cgroup {
-		deviceCgroup = DeviceCgroupConfined
-	}
-
 	uidMap, gidMap := MapSameAsRef, MapSameAsRef
 	if newUserNS {
 		if applyCaps {
@@ -436,7 +421,6 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		UIDMap:             uidMap,
 		GIDMap:             gidMap,
 		ProcFileOwner:      OwnerSameAsProcess,
-		DeviceCgroup:       deviceCgroup,
 	}
 }
 

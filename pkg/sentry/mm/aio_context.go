@@ -276,8 +276,6 @@ func (aio *AIOContext) Drain() {
 //
 // +stateify savable
 type aioMappable struct {
-	memmap.MappableNoHugepages
-
 	aioMappableRefs
 
 	mf *pgalloc.MemoryFile `state:"nosave"`

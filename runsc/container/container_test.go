@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -38,7 +39,6 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/hostos"
@@ -240,6 +240,64 @@ func blockUntilWaitable(pid int) error {
 		return 0, 0, err
 	})
 	return err
+}
+
+func TestSetOOMScoreAdjExited(t *testing.T) {
+	cmd := exec.Command("/bin/cat")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close() })
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	})
+
+	pid := cmd.Process.Pid
+	if err := setOOMScoreAdj(pid, 1000); err != nil {
+		t.Fatalf("setOOMScoreAdj(%d, 1000) while alive: %v", pid, err)
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "1000" {
+		t.Fatalf("live oom_score_adj = %q, want 1000", got)
+	}
+
+	// Keep the child waitable but unreaped so its proc files still exist.
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := blockUntilWaitable(pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := setOOMScoreAdj(pid, 1000); err != nil {
+		t.Fatalf("setOOMScoreAdj(%d, 1000) after exit = %v, want nil", pid, err)
+	}
+}
+
+func TestSetOOMScoreAdjPermissionDenied(t *testing.T) {
+	// Probe without writing: a privileged caller may be able to change PID 1's
+	// score, in which case this permission-denied control does not apply.
+	f, err := os.OpenFile("/proc/1/oom_score_adj", os.O_WRONLY, 0)
+	if err == nil {
+		f.Close()
+		t.Skip("PID 1's oom_score_adj is writable")
+	}
+	if !errors.Is(err, unix.EACCES) {
+		t.Fatalf("opening PID 1's oom_score_adj: %v, want EACCES", err)
+	}
+	if running, err := specutils.IsProcessRunning(1); err != nil || !running {
+		t.Fatalf("IsProcessRunning(1) = (%t, %v), want (true, nil)", running, err)
+	}
+	if err := setOOMScoreAdj(1, 1000); !errors.Is(err, unix.EACCES) {
+		t.Fatalf("setOOMScoreAdj(1, 1000) = %v, want EACCES", err)
+	}
 }
 
 // execPS executes `ps` inside the container and return the processes.
@@ -3439,66 +3497,6 @@ func TestWaitOnExitedSandbox(t *testing.T) {
 			}
 			if got := ws.ExitStatus(); got != wantExit {
 				t.Errorf("got exit status %d, want %d", got, wantExit)
-			}
-		})
-	}
-}
-
-// TestDestroyFilestoreCleanup checks cleanup after reloading persisted container state.
-func TestDestroyFilestoreCleanup(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("fsmutationlog=%t", enabled), func(t *testing.T) {
-			c := &Container{
-				ID:     "filestore-test",
-				Status: Stopped,
-				Spec: &specs.Spec{
-					Root:   &specs.Root{Path: t.TempDir()},
-					Mounts: []specs.Mount{{Type: "bind", Source: t.TempDir(), Destination: "/data"}},
-				},
-				GoferMountConfs: []specutils.GoferMountConf{
-					{Lower: specutils.Lisafs, Upper: specutils.SelfOverlay},
-					{Lower: specutils.Lisafs, Upper: specutils.SelfOverlay},
-				},
-				Saver: StateFile{RootDir: t.TempDir(), ID: FullID{SandboxID: "filestore-test", ContainerID: "filestore-test"}},
-			}
-			filestore := sentryapi.SelfFilestorePath(c.Spec.Root.Path, c.sandboxID())
-			if enabled {
-				c.FSMutationLogFilestore = filestore
-			}
-			// A self-backed bind mount is unrelated to the root mutation journal.
-			submountFilestore := sentryapi.SelfFilestorePath(c.Spec.Mounts[0].Source, c.sandboxID())
-			if err := os.WriteFile(submountFilestore, []byte("submount data"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filestore, []byte("snapshot data"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.Saver.lock(BlockAcquire); err != nil {
-				t.Fatal(err)
-			}
-			err := c.saveLocked()
-			c.Saver.UnlockOrDie()
-			defer c.Saver.close()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var loaded Container
-			if err := c.Saver.load(&loaded, LoadOpts{}); err != nil {
-				t.Fatal(err)
-			}
-			if err := loaded.Destroy(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := os.Stat(submountFilestore); !os.IsNotExist(err) {
-				t.Fatalf("unrelated filestore was not removed: %v", err)
-			}
-			data, err := os.ReadFile(filestore)
-			if enabled {
-				if err != nil || string(data) != "snapshot data" {
-					t.Fatalf("journaled filestore was not preserved: data %q, err %v", data, err)
-				}
-			} else if !os.IsNotExist(err) {
-				t.Fatalf("ordinary filestore was not removed: %v", err)
 			}
 		})
 	}

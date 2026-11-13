@@ -197,8 +197,6 @@ go_test(
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
-        "//pkg/sentry/state/stateio",
-        "//pkg/sentry/usage",
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
     ],

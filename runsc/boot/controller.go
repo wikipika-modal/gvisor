@@ -20,13 +20,10 @@ import (
 	"io"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	gtime "time"
 
 	"golang.org/x/sys/unix"
-
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -36,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -358,7 +356,7 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
-func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
+func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.RestoreReply) (retErr error) {
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -423,7 +421,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		// For background restore, throttle page loading until the kernel is
+		// restored, so that restore does not wait behind page reads.
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
@@ -485,7 +485,8 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		return fmt.Errorf("checkpoint taken with no-root-container=%t cannot be restored with no-root-container=%t", saved, cm.l.noRootContainer.enabled)
 	}
 	timer.Reached("restorer initialized")
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	reply.KernelStarted, err = cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	return err
 }
 
 func getRestoreReaders(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
@@ -601,7 +602,7 @@ func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 	cm.restorer = nil
 }
 
-func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *struct{}) (retErr error) {
+func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply *sentryapi.RestoreReply) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
 	state := cm.l.state
@@ -681,7 +682,7 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *st
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
+	reply.KernelStarted, err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
 	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
@@ -809,40 +810,6 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 	return nil
 }
 
-// DrainDentryCache drains unused dentries without changing cache policy or
-// pausing guest tasks.
-func (cm *containerManager) DrainDentryCache(args *sentryapi.DrainDentryCacheArgs, _ *struct{}) error {
-	if !path.IsAbs(args.Path) || strings.ContainsRune(args.Path, 0) || len(args.Path) >= linux.PATH_MAX {
-		return fmt.Errorf("a valid absolute path shorter than PATH_MAX must be provided")
-	}
-	cm.l.mu.Lock()
-	defer cm.l.mu.Unlock()
-	ep, ok := cm.l.processes[execID{cid: args.ContainerID}]
-	if !ok {
-		return fmt.Errorf("container %q is deleted", args.ContainerID)
-	}
-	if ep.tg == nil {
-		return fmt.Errorf("container %q isn't started", args.ContainerID)
-	}
-	t := ep.tg.Leader()
-	if t == nil {
-		return fmt.Errorf("container %q has no init process", args.ContainerID)
-	}
-	ctx := t.AsyncContext()
-	root := t.FSContext().RootDirectory()
-	if !root.Ok() {
-		return fmt.Errorf("container %q init process has exited", args.ContainerID)
-	}
-	defer root.DecRef(ctx)
-	pop := vfs.PathOperation{
-		Root:               root,
-		Start:              root,
-		Path:               fspath.Parse(args.Path),
-		FollowFinalSymlink: true,
-	}
-	return t.Kernel().VFS().DrainDentryCache(ctx, t.Credentials(), &pop)
-}
-
 const initTID kernel.ThreadID = 1
 
 // Mount mounts a filesystem in a container.
@@ -938,34 +905,6 @@ func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) erro
 	}
 	defer cm.l.stopIfKilled()
 	return cm.l.k.FSSave(cm.l.k.SupervisorContext(), &kopts)
-}
-
-// FsMutationLog writes an ordered journal of the mutations to the overlay upper
-// layer to the provided log file. It does not clone the filestore; the caller
-// reflinks the filestore's physical backing file host-side while the container
-// remains paused.
-func (cm *containerManager) FsMutationLog(args *sentryapi.FsMutationLogArgs, res *sentryapi.FsMutationLogResult) error {
-	log.Debugf("containerManager.FsMutationLog")
-	kopts := kernel.FsMutationLogOpts{
-		Path:     args.Path,
-		SinceGen: args.SinceGen,
-	}
-	if args.Dump {
-		if len(args.Files) != 1 {
-			return fmt.Errorf("fsmutationlog dump needs one output file, got %d", len(args.Files))
-		}
-		defer args.Files[0].Close()
-		kopts.Dump = args.Files[0]
-		kopts.Resync = args.Resync
-	} else if args.Resync {
-		return fmt.Errorf("fsmutationlog resync needs a dump")
-	}
-	if err := cm.l.k.FsMutationLog(cm.l.k.SupervisorContext(), &kopts); err != nil {
-		return err
-	}
-	res.Generation = kopts.Generation
-	res.Length = kopts.Length
-	return nil
 }
 
 // GetSavings returns the savings for restored sandboxes.

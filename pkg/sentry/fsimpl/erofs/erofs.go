@@ -31,7 +31,6 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -332,7 +331,6 @@ func (fs *filesystem) inodeBucket(nid uint64) *inodeBucket {
 // +stateify savable
 type inode struct {
 	erofs.Inode
-	memmap.MappableNoHugepages
 
 	// inodeRefs is the reference count.
 	inodeRefs

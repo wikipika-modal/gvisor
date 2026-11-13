@@ -190,6 +190,22 @@ of all supported CPU features can be found
 The runsc command `runsc cpu-features` lists all CPU features on the current
 machine.
 
+Example to retrieve the cpu-features from statefile and `runsc cpu-features`:
+
+```bash
+runsc statefile --get cpu_features <image-path>/checkpoint.img | tr , '\n' | sort > checkpoint.txt
+runsc cpu-features | tr , '\n' | sort > host.txt
+comm -23 checkpoint.txt host.txt  # Prints features missing on this host.
+```
+
+Both commands also accept `--bitmask` to output the CPU features as
+comma-separated hex `uint32` block bitmasks:
+
+```bash
+runsc statefile --get cpu_features --bitmask <image-path>/checkpoint.img
+runsc cpu-features --bitmask
+```
+
 ## GPU Checkpoint/Restore
 
 gVisor supports checkpointing and restoring containers that use GPUs by
@@ -325,8 +341,6 @@ cat <&3   # blocks until resume/restore completes, prints "resume" or "restore"
 When application-driven checkpointing is enabled, gVisor also exposes
 `/proc/gvisor/spec_environ`. It contains the environment variables from the
 container's spec (NULL-separated, in the same format as `/proc/<pid>/environ`).
-Like `/proc/<pid>/environ`, it has mode `0400` and is owned by the container's
-user (`process.user` in the spec), so only that user and root can read it.
 
 Because the environment variables in the spec used to *restore* a container can
 differ from the one used to create it, this file gives the workload a way to

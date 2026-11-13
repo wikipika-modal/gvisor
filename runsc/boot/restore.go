@@ -35,12 +35,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
-	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state"
@@ -205,19 +203,13 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	return saveOpts, nil
 }
 
-func newProcInternalData(conf *config.Config, spec *specs.Spec, containerName string) *proc.InternalData {
-	data := &proc.InternalData{
+func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalData {
+	return &proc.InternalData{
 		GVisorMarkerFile:    conf.GVisorMarkerFile,
 		OverrideProcs:       procFiles(conf),
 		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, annotationCheckpointEnable),
 		FSCheckpointEnabled: specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
-		ContainerName:       containerName,
 	}
-	if spec.Process != nil {
-		data.ContainerUID = auth.KUID(spec.Process.User.UID)
-		data.ContainerGID = auth.KGID(spec.Process.User.GID)
-	}
-	return data
 }
 
 // restorer manages a restore session for a sandbox. It stores information about
@@ -277,7 +269,8 @@ type restorer struct {
 }
 
 // restoreSubcontainer restores a subcontainer.
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) error {
+// It returns whether this started the kernel.
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) (bool, error) {
 	containerName := r.registerContainer(l, spec, cid)
 	info := &containerInfo{
 		cid:               cid,
@@ -321,16 +314,17 @@ func (r *restorer) registerContainer(l *Loader, spec *specs.Spec, cid string) st
 }
 
 // restoreContainerInfo restores a container.
-func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
+// It returns whether this started the kernel.
+func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
-			return fmt.Errorf("container %q already restored", info.containerName)
+			return false, fmt.Errorf("container %q already restored", info.containerName)
 		}
 		if container.cid == info.cid {
-			return fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
+			return false, fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
 		}
 	}
 
@@ -349,10 +343,11 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	if len(r.containers) == r.totalContainers {
 		// Trigger the restore if this is the last container.
 		if err := r.restore(l); err != nil {
-			return err
+			return false, err
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 type restoreMounts struct {
@@ -532,12 +527,9 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	cleanMnts.Release()
 
-	nvproxyRemapping, err := r.getNvproxyDeviceRemapping(ctx, l)
+	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
 	if err != nil {
 		return err
-	}
-	if nvproxyRemapping != nil {
-		ctx = context.WithValue(ctx, nvproxy.CtxDeviceRemapping, nvproxyRemapping)
 	}
 	ctx, err = r.prepareTPURestoreContextLocked(ctx, l)
 	if err != nil {
@@ -572,6 +564,8 @@ func (r *restorer) restore(l *Loader) error {
 				return err
 			}
 			r.timer.Reached("MF metadata loaded")
+			// The kernel is restored; load the remaining pages at full speed.
+			r.asyncMFLoader.Unthrottle()
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err
@@ -621,9 +615,9 @@ func (r *restorer) restore(l *Loader) error {
 		specsByCID[cid] = l.containerSpecs[name]
 	}
 	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
-		// Find all processes with no parent (root of execution), that were not started
-		// via a call to `exec`.
-		if tg.Leader().Parent() == nil && tg.Leader().Origin != kernel.OriginExec {
+		// Find all container init processes. A process with no parent is not
+		// enough: in a sandbox with no root container, orphans have none.
+		if tg.IsContainerInit() {
 			cid := tg.Leader().ContainerID()
 			proc := l.processes[execID{cid: cid}]
 			if proc == nil {
@@ -647,6 +641,11 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	for cid, spec := range specsByCID {
+		if spec != nil && spec.Process != nil {
+			l.k.SetContainerEnv(cid, spec.Process.Env)
+		}
+	}
 	l.k.SetSaver(l)
 	l.createNvproxyDeviceFilesAfterRestore(ctx)
 
@@ -668,7 +667,7 @@ func (r *restorer) restore(l *Loader) error {
 	// but some restore tasks may still run in the background, and we don't
 	// want to block this function until they finish.
 	postRestoreTimeline := r.timer.Fork("postRestore")
-	go r.postRestore(l.k, postRestoreTimeline, r.timer, nvproxyRemapping)
+	go r.postRestore(l.k, postRestoreTimeline, r.timer)
 	r.timer = nil
 
 	return nil
@@ -689,12 +688,12 @@ func (l *Loader) restoreNamespacePathsLocked(proc *execProcess, spec *specs.Spec
 	}
 }
 
-func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, timer *timing.Timer, nvproxyRemapping *nvproxy.DeviceRemapping) {
+func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, timer *timing.Timer) {
 	defer timer.Log()
 	defer timeline.End()
 
 	timeline.Reached("scheduled")
-	if err := control.PostRestore(k, timeline, nvproxyRemapping); err != nil {
+	if err := control.PostRestore(k, timeline); err != nil {
 		r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
 		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
@@ -890,6 +889,9 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	if l.noRootContainer.enabled {
 		saveOpts.Metadata[noRootContainerKey] = "true"
 	}
+
+	// Save the sandbox's CPU features.
+	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())

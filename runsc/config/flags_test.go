@@ -44,7 +44,6 @@ var boolFlagAllowlist = map[string]struct{}{
 	"directfs":                         {},
 	"enable-core-tags":                 {},
 	"fsgofer-host-uds":                 {},
-	"fsmutationlog":                    {},
 	"fuse":                             {},
 	"gso":                              {},
 	"gvisor-gro":                       {},
@@ -107,7 +106,7 @@ func TestNoNewBoolFlagsPlease(t *testing.T) {
 }
 
 func TestDoNotAddNewFlagsToAllowlist(t *testing.T) {
-	const expectedNumAllowlistFlagsPleaseDoNotModifyThis = 56 // Never modify this, unless you are decreasing it.
+	const expectedNumAllowlistFlagsPleaseDoNotModifyThis = 55 // Never modify this, unless you are decreasing it.
 	if len(boolFlagAllowlist) != expectedNumAllowlistFlagsPleaseDoNotModifyThis {
 		t.Errorf("Cannot add new boolean flags to allowlist")
 	}

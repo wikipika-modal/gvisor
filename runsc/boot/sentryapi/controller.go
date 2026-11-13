@@ -134,6 +134,13 @@ type RestoreOpts struct {
 	SplitFSRestore bool `json:"split_fsrestore"`
 }
 
+// RestoreReply is the reply of ContMgrRestore and ContMgrRestoreSubcontainer.
+type RestoreReply struct {
+	// KernelStarted is set when the call restored the last container, which
+	// starts the kernel.
+	KernelStarted bool
+}
+
 // ContMgrRestoreSubcontainer restores a container from a statefile.
 const ContMgrRestoreSubcontainer = "containerManager.RestoreSubcontainer"
 
@@ -257,15 +264,6 @@ const ContMgrListTraceSessions = "containerManager.ListTraceSessions"
 // ContMgrProcfsDump dumps sandbox procfs state.
 const ContMgrProcfsDump = "containerManager.ProcfsDump"
 
-// ContMgrDrainDentryCache drains unused dentries for a container path.
-const ContMgrDrainDentryCache = "containerManager.DrainDentryCache"
-
-// DrainDentryCacheArgs identifies a filesystem in a container's init process view.
-type DrainDentryCacheArgs struct {
-	ContainerID string
-	Path        string
-}
-
 // ContMgrMount mounts a filesystem in a container.
 const ContMgrMount = "containerManager.Mount"
 
@@ -313,43 +311,6 @@ type FSSaveArgs struct {
 	// exactly one FD, which is a Unix domain socket connected to a URPC server
 	// implementing stateipc.AsyncFileServer.
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
-}
-
-// ContMgrFsMutationLog emits an ordered journal of the mutations to the
-// overlay upper layer's files.
-const ContMgrFsMutationLog = "containerManager.FsMutationLog"
-
-// FsMutationLogArgs holds arguments to FsMutationLog.
-type FsMutationLogArgs struct {
-	// Path is the mount path inside the container to journal. Empty defaults to
-	// "/".
-	Path string `json:"path"`
-
-	// SinceGen requests the segment of changes since this generation (as returned
-	// by a previous call). Zero drains the full history of a mount that has not been
-	// drained yet; a mismatch fails until a Resync.
-	SinceGen uint64 `json:"since_gen"`
-
-	// Dump writes a FULL segment of the journaled upper to the only file in
-	// FilePayload instead.
-	Dump bool `json:"dump"`
-
-	// Resync restarts the journal after the Dump.
-	Resync bool `json:"resync"`
-
-	urpc.FilePayload
-}
-
-// FsMutationLogResult holds results from FsMutationLog.
-type FsMutationLogResult struct {
-	// Generation is the generation the written segment reflects; the caller passes
-	// it as SinceGen next time, except after a dump, which leaves the journal's
-	// cursor alone.
-	Generation uint64 `json:"generation"`
-
-	// Length is the size of the written segment; the caller reflinks the log file and
-	// reads [0, Length).
-	Length uint64 `json:"length"`
 }
 
 // ContMgrGetSavings gets the savings for restored sandboxes.

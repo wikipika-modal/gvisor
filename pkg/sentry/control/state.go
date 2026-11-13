@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
-	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -280,7 +279,7 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return nil
 	}
 	// Undo preSave in reverse order.
-	if err := postRestoreCuda(k, timeline, nil); err != nil {
+	if err := postResumeCuda(k, timeline); err != nil {
 		return err
 	}
 
@@ -291,11 +290,10 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 	return postResumeTPU(k)
 }
 
-// PostRestore is called after restoring the kernel. nvproxyRemapping, if
-// non-nil, describes how GPUs were remapped by this restore.
+// PostRestore is called after restoring the kernel.
 //
 // Precondition: The kernel should be running.
-func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *nvproxy.DeviceRemapping) error {
+func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 	if k.IsPaused() {
 		// The kernel is still paused (double-pause can happen with Docker which
 		// calls pause first and then checkpoint command). The final resume command
@@ -308,7 +306,7 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, nvproxyRemapping *
 		return nil
 	}
 	// Undo preSave in reverse order.
-	if err := postRestoreCuda(k, timeline, nvproxyRemapping); err != nil {
+	if err := postRestoreCuda(k, timeline); err != nil {
 		return err
 	}
 
@@ -368,13 +366,7 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 		execOut = fdcollector.NewAgent(ctx, rfd, argv[0]) // transfers ownership of rfd
 		cu.Add(execOut.Stop)
 	}
-	// TODO(b/419041893): Support running the save/restore binary with container
-	// env vars without relying on the Saver().
-	var envv []string
-	if k.Saver() != nil {
-		contName := k.ContainerName(contID)
-		envv = k.Saver().SpecEnviron(contName)
-	}
+	envv := k.SpecEnviron(contID)
 
 	proc := Proc{
 		Kernel: k,
@@ -445,10 +437,8 @@ func findContainerInitProcess(k *kernel.Kernel, containerID string) (*kernel.Tas
 		}
 		return init.Leader(), nil
 	}
-	// To find the init process of a container, we look for the process with no
-	// parent (root of execution) that is not an exec process.
 	for _, tg := range k.RootPIDNamespace().ThreadGroups() {
-		if leader := tg.Leader(); leader.Parent() == nil && leader.Origin != kernel.OriginExec && leader.ContainerID() == containerID {
+		if leader := tg.Leader(); tg.IsContainerInit() && leader.ContainerID() == containerID {
 			return leader, nil
 		}
 	}

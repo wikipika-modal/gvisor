@@ -41,8 +41,7 @@ TEST(MmapEternalTest, PageTableLeak) {
   // Platform::kNative) and because MM can be slow enough on such platforms to
   // cause the test to time out.
   SKIP_IF(GvisorPlatform() == Platform::kPtrace ||
-          GvisorPlatform() == Platform::kSystrap ||
-          GvisorPlatform() == Platform::kXemu);
+          GvisorPlatform() == Platform::kSystrap);
 
   // Guess how much virtual address space we need.
   constexpr size_t kMemoryLimitBytes = 12L << 30;

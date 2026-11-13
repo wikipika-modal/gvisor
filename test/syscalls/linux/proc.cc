@@ -1681,15 +1681,20 @@ TEST(ProcLoadavg, Fields) {
   EXPECT_EQ(fields.size(), 6) << proc_loadvg;
 
   double val;
-  uint64_t val2;
   // First three fields are floating point numbers.
   EXPECT_TRUE(absl::SimpleAtod(fields[0], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[1], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[2], &val)) << proc_loadvg;
   // Rest of the fields are valid base 10 numbers.
-  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &val2)) << proc_loadvg;
+  uint64_t running_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &running_tasks)) << proc_loadvg;
+  EXPECT_GE(running_tasks, 1) << proc_loadvg;
+  uint64_t total_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &total_tasks)) << proc_loadvg;
+  EXPECT_GE(total_tasks, running_tasks) << proc_loadvg;
+  uint64_t last_tid = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &last_tid)) << proc_loadvg;
+  EXPECT_GE(last_tid, 1) << proc_loadvg;
 }
 
 // NOTE: Tests in priority.cc also check certain priority related fields in
@@ -2741,6 +2746,24 @@ std::vector<std::string> TaskFiles(const std::vector<pid_t>& pids) {
 TEST(ProcTask, Basic) {
   EXPECT_NO_ERRNO(
       DirContains("/proc/self/task", {".", "..", absl::StrCat(getpid())}, {}));
+}
+
+TEST(ProcTask, InvalidTaskNames) {
+  const std::string invalid_names[] = {
+      absl::StrCat("0", getpid()),
+      absl::StrCat((uint64_t{1} << 32) + getpid()),
+      "2147483648",
+      "4294967295",
+      "18446744073709551616",
+  };
+  for (const std::string& name : invalid_names) {
+    for (const char* dir : {"/proc/", "/proc/self/task/"}) {
+      const std::string path = absl::StrCat(dir, name);
+      SCOPED_TRACE(path);
+      struct stat st;
+      EXPECT_THAT(stat(path.c_str(), &st), SyscallFailsWithErrno(ENOENT));
+    }
+  }
 }
 
 // Helper class for creating a new task in the current thread group.

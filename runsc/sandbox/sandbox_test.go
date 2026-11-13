@@ -17,84 +17,19 @@ package sandbox
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
-
-func TestIsRunning(t *testing.T) {
-	var s Sandbox
-	// Pid == 0 should not be running.
-	running, err := s.IsRunning()
-	if err != nil {
-		t.Fatalf("IsRunning() error = %v, want nil", err)
-	}
-	if running {
-		t.Errorf("IsRunning() = true for pid 0, want false")
-	}
-
-	// Current process should be running.
-	s.Pid.Store(os.Getpid())
-	running, err = s.IsRunning()
-	if err != nil {
-		t.Fatalf("IsRunning() error = %v, want nil", err)
-	}
-	if !running {
-		t.Errorf("IsRunning() = false for current process, want true")
-	}
-
-	// Spawn a child process that exits immediately and becomes a zombie until reaped.
-	cmd := exec.Command("/bin/true")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("cmd.Start() failed: %v", err)
-	}
-	childPid := cmd.Process.Pid
-	s.Pid.Store(childPid)
-
-	// Wait until child enters zombie state ('Z').
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", childPid))
-		if err == nil && strings.Contains(string(statBytes), ") Z ") {
-			break
-		}
-		if time.Now().After(deadline) {
-			_ = cmd.Wait()
-			t.Fatalf("timed out waiting for child pid %d to become zombie", childPid)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Zombie process must NOT be reported as running.
-	running, err = s.IsRunning()
-	if err != nil {
-		_ = cmd.Wait()
-		t.Fatalf("IsRunning() on zombie error = %v, want nil", err)
-	}
-	if running {
-		t.Errorf("IsRunning() = true for zombie process %d, want false", childPid)
-	}
-
-	// Reap the zombie process.
-	_ = cmd.Wait()
-	running, err = s.IsRunning()
-	if err != nil {
-		t.Fatalf("IsRunning() on reaped process error = %v, want nil", err)
-	}
-	if running {
-		t.Errorf("IsRunning() = true for reaped process %d, want false", childPid)
-	}
-}
 
 func TestGetGCSURIFromImagePath(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -189,6 +124,7 @@ func TestCalculateCPUNum(t *testing.T) {
 		numCPUErr       error
 		cpuQuota        int64
 		cpuPeriod       int64
+		limits          *CPULimits
 		cpuNumFromQuota bool
 		want            int
 	}{
@@ -226,6 +162,15 @@ func TestCalculateCPUNum(t *testing.T) {
 			cpuNumFromQuota: true,
 			want:            4,
 		},
+		{
+			name:            "cgroup has lifecycle limit, application limit from limits",
+			numCPU:          16,
+			cpuQuota:        -1,
+			cpuPeriod:       100000,
+			limits:          &CPULimits{App: specs.LinuxCPU{Quota: new(int64(300000)), Period: new(uint64(100000))}},
+			cpuNumFromQuota: true,
+			want:            3,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cg := &fakeCgroup{
@@ -234,20 +179,150 @@ func TestCalculateCPUNum(t *testing.T) {
 				cpuQuota:  tc.cpuQuota,
 				cpuPeriod: tc.cpuPeriod,
 			}
-			gotNum, gotQuota, gotPeriod, err := calculateCPUNum(cg, tc.cpuNumFromQuota)
+			gotNum, gotQuota, gotPeriod, err := calculateCPUNum(cg, tc.limits, tc.cpuNumFromQuota)
 			if err != nil {
 				t.Fatalf("calculateCPUNum failed: %v", err)
 			}
 			if gotNum != tc.want {
 				t.Errorf("calculateCPUNum() got cpuNum = %d, want %d", gotNum, tc.want)
 			}
-			if gotQuota != tc.cpuQuota {
-				t.Errorf("calculateCPUNum() got cpuQuota = %d, want %d", gotQuota, tc.cpuQuota)
+			wantQuota, wantPeriod := tc.cpuQuota, tc.cpuPeriod
+			if tc.limits != nil {
+				wantQuota, wantPeriod = *tc.limits.App.Quota, int64(*tc.limits.App.Period)
 			}
-			if gotPeriod != tc.cpuPeriod {
-				t.Errorf("calculateCPUNum() got cpuPeriod = %d, want %d", gotPeriod, tc.cpuPeriod)
+			if gotQuota != wantQuota {
+				t.Errorf("calculateCPUNum() got cpuQuota = %d, want %d", gotQuota, wantQuota)
+			}
+			if gotPeriod != wantPeriod {
+				t.Errorf("calculateCPUNum() got cpuPeriod = %d, want %d", gotPeriod, wantPeriod)
 			}
 		})
+	}
+}
+
+func TestNewCPULimits(t *testing.T) {
+	quotaRes := &specs.LinuxResources{CPU: &specs.LinuxCPU{Quota: new(int64(25000))}}
+	for _, tc := range []struct {
+		name          string
+		creation      string
+		lifecycle     string
+		res           *specs.LinuxResources
+		wantNil       bool
+		wantApp       int64
+		wantPeriod    uint64
+		wantCreation  int64
+		wantLifecycle int64
+	}{
+		{
+			name:          "default case",
+			creation:      "uncapped",
+			lifecycle:     "max(4x,1000m)",
+			res:           quotaRes,
+			wantApp:       25000,
+			wantPeriod:    100000,
+			wantCreation:  -1,
+			wantLifecycle: 100000,
+		},
+		{
+			name:          "creation keeps the OCI spec limit",
+			creation:      "1x",
+			lifecycle:     "uncapped",
+			res:           quotaRes,
+			wantApp:       25000,
+			wantPeriod:    100000,
+			wantCreation:  25000,
+			wantLifecycle: -1,
+		},
+		{
+			name:      "both keep the OCI spec limit",
+			creation:  "1x",
+			lifecycle: "250m",
+			res:       quotaRes,
+			wantNil:   true,
+		},
+		{
+			name:      "unified cpu.max overrides it",
+			creation:  "uncapped",
+			lifecycle: "uncapped",
+			res: &specs.LinuxResources{
+				CPU:     &specs.LinuxCPU{Quota: new(int64(25000))},
+				Unified: map[string]string{"cpu.max": "50000 200000"},
+			},
+			wantApp:       50000,
+			wantPeriod:    200000,
+			wantCreation:  -1,
+			wantLifecycle: -1,
+		},
+		{
+			name:      "unified cpu.max uses 'max'",
+			creation:  "uncapped",
+			lifecycle: "uncapped",
+			res:       &specs.LinuxResources{Unified: map[string]string{"cpu.max": "max 100000"}},
+			wantNil:   true,
+		},
+		{
+			name:      "no quota specified",
+			creation:  "uncapped",
+			lifecycle: "uncapped",
+			res:       &specs.LinuxResources{CPU: &specs.LinuxCPU{Shares: new(uint64(1024))}},
+			wantNil:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var creation, lifecycle config.SandboxCPUPolicy
+			if err := creation.Set(tc.creation); err != nil {
+				t.Fatalf("creation.Set(%q) failed: %v", tc.creation, err)
+			}
+			if err := lifecycle.Set(tc.lifecycle); err != nil {
+				t.Fatalf("lifecycle.Set(%q) failed: %v", tc.lifecycle, err)
+			}
+			l := NewCPULimits(creation, lifecycle, tc.res)
+			if tc.wantNil {
+				if l != nil {
+					t.Fatalf("NewCPULimits() = %+v, want nil", l)
+				}
+				return
+			}
+			if l == nil {
+				t.Fatalf("NewCPULimits() = nil")
+			}
+			for _, got := range []struct {
+				name  string
+				cpu   specs.LinuxCPU
+				quota int64
+			}{
+				{"App", l.App, tc.wantApp},
+				{"Creation", l.Creation, tc.wantCreation},
+				{"Lifecycle", l.Lifecycle, tc.wantLifecycle},
+			} {
+				if *got.cpu.Quota != got.quota || *got.cpu.Period != tc.wantPeriod {
+					t.Errorf("%s = %d/%d, want %d/%d", got.name, *got.cpu.Quota, *got.cpu.Period, got.quota, tc.wantPeriod)
+				}
+			}
+		})
+	}
+}
+
+func TestCreationResourcesStripsUnifiedCPUMax(t *testing.T) {
+	var uncapped config.SandboxCPUPolicy
+	if err := uncapped.Set("uncapped"); err != nil {
+		t.Fatalf("Set(uncapped) failed: %v", err)
+	}
+	res := &specs.LinuxResources{
+		Unified: map[string]string{"cpu.max": "50000 100000", "memory.high": "1G"},
+	}
+	creationRes := NewCPULimits(uncapped, uncapped, res).CreationResources(res)
+	if _, ok := creationRes.Unified["cpu.max"]; ok {
+		t.Errorf("CreationResources() kept unified cpu.max, which would override the creation limit")
+	}
+	if got := creationRes.Unified["memory.high"]; got != "1G" {
+		t.Errorf("CreationResources() unified memory.high = %q, want %q", got, "1G")
+	}
+	if _, ok := res.Unified["cpu.max"]; !ok {
+		t.Errorf("CreationResources() modified the OCI spec")
+	}
+	if got := *creationRes.CPU.Quota; got != -1 {
+		t.Errorf("CreationResources() CPU quota = %d, want -1", got)
 	}
 }
 
@@ -398,85 +473,6 @@ func TestDiscoverFSCheckpointPrefixesFollowsSymlink(t *testing.T) {
 	if want := []string{"fs"}; !slices.Equal(got, want) {
 		t.Errorf("discoverFSCheckpointPrefixes(%q) = %q, want %q", link, got, want)
 	}
-}
-
-func TestReadCheckpointGoferEndpointOpts(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		endpoint   string
-		gcsOpts    bool
-		want       *checkpointGoferEndpointOpts
-		wantErr    bool
-		wantTarget string
-	}{
-		{name: "missing file"},
-		{name: "missing file with gcs opts", gcsOpts: true},
-		{
-			name:       "endpoint and target",
-			endpoint:   `{"endpoint": "/run/gofer.sock", "target": "snapshot-1"}`,
-			want:       &checkpointGoferEndpointOpts{Endpoint: "/run/gofer.sock", Target: "snapshot-1"},
-			wantTarget: "snapshot-1",
-		},
-		{
-			name:       "endpoint only",
-			endpoint:   `{"endpoint": "/run/gofer.sock"}`,
-			want:       &checkpointGoferEndpointOpts{Endpoint: "/run/gofer.sock"},
-			wantTarget: "/run/gofer.sock",
-		},
-		{name: "invalid json", endpoint: "not valid json", wantErr: true},
-		{name: "empty endpoint", endpoint: `{"target": "snapshot-1"}`, wantErr: true},
-		{name: "both files", endpoint: `{"endpoint": "/run/gofer.sock"}`, gcsOpts: true, wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if tc.endpoint != "" {
-				if err := os.WriteFile(filepath.Join(dir, checkpointGoferEndpointFileName), []byte(tc.endpoint), 0644); err != nil {
-					t.Fatalf("os.WriteFile failed: %v", err)
-				}
-			}
-			if tc.gcsOpts {
-				if err := os.WriteFile(filepath.Join(dir, checkpointGCSOptsFileName), []byte(`{"bucket": "b"}`), 0644); err != nil {
-					t.Fatalf("os.WriteFile failed: %v", err)
-				}
-			}
-			got, err := readCheckpointGoferEndpointOpts(dir)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("readCheckpointGoferEndpointOpts() error = %v, wantErr %t", err, tc.wantErr)
-			}
-			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
-				t.Errorf("readCheckpointGoferEndpointOpts() = %+v, want %+v", got, tc.want)
-			}
-			if tc.want != nil {
-				if target := getCheckpointGoferTarget(dir); target != tc.wantTarget {
-					t.Errorf("getCheckpointGoferTarget() = %q, want %q", target, tc.wantTarget)
-				}
-			}
-		})
-	}
-}
-
-func TestDialCheckpointGofer(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "gofer.sock")
-	opts := &checkpointGoferEndpointOpts{Endpoint: sockPath, Target: "snapshot-1"}
-	if _, err := dialCheckpointGofer(opts); err == nil || !strings.Contains(err.Error(), "snapshot-1") {
-		t.Errorf("dialCheckpointGofer() with no listener: error = %v, want error naming the target", err)
-	}
-
-	ln, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Fatalf("net.Listen failed: %v", err)
-	}
-	defer ln.Close()
-	f, err := dialCheckpointGofer(opts)
-	if err != nil {
-		t.Fatalf("dialCheckpointGofer() failed: %v", err)
-	}
-	defer f.Close()
-	conn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept failed: %v", err)
-	}
-	conn.Close()
 }
 
 func TestIsGCSRestorePath(t *testing.T) {

@@ -35,11 +35,6 @@ func isWhiteout(stat *linux.Statx) bool {
 	return stat.Mode&linux.S_IFMT == linux.S_IFCHR && stat.RdevMajor == 0 && stat.RdevMinor == 0
 }
 
-// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
-func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
-	return linuxerr.EOPNOTSUPP
-}
-
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	if fs.opts.UpperRoot.Ok() {
@@ -1631,21 +1626,6 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 	return err
 }
 
-// isNoopChown returns true if opts only sets d's owner to its current value
-// and would not clear setid bits, which the gofer filesystem also skips.
-func (d *dentry) isNoopChown(opts *vfs.SetStatOptions) bool {
-	stat := &opts.Stat
-	mode := d.mode.Load()
-	setsMore := stat.Mask&^(linux.STATX_UID|linux.STATX_GID) != 0
-	changesUID := stat.Mask&linux.STATX_UID != 0 && stat.UID != d.uid.Load()
-	changesGID := stat.Mask&linux.STATX_GID != 0 && stat.GID != d.gid.Load()
-	clearsSetid := opts.ClearPrivs && vfs.ClearSUIDAndSGID(mode) != mode
-	if setsMore || changesUID || changesGID || clearsSetid {
-		return false
-	}
-	return true
-}
-
 // Preconditions: d.fs.renameMu must be held for reading, and the caller must hold a reference on d.
 func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	mode := linux.FileMode(d.mode.Load())
@@ -1665,9 +1645,6 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 		return err
 	}
 	defer mnt.EndWrite()
-	if !d.isCopiedUp() && d.isNoopChown(&opts) {
-		return nil
-	}
 	if err := d.copyUpForWriteLocked(ctx); err != nil {
 		return err
 	}

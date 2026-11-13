@@ -28,7 +28,6 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
@@ -64,8 +63,16 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet" // Top-level inet provider.
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink" // Register supported socket providers.
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/netfilter"
+	rdmanetlink "gvisor.dev/gvisor/pkg/sentry/socket/netlink/rdma"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack" // Top-level inet provider.
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -90,22 +97,10 @@ import (
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
-
-	// Top-level inet providers.
-	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
-
-	// Include other supported socket providers.
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/netfilter"
-	rdmanetlink "gvisor.dev/gvisor/pkg/sentry/socket/netlink/rdma"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
-	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 type containerInfo struct {
@@ -158,10 +153,6 @@ type containerInfo struct {
 	// rootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
-
-	// fsMutationLogFD is the persistent mutation-log file that the root overlay upper
-	// adopts at mount creation. nil if not donated (e.g. on restore).
-	fsMutationLogFD *fd.FD
 
 	// useCPUNums indicates whether to use platform assigned CPU numbers as CPU numbers in the sentry.
 	useCPUNums bool
@@ -562,10 +553,6 @@ type Args struct {
 	// The `Loader` records midpoints on it as it goes through loader creation
 	// and sandbox startup. The `Loader` does not take ownership of it.
 	StartupTimer *timing.Timer
-
-	// FSMutationLogFD is the file descriptor to the persistent mutation-log file that the
-	// root overlay upper adopts at mount creation. -1 if not donated.
-	FSMutationLogFD int
 }
 
 // HostTHP holds host transparent hugepage settings.
@@ -794,9 +781,6 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("rootfs upper tar file is mutually exclusive with filesystem checkpoint restore")
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
-	}
-	if args.FSMutationLogFD >= 0 {
-		l.root.fsMutationLogFD = fd.New(args.FSMutationLogFD)
 	}
 
 	// Create kernel and platform.
@@ -2122,6 +2106,7 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 
 	// Wait for container.
 	l.k.WaitExited()
+
 	return l.k.GlobalInit().ExitStatus()
 }
 
@@ -2700,29 +2685,6 @@ func unnamedContainerNumber(containerName string) (int, bool) {
 	}
 	n, err := strconv.Atoi(s)
 	return n, err == nil
-}
-
-// +checklocksexclude:l.mu
-func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.containerSpecs[containerName]
-}
-
-// SpecEnviron returns the environment variables for the given container from
-// the container spec it was created with.
-//
-// +checklocksexclude:l.mu
-func (l *Loader) SpecEnviron(containerName string) []string {
-	spec := l.getContainerSpec(containerName)
-	if spec == nil {
-		log.Warningf("Container spec not found for container %q", containerName)
-		return nil
-	}
-	if spec.Process == nil {
-		return nil
-	}
-	return spec.Process.Env
 }
 
 // +checklocksexclude:l.mu

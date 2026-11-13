@@ -47,7 +47,6 @@ var (
 	StringVar   = flag.StringVar
 	Uint        = flag.Uint
 	Uint64      = flag.Uint64
-	Uint64Var   = flag.Uint64Var
 	Var         = flag.Var
 )
 

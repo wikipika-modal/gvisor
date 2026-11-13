@@ -101,11 +101,6 @@ type anonDentry struct {
 func (fs *anonFilesystem) Release(ctx context.Context) {
 }
 
-// DrainDentryCache implements FilesystemImpl.DrainDentryCache.
-func (fs *anonFilesystem) DrainDentryCache(ctx context.Context) error {
-	return linuxerr.EOPNOTSUPP
-}
-
 // Sync implements FilesystemImpl.Sync.
 func (fs *anonFilesystem) Sync(ctx context.Context) error {
 	return nil
