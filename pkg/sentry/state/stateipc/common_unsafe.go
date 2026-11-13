@@ -112,6 +112,12 @@ func (ioep *ioEndpoint) scanWriteSubmissionHeader() *writeSubmissionHeader {
 	return (*writeSubmissionHeader)(ioep.ptrAdd(unsafe.Sizeof(writeSubmissionHeader{})))
 }
 
+// scanUint64 returns a pointer to the uint64 at the current datagram position,
+// and advances the datagram position to past it.
+func (ioep *ioEndpoint) scanUint64() *uint64 {
+	return (*uint64)(ioep.ptrAdd(8))
+}
+
 // scanFileRanges returns a slice representing the numRanges FileRanges at the
 // current datagram position, and advances the datagram position to past the
 // FileRanges.

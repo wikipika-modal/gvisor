@@ -123,6 +123,72 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// ReadPrioritizer is implemented by AsyncReaders that can serve some reads
+// ahead of others.
+type ReadPrioritizer interface {
+	// PrioritizeLastRead marks the read most recently enqueued by AddRead or
+	// AddReadv as one that a caller is blocked on.
+	PrioritizeLastRead()
+}
+
+// LazyReader is implemented by AsyncReaders that can ask to load only pages
+// that someone waits for.
+type LazyReader interface {
+	Lazy() bool
+}
+
+// PrefetchReader is implemented by lazy AsyncReaders that know which ranges
+// of their source are likely to be awaited soon, e.g. from a profile of an
+// earlier restore.
+type PrefetchReader interface {
+	// Prefetch returns ranges of the source, in source offsets, to load
+	// without waiting for anyone to await them.
+	Prefetch() []memmap.FileRange
+}
+
+// SourceRetainer is implemented by AsyncWriters that may still read a write's
+// source after completing it. Their sources must not change after the write
+// completes, even if the sandbox exits.
+type SourceRetainer interface {
+	RetainsSources() bool
+}
+
+// PositionedWriter is implemented by AsyncWriters that can write at explicit
+// offsets, so that writes can complete out of order.
+//
+// Once AddWritevAt has been called, AsyncWriter.Wait may return fewer than
+// minCompletions completions, so that a caller isn't kept from adding a write
+// that it's blocked on while the AsyncWriter holds other writes.
+type PositionedWriter interface {
+	// AddWritevAt is like AsyncWriter.AddWritev, but writes at offset off
+	// rather than appending, as qualified by flags.
+	//
+	// Preconditions: As for AsyncWriter.AddWritev, and len(srcFRs) <
+	// AsyncWriter.MaxRanges(). If flags includes WriteRepeat, HoldsWrites()
+	// returns true.
+	AddWritevAt(id int, off uint64, flags WriteFlags, total uint64, srcFile SourceFile, srcFRs []memmap.FileRange, srcMaps []unix.Iovec)
+
+	// HoldsWrites returns true if the PositionedWriter may keep reading a
+	// write's source long after the write is added, in which case a caller
+	// blocked on an incomplete write may repeat it with WriteRepeat.
+	HoldsWrites() bool
+}
+
+// WriteFlags qualifies a write added by PositionedWriter.AddWritevAt.
+type WriteFlags uint32
+
+const (
+	// WritePriority marks a write that a caller is blocked on, which the
+	// PositionedWriter may complete ahead of other writes.
+	WritePriority WriteFlags = 1 << iota
+
+	// WriteRepeat marks a priority write of a range that an incomplete earlier
+	// write also covers, at the same offsets and with the same contents. The
+	// PositionedWriter completes it once the earlier write no longer reads the
+	// range's source.
+	WriteRepeat
+)
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

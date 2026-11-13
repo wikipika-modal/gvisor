@@ -443,6 +443,7 @@ go_test(
         "task_syscall_benchmark_test.go",
         "task_test.go",
         "timekeeper_test.go",
+        "vdso_save_test.go",
     ],
     embed = [":kernel"],
     deps = [
@@ -462,6 +463,7 @@ go_test(
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/stateio/stateiotest",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",

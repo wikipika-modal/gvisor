@@ -16,12 +16,14 @@ package pgalloc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -182,10 +184,21 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If Prescan is not nil, SaveTo() checks only pages that Prescan didn't
+	// find non-zero.
+	Prescan *ZeroPagesPrescan
 }
+
+// lazyMinBytes is the smallest contiguous unloaded range that is loaded only
+// when awaited, when loading lazily.
+const lazyMinBytes = 32 << 20
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if f.IsEarlyResumeSaving() {
+		return fmt.Errorf("a previous save is still saving pages")
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -222,6 +235,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			pf: opts.PagesFile,
 			sf: sf,
 		}
+		if amfs.pf.earlyResume {
+			if err := amfs.registerEarlyResume(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// We only want to explicitly include pages containing non-zero bytes in
@@ -246,16 +264,21 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		alreadyUncommittedBytes uint64
 		newUncommittedBytes     uint64
 		hostHoleBytes           uint64
+		checkedBytes            uint64
 	)
 	asyncWritePages := func(fr memmap.FileRange) {}
 	if amfs != nil {
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
 			amfs.pf.mu.Lock()
-			amfs.pf.unsaved.PushBack(apsRange{
-				amfs:      amfs,
-				FileRange: fr,
-			})
+			if amfs.pf.earlyResume {
+				amfs.addUnsavedLocked(fr, amfs.pf.saveOff)
+			} else {
+				amfs.pf.unsaved.PushBack(apsRange{
+					amfs:      amfs,
+					FileRange: fr,
+				})
+			}
 			amfs.pf.saveOff += amount
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
@@ -375,7 +398,6 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	dataSeeker := f.newHostFileDataSeeker()
-	zeroPage := make([]byte, hostarch.PageSize)
 	// f.mu is unlocked below, allowing concurrent calls to f.UpdateUsage() to
 	// observe pages that we transiently commit (for comparisons to zero) or
 	// leave committed (if opts.ExcludeCommittedZeroPages is true). Set
@@ -400,27 +422,31 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			return
 		}
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			bs := chunk.sliceAt(chunkFR)
-			pageSize := int(hostarch.PageSize)
-			for pgoff := 0; pgoff < len(bs); pgoff += pageSize {
-				pg := bs[pgoff : pgoff+pageSize]
-				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
-				if isZeroed {
-					if !wasCommitted {
-						alreadyUncommittedBytes += uint64(hostarch.PageSize)
-						decommitAddPage(off)
-					} else {
-						newUncommittedBytes += uint64(hostarch.PageSize)
-					}
-				} else {
-					if !wasCommitted {
-						newCommittedBytes += uint64(hostarch.PageSize)
-					} else {
-						alreadyCommittedBytes += uint64(hostarch.PageSize)
-					}
+			zero := opts.Prescan.zeroPages(chunk.sliceAt(chunkFR), chunkFR, &checkedBytes)
+			for i := 0; i < len(zero); {
+				j := i + 1
+				for j < len(zero) && zero[j] == zero[i] {
+					j++
 				}
-				maseg = updateAddRange(maseg, memmap.FileRange{Start: off, End: off + uint64(hostarch.PageSize)}, wasCommitted, !isZeroed)
+				run := memmap.FileRange{
+					Start: chunkFR.Start + uint64(i)*hostarch.PageSize,
+					End:   chunkFR.Start + uint64(j)*hostarch.PageSize,
+				}
+				switch {
+				case zero[i] && !wasCommitted:
+					alreadyUncommittedBytes += run.Length()
+					for off := run.Start; off < run.End; off += hostarch.PageSize {
+						decommitAddPage(off)
+					}
+				case zero[i]:
+					newUncommittedBytes += run.Length()
+				case !wasCommitted:
+					newCommittedBytes += run.Length()
+				default:
+					alreadyCommittedBytes += run.Length()
+				}
+				maseg = updateAddRange(maseg, run, wasCommitted, !zero[i])
+				i = j
 			}
 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
 			// occasionally unlock f.mu to ensure that the former can promptly
@@ -500,10 +526,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	durScan := time.Duration(gohacks.Nanotime() - timeScanStart)
-	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected including %d bytes of host holes, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
+	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes (%d bytes checked): %d bytes of zero pages (%d bytes expected including %d bytes of host holes, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
 		f,
 		durScan,
 		allocatedBytes,
+		checkedBytes,
 		alreadyUncommittedBytes+newUncommittedBytes,
 		alreadyUncommittedBytes,
 		hostHoleBytes,
@@ -685,6 +712,37 @@ type AsyncPagesFileSave struct {
 	// AsyncPagesFileSave.err is never returned to application syscalls and
 	// hence is not constrained to being an errno.
 	err error
+
+	// The following fields are used only by early-resume saving; see
+	// EnableEarlyResume. earlyResume, pw and prioReserve are immutable after
+	// EnableEarlyResume; the remaining fields are protected by mu.
+	earlyResume bool
+	pw          stateio.PositionedWriter
+	prioReserve int
+	repeats     bool
+
+	// erFiles are the MemoryFiles being saved, in pages file order.
+	erFiles []*asyncMemoryFileSave
+
+	// erCursorFile and erCursor are the index into erFiles and MemoryFile
+	// offset before which all pages are saved, inflight or prioritized.
+	erCursorFile int
+	erCursor     uint64
+
+	// priority holds ranges awaited by writers.
+	priority ringdeque.Deque[apsRange]
+
+	// savedCh is closed and replaced whenever writes complete.
+	savedCh chan struct{}
+
+	// erDone is true once saving has ended.
+	erDone bool
+
+	prioOps   uint64
+	prioBytes uint64
+	repeatOps uint64
+	erWaits   uint64
+	erWaitDur time.Duration
 }
 
 // Possible events in AsyncPagesFileSave.stStatus:
@@ -700,6 +758,10 @@ type asyncMemoryFileSave struct {
 	f  *MemoryFile
 	pf *AsyncPagesFileSave
 	sf stateio.SourceFile
+
+	// unsaved tracks pages that have not been saved, during early-resume
+	// saving. unsaved is protected by pf.mu.
+	unsaved apsUnsavedSet
 }
 
 type apsRange struct {
@@ -721,6 +783,10 @@ type apsOp struct {
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// For early-resume saving, off is the pages file offset of the write.
+	off   uint64
+	flags stateio.WriteFlags
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
@@ -790,7 +856,9 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 
 	apfs.qavail--
 	apfs.curOp = nil
-	if len(op.frs) == 1 && len(op.iovecs) == 1 {
+	if apfs.earlyResume {
+		apfs.enqueueEarlyResumeOp(op)
+	} else if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized write to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncWriter implementation.
 		apfs.aw.AddWrite(int(apfs.curOpID), op.amfs.sf, op.frs[0], stateio.SliceFromIovec(op.iovecs[0]))
@@ -902,6 +970,9 @@ func (apfs *AsyncPagesFileSave) main() {
 		if apfs.err != nil {
 			log.Warningf("Async page saving failed: %v", apfs.err)
 		}
+		if apfs.earlyResume {
+			apfs.endEarlyResume()
+		}
 		if err := apfs.aw.Close(); err != nil {
 			// Saving success is independent of err, so log it rather than
 			// propagating it.
@@ -969,12 +1040,16 @@ func (apfs *AsyncPagesFileSave) main() {
 
 	prevFull := false
 	for {
-		// Enqueue as many writes as possible.
-		if !apfs.canEnqueue() {
+		// Enqueue as many writes as possible. A PositionedWriter's Wait may
+		// return without completions.
+		if !apfs.canEnqueue() && !apfs.earlyResume {
 			panic("main loop invariant failed")
 		}
 		apfs.mu.Lock()
 		apfs.aw.Reserve(apfs.saveOff)
+		if apfs.earlyResume {
+			apfs.enqueueEarlyResumeLocked()
+		}
 		for !apfs.unsaved.Empty() {
 			mfr := apfs.unsaved.PeekFrontPtr()
 			n := apfs.enqueueRange(*mfr)
@@ -1073,9 +1148,156 @@ func (apfs *AsyncPagesFileSave) main() {
 			if full {
 				apfs.bytesFull += op.total
 			}
+			if apfs.earlyResume {
+				apfs.savedLocked(op)
+			}
+		}
+		if apfs.earlyResume {
+			apfs.wakeSaveWaitersLocked()
 		}
 		apfs.mu.Unlock()
 	}
+}
+
+// zeroPageScanMinPages is the fewest pages zeroPages() checks per goroutine.
+const zeroPageScanMinPages = 4096
+
+var zeroPage [hostarch.PageSize]byte
+
+// zeroPages returns whether each page in bs is zero. Pages are checked in
+// parallel, since each check is usually bound by a cache miss.
+func zeroPages(bs []byte) []bool {
+	zero := make([]bool, len(bs)/hostarch.PageSize)
+	check := func(start, end int) {
+		for i := start; i < end; i++ {
+			zero[i] = bytes.Equal(bs[i*hostarch.PageSize:(i+1)*hostarch.PageSize], zeroPage[:])
+		}
+	}
+	shards := min(runtime.GOMAXPROCS(0), len(zero)/zeroPageScanMinPages)
+	if shards <= 1 {
+		check(0, len(zero))
+		return zero
+	}
+	var wg sync.WaitGroup
+	for s := range shards {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			check(len(zero)*s/shards, len(zero)*(s+1)/shards)
+		}()
+	}
+	wg.Wait()
+	return zero
+}
+
+// ZeroPagesPrescan holds the pages that MemoryFile.PrescanZeroPages() found
+// non-zero.
+type ZeroPagesPrescan struct {
+	// nonZero is sorted and non-overlapping.
+	nonZero []memmap.FileRange
+}
+
+// PrescanZeroPages finds the pages of f that SaveTo() would check for zero
+// bytes, given excludeCommittedZeroPages, and that hold non-zero bytes. It
+// runs while f is in use, so that SaveTo(), given the result in
+// SaveOpts.Prescan, checks only the other pages while the kernel is paused.
+// Pages found non-zero are saved even if they have since become zero, so
+// SaveTo() still excludes only pages it finds zero.
+func (f *MemoryFile) PrescanZeroPages(excludeCommittedZeroPages bool) *ZeroPagesPrescan {
+	start := gohacks.Nanotime()
+	p := &ZeroPagesPrescan{}
+	var scanned, nonZero uint64
+	scan := func(fr memmap.FileRange) {
+		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			zero := zeroPages(chunk.sliceAt(chunkFR))
+			for i := 0; i < len(zero); i++ {
+				if zero[i] {
+					continue
+				}
+				pfr := memmap.FileRange{
+					Start: chunkFR.Start + uint64(i)*hostarch.PageSize,
+					End:   chunkFR.Start + uint64(i+1)*hostarch.PageSize,
+				}
+				if n := len(p.nonZero); n != 0 && p.nonZero[n-1].End == pfr.Start {
+					p.nonZero[n-1].End = pfr.End
+				} else {
+					p.nonZero = append(p.nonZero, pfr)
+				}
+				nonZero += hostarch.PageSize
+			}
+			scanned += chunkFR.Length()
+			return true
+		})
+	}
+	dataSeeker := f.newHostFileDataSeeker()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Scan one huge page at a time with f.mu locked, so that scanned pages
+	// aren't released, and let other users of f.mu proceed in between.
+	for start := uint64(0); start < f.TotalSize(); start += hostarch.HugePageSize {
+		unitFR := memmap.FileRange{start, start + hostarch.HugePageSize}
+		for maseg := f.memAcct.LowerBoundSegment(start); maseg.Ok() && maseg.Start() < unitFR.End; maseg = maseg.NextSegment() {
+			ma := maseg.ValuePtr()
+			fr := maseg.Range().Intersect(unitFR)
+			switch {
+			case ma.wasteOrReleasing:
+			case ma.knownCommitted:
+				if excludeCommittedZeroPages {
+					scan(fr)
+				}
+			case dataSeeker == nil:
+				scan(fr)
+			default:
+				for fr.Length() != 0 {
+					data, err := dataSeeker.dataAtOrAfter(fr.Start)
+					if err != nil {
+						log.Warningf("MemoryFile(%p): prescanning stopped: %v", f, err)
+						return p
+					}
+					dataFR := memmap.FileRange{max(fr.Start, data.Start), min(data.End, fr.End)}
+					if dataFR.Length() == 0 {
+						break
+					}
+					scan(dataFR)
+					fr.Start = dataFR.End
+				}
+			}
+		}
+		f.mu.Unlock()
+		f.mu.Lock()
+	}
+	log.Infof("MemoryFile(%p): prescanning took %s for %d bytes: %d bytes of non-zero pages", f, time.Duration(gohacks.Nanotime()-start), scanned, nonZero)
+	return p
+}
+
+// zeroPages returns whether each page in bs, the contents of fr, is zero,
+// checking only pages that p didn't find non-zero, and adds the bytes it
+// checks to checked.
+func (p *ZeroPagesPrescan) zeroPages(bs []byte, fr memmap.FileRange, checked *uint64) []bool {
+	if p == nil {
+		*checked += fr.Length()
+		return zeroPages(bs)
+	}
+	zero := make([]bool, len(bs)/hostarch.PageSize)
+	check := func(start, end uint64) {
+		copy(zero[(start-fr.Start)/hostarch.PageSize:], zeroPages(bs[start-fr.Start:end-fr.Start]))
+		*checked += end - start
+	}
+	i, _ := slices.BinarySearchFunc(p.nonZero, fr.Start, func(nz memmap.FileRange, off uint64) int {
+		return cmp.Compare(nz.End, off+1)
+	})
+	start := fr.Start
+	for ; i < len(p.nonZero) && p.nonZero[i].Start < fr.End; i++ {
+		nz := p.nonZero[i].Intersect(fr)
+		if start < nz.Start {
+			check(start, nz.Start)
+		}
+		start = nz.End
+	}
+	if start < fr.End {
+		check(start, fr.End)
+	}
+	return zero
 }
 
 // LoadOpts provides options to MemoryFile.LoadFrom().
@@ -1213,6 +1435,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			amfl.pf.mu.Lock()
 			defer amfl.pf.mu.Unlock()
 			amfl.lfDone = true
+			if amfl.pf.lazy {
+				amfl.markLazyLocked()
+				amfl.pf.lfStatus.Notify(aplLFPending)
+			}
 			if amfl.unloaded.IsEmpty() {
 				// The async page loader goroutine does this when it
 				// transitions amfl.unloaded from non-empty to empty with
@@ -1220,14 +1446,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				// empty (async page loading for this MemoryFile finished
 				// before we got here, possibly because the MemoryFile was
 				// empty), we have to do so instead.
-				amfl.minUnloaded.Store(math.MaxUint64)
-				amfl.pf.amfls.Remove(amfl)
-				amfl.f.asyncPageLoad.Store(nil)
-				amfl.timeline.End()
-				if amfl.doneCallback != nil {
-					amfl.doneCallback(nil)
-					amfl.doneCallback = nil
-				}
+				amfl.loadedLocked()
 			}
 		}()
 	}
@@ -1363,6 +1582,15 @@ type AsyncPagesFileLoad struct {
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
 
+	// If lazy is true, large unloaded ranges are only loaded when awaited
+	// (see asyncMemoryFileLoad.markLazyLocked). lazy is immutable.
+	lazy bool
+
+	// prefetch is the ranges of the pages file that ar suggests loading
+	// eagerly when loading lazily, sorted and disjoint. prefetch is
+	// immutable.
+	prefetch []memmap.FileRange
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -1391,6 +1619,9 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	// aplLazyWake is only used when lazy loading: a new waiter needs pages, or
+	// a MemoryFile has no unloaded pages left.
+	aplLazyWake
 )
 
 type aplFileRange struct {
@@ -1445,6 +1676,9 @@ type aplUnloadedInfo struct {
 
 	// started is true if a read has been enqueued for these pages.
 	started bool
+
+	// lazy is true if these pages are only loaded when awaited.
+	lazy bool
 
 	// waiters queues goroutines waiting for these pages to be loaded.
 	waiters []*aplWaiter
@@ -1517,6 +1751,8 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		doneCallback:     doneCallback,
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		lazy:             isLazy(ar),
+		prefetch:         prefetchRanges(ar),
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1537,6 +1773,36 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	return apfl, nil
 }
 
+func isLazy(ar stateio.AsyncReader) bool {
+	lr, ok := ar.(stateio.LazyReader)
+	return ok && lr.Lazy()
+}
+
+// prefetchRanges returns the non-empty ranges that a lazy ar suggests
+// prefetching, sorted and merged.
+func prefetchRanges(ar stateio.AsyncReader) []memmap.FileRange {
+	pr, ok := ar.(stateio.PrefetchReader)
+	if !ok || !isLazy(ar) {
+		return nil
+	}
+	var frs []memmap.FileRange
+	for _, fr := range pr.Prefetch() {
+		if fr.WellFormed() && fr.Length() != 0 {
+			frs = append(frs, fr)
+		}
+	}
+	slices.SortFunc(frs, func(a, b memmap.FileRange) int { return cmp.Compare(a.Start, b.Start) })
+	var merged []memmap.FileRange
+	for _, fr := range frs {
+		if n := len(merged); n != 0 && fr.Start <= merged[n-1].End {
+			merged[n-1].End = max(merged[n-1].End, fr.End)
+		} else {
+			merged = append(merged, fr)
+		}
+	}
+	return merged
+}
+
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
 // loading from apfl. MemoryFilesDone may be called multiple times; subsequent
 // calls have no effect.
@@ -1548,6 +1814,13 @@ func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 // failed permanently.
 func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
+}
+
+// IsLazyLoading returns true if async page loading is in progress and loads
+// large ranges only when awaited.
+func (f *MemoryFile) IsLazyLoading() bool {
+	amfl := f.asyncPageLoad.Load()
+	return amfl != nil && amfl.pf.lazy
 }
 
 // AwaitLoadAll blocks until async page loading has completed. If async page
@@ -1617,6 +1890,9 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.totalWaiters++
 	}
 	apfl.mu.Unlock()
+	if pending && apfl.lazy {
+		apfl.lfStatus.Notify(aplLazyWake)
+	}
 	if pending {
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
@@ -1628,6 +1904,71 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		}
 	}
 	return apfl.err()
+}
+
+// reapLoaded marks MemoryFiles whose unloaded pages all became waste as
+// loaded, and returns true if any MemoryFile still has unloaded pages.
+func (apfl *AsyncPagesFileLoad) reapLoaded() bool {
+	apfl.amflsMu.Lock()
+	defer apfl.amflsMu.Unlock()
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	for amfl := apfl.amfls.Front(); amfl != nil; {
+		next := amfl.Next()
+		if amfl.lfDone && amfl.unloaded.IsEmpty() {
+			amfl.loadedLocked()
+		}
+		amfl = next
+	}
+	return !apfl.amfls.Empty()
+}
+
+// markLazyLocked marks unloaded ranges of at least lazyMinBytes as loaded
+// only when awaited, except for pages in the pages file ranges that
+// amfl.pf.prefetch suggests. Smaller ones are usually small, scattered
+// allocations that a fault would load whole anyway, and loading each on demand
+// would cost one synchronous read per fault, so they are still loaded in the
+// background.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) markLazyLocked() {
+	prefetch := amfl.pf.prefetch
+	for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+		fr := ulseg.Range()
+		if fr.Length() < lazyMinBytes {
+			continue
+		}
+		ulseg.ValuePtr().lazy = true
+		off := ulseg.ValuePtr().off
+		src := memmap.FileRange{off, off + fr.Length()}
+		i, _ := slices.BinarySearchFunc(prefetch, src.Start, func(p memmap.FileRange, start uint64) int {
+			return cmp.Compare(p.End, start+1)
+		})
+		for ; i < len(prefetch) && prefetch[i].Start < src.End; i++ {
+			o := prefetch[i].Intersect(src)
+			pfr := memmap.FileRange{
+				hostarch.PageRoundDown(fr.Start + (o.Start - off)),
+				hostarch.MustPageRoundUp(fr.Start + (o.End - off)),
+			}
+			amfl.unloaded.MutateRange(pfr, func(pseg aplUnloadedIterator) bool {
+				pseg.ValuePtr().lazy = false
+				return true
+			})
+		}
+		ulseg = amfl.unloaded.FindSegment(fr.End - 1)
+	}
+}
+
+// Preconditions: apfl.amflsMu and apfl.mu must be locked.
+func (amfl *asyncMemoryFileLoad) loadedLocked() {
+	amfl.minUnloaded.Store(math.MaxUint64)
+	amfl.pf.amfls.Remove(amfl)
+	amfl.f.asyncPageLoad.Store(nil)
+	amfl.timeline.End()
+	if amfl.doneCallback != nil {
+		amfl.doneCallback(nil)
+		amfl.doneCallback = nil
+	}
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
@@ -1655,6 +1996,12 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 		apfl.ar.AddRead(int(apfl.curOpID), op.off(), op.amfl.df, op.frs[0], stateio.SliceFromIovec(op.iovecs[0]))
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
+	}
+	if !op.tempRef {
+		// Awaited reads (tempRef == false) have waiters blocked on them.
+		if p, ok := apfl.ar.(stateio.ReadPrioritizer); ok {
+			p.PrioritizeLastRead()
+		}
 	}
 	if logAwaitedLoads && !op.tempRef {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
@@ -1940,13 +2287,17 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// awaited loads vs. elevated disk latency.
 		amflsLoop:
 			for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+				if apfl.lazy && !amfl.lfDone {
+					// Lazy ranges are not marked yet.
+					continue
+				}
 				amfl.f.mu.Lock()
 				apfl.mu.Lock()
 				ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
 				for ulseg.Ok() {
 					ul := ulseg.ValuePtr()
 					ulFR := ulseg.Range()
-					if ul.started {
+					if ul.started || ul.lazy {
 						amfl.minUnstarted = ulFR.End
 						ulseg = ulseg.NextSegment()
 						continue
@@ -1989,6 +2340,15 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
 				// asyncMemoryFileLoad.unloaded.
 				apfl.lfStatus.Ack(aplLFPending)
+				continue
+			}
+			if ev&aplLazyWake != 0 {
+				apfl.lfStatus.Ack(aplLazyWake)
+				continue
+			}
+			if ev&aplLFDone != 0 && apfl.lazy && apfl.reapLoaded() {
+				// Lazy ranges remain unloaded until something waits for them.
+				apfl.lfStatus.WaitFor(aplLazyWake)
 				continue
 			}
 			if ev&aplLFDone != 0 {
@@ -2080,14 +2440,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// accurately if insertions into amfl.unloaded are complete.
 			if amfl.lfDone {
 				if amfl.unloaded.IsEmpty() {
-					amfl.minUnloaded.Store(math.MaxUint64)
-					apfl.amfls.Remove(amfl)
-					amfl.f.asyncPageLoad.Store(nil)
-					amfl.timeline.End()
-					if amfl.doneCallback != nil {
-						amfl.doneCallback(nil)
-						amfl.doneCallback = nil
-					}
+					amfl.loadedLocked()
 				} else {
 					amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
 				}
@@ -2127,6 +2480,9 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
 		}
 	})
+	if amfl.pf.lazy && amfl.unloaded.IsEmpty() {
+		amfl.pf.lfStatus.Notify(aplLazyWake)
+	}
 }
 
 type aplUnloadedSetFunctions struct{}
@@ -2147,6 +2503,9 @@ func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, 
 	if ul1.off+fr1.Length() != ul2.off {
 		return aplUnloadedInfo{}, false
 	}
+	if ul1.lazy != ul2.lazy {
+		return aplUnloadedInfo{}, false
+	}
 	if ul1.started || ul2.started || len(ul1.waiters) != 0 || len(ul2.waiters) != 0 {
 		// Merging would be counterproductive, since we expect that these
 		// segments will shortly be removed (separately) based on AIO
@@ -2160,6 +2519,7 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 	ul2 := aplUnloadedInfo{
 		off:     ul.off + (splitAt - fr.Start),
 		started: ul.started,
+		lazy:    ul.lazy,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be
